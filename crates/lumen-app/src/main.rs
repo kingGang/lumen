@@ -5,6 +5,7 @@ mod input;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
@@ -20,6 +21,11 @@ use winit::window::{Window, WindowId};
 
 /// scrollback 容量（行）。
 const SCROLLBACK: usize = 10_000;
+
+/// PTY 输出的合帧窗口：数据到达后稍等片刻，把同一逻辑帧被 ConPTY
+/// 切开的碎块攒齐再渲染，避免把 TUI 重绘中间态（光标停在临时
+/// 位置、半成品行）画上屏。对打字回显是无感的延迟。
+const REDRAW_DEBOUNCE: Duration = Duration::from_millis(5);
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
@@ -55,6 +61,8 @@ struct AppState {
     wake_pending: Arc<AtomicBool>,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
+    /// 合帧渲染的截止时刻（最早一批未渲染数据的到达时间 + 窗口）。
+    redraw_at: Option<Instant>,
     /// 鼠标最近一次的窗口内像素位置。
     mouse_pos: (f64, f64),
     /// 左键按住拖选中。
@@ -174,6 +182,7 @@ impl App {
             wake_pending,
             modifiers: ModifiersState::default(),
             clipboard,
+            redraw_at: None,
             mouse_pos: (0.0, 0.0),
             selecting: false,
             selection: None,
@@ -239,13 +248,32 @@ impl ApplicationHandler<PtyWake> for App {
             }
             // DEC 2026 同步更新进行中不渲染，等 ESU 到达的批次一次画出，
             // 否则会把 TUI 重绘中间态（光标游走）上屏。
+            // 渲染本身经合帧窗口延迟（见 about_to_wait），吸收 ConPTY
+            // 对同一逻辑帧的切块。
             if !state.term.is_synchronized() {
-                state.window.request_redraw();
+                state
+                    .redraw_at
+                    .get_or_insert_with(|| Instant::now() + REDRAW_DEBOUNCE);
             }
         }
         if exited {
             info!("shell 已退出，关闭窗口");
             event_loop.exit();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        match state.redraw_at {
+            Some(at) if Instant::now() >= at => {
+                state.redraw_at = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+                state.window.request_redraw();
+            }
+            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            None => {}
         }
     }
 
