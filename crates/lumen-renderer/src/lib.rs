@@ -21,6 +21,12 @@ const LINE_HEIGHT_FACTOR: f32 = 1.35;
 /// 内容区与窗口边缘的内边距（逻辑像素，随 DPI 缩放）。
 const PADDING: f32 = 10.0;
 
+/// 一行的排版缓存：内容哈希 + 各文本段（起始列, 排版 buffer）。
+struct RowSegs {
+    hash: Option<u64>,
+    segs: Vec<(usize, TextBuffer)>,
+}
+
 /// 终端渲染器。持有 GPU 资源与字体系统。
 pub struct Renderer {
     device: wgpu::Device,
@@ -33,8 +39,10 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    /// 文本段排版 buffer 池（跨帧复用，按需增长）。
-    text_buffers: Vec<TextBuffer>,
+    /// 行级排版缓存：行内容（哈希）不变则整行跳过 shaping。
+    /// TUI 全屏界面（如 codex 的框线边框）段数巨大，没有缓存时
+    /// 每帧全量整形会把打字回显拖卡。
+    row_segs: Vec<RowSegs>,
     rects: rect::RectRenderer,
 
     theme: Theme,
@@ -119,7 +127,7 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
-            text_buffers: Vec::new(),
+            row_segs: Vec::new(),
             rects,
             theme: Theme::default(),
             font_family,
@@ -270,21 +278,32 @@ impl Renderer {
             &instances,
         );
 
-        // ---- 文本排版：按网格分段强制对齐 ----
-        // 窄字符连续成段、宽字符（CJK 等）单独成段，每段起点钉死在
-        // col * cell_w。CJK fallback 字体的字形宽度往往 ≠ 2*cell_w，
-        // 整行自由排版会让偏差逐字累计（光标与文字渐行渐远）。
+        // ---- 文本排版：按网格分段强制对齐，行级缓存 ----
+        // 窄字符连续成段、宽字符（CJK 等）与一切非 ASCII 字符单独成段，
+        // 每段起点钉死在 col * cell_w（回退字形 advance != cell_w 时偏差
+        // 不跨段累计）。行内容哈希不变则复用上一帧的排版结果。
         let metrics = Metrics::new(self.font_size, self.cell_h);
         let family = self.font_family.clone();
         let base_attrs = Attrs::new().family(Family::Name(&family));
 
-        // (buffer 池索引, 像素 x, 像素 y)
-        let mut placed: Vec<(usize, f32, f32)> = Vec::new();
-        let mut used = 0usize;
+        if self.row_segs.len() != rows {
+            self.row_segs.resize_with(rows, || RowSegs {
+                hash: None,
+                segs: Vec::new(),
+            });
+        }
 
         for (vr, row) in grid.visible_rows().enumerate() {
+            let h = hash_row(row, cols);
+            if self.row_segs[vr].hash == Some(h) {
+                continue;
+            }
+            self.row_segs[vr].hash = Some(h);
+            // 取出 segs 重建（旧 buffer 复用，超出部分截断）。
+            let mut segs = std::mem::take(&mut self.row_segs[vr].segs);
+            let mut seg_count = 0usize;
+
             let cells = row.cells();
-            let y = pad + vr as f32 * ch;
             let row_len = cols.min(cells.len());
             let mut c = 0usize;
 
@@ -307,112 +326,101 @@ impl Renderer {
                     attrs
                 };
 
-                // 宽字符（CJK 占 2 列）以及一切非 ASCII 字符都单独成段、
-                // 独立钉在自己的网格列上：spinner 符号（✛ ✻ …）这类字符
-                // 主字体没有、回退字形 advance != cell_w，若与后续文字连段
-                // 排版，会把整段推偏——spinner 每帧换符号时偏移量不同，
-                // 表现为整行文字抖动。
-                if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
-                    let mut tmp = [0u8; 4];
-                    let s: &str = cell.ch.encode_utf8(&mut tmp);
-                    let attrs = cell_attrs(cell);
-                    while used >= self.text_buffers.len() {
-                        self.text_buffers
-                            .push(TextBuffer::new(&mut self.font_system, metrics));
-                    }
-                    let buf = &mut self.text_buffers[used];
-                    buf.set_metrics(&mut self.font_system, metrics);
-                    buf.set_size(&mut self.font_system, None, Some(ch));
-                    buf.set_rich_text(
-                        &mut self.font_system,
-                        [(s, attrs)],
-                        &base_attrs,
-                        Shaping::Advanced,
-                        None,
-                    );
-                    placed.push((used, pad + c as f32 * cw, y));
-                    used += 1;
-                    // 宽字符跳过右半占位格。
-                    c += if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 };
-                    continue;
-                }
-
-                // ASCII 窄字符 run：主等宽字体保证 advance == cell_w，
-                // 可以安全连段；遇宽字符或非 ASCII 字符断段。
+                // 段构建：单字符段（宽字符/非 ASCII）或 ASCII run。
                 let start_col = c;
                 let mut line = String::new();
                 let mut spans: Vec<(usize, usize, Attrs)> = Vec::new();
-                let mut run_start = 0usize;
-                let mut run_attrs: Option<Attrs> = None;
-                while c < row_len {
-                    let cell = &cells[c];
-                    if cell
-                        .flags
-                        .intersects(CellFlags::WIDE | CellFlags::WIDE_SPACER)
-                        || !cell.ch.is_ascii()
-                    {
-                        break;
-                    }
-                    let attrs = cell_attrs(cell);
-                    if run_attrs.as_ref() != Some(&attrs) {
-                        if line.len() > run_start {
-                            if let Some(a) = run_attrs.take() {
-                                spans.push((run_start, line.len(), a));
-                            }
-                        }
-                        run_start = line.len();
-                        run_attrs = Some(attrs);
-                    }
+
+                if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
                     line.push(cell.ch);
-                    c += 1;
-                }
-                if line.len() > run_start {
-                    if let Some(a) = run_attrs.take() {
-                        spans.push((run_start, line.len(), a));
+                    spans.push((0, line.len(), cell_attrs(cell)));
+                    c += if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 };
+                } else {
+                    let mut run_start = 0usize;
+                    let mut run_attrs: Option<Attrs> = None;
+                    while c < row_len {
+                        let cell = &cells[c];
+                        if cell
+                            .flags
+                            .intersects(CellFlags::WIDE | CellFlags::WIDE_SPACER)
+                            || !cell.ch.is_ascii()
+                        {
+                            break;
+                        }
+                        let attrs = cell_attrs(cell);
+                        if run_attrs.as_ref() != Some(&attrs) {
+                            if line.len() > run_start {
+                                if let Some(a) = run_attrs.take() {
+                                    spans.push((run_start, line.len(), a));
+                                }
+                            }
+                            run_start = line.len();
+                            run_attrs = Some(attrs);
+                        }
+                        line.push(cell.ch);
+                        c += 1;
                     }
+                    if line.len() > run_start {
+                        if let Some(a) = run_attrs.take() {
+                            spans.push((run_start, line.len(), a));
+                        }
+                    }
+                    // 全空白段不排版（空格无字形，背景色块单独绘制）。
+                    let trimmed = line.trim_end().len();
+                    if trimmed == 0 {
+                        continue;
+                    }
+                    line.truncate(trimmed);
+                    spans.retain_mut(|(s, e, _)| {
+                        *e = (*e).min(trimmed);
+                        *s < trimmed
+                    });
                 }
-                // 全空白段不排版（空格无字形，背景色块已单独绘制）。
-                let trimmed_len = line.trim_end().len();
-                if trimmed_len == 0 {
-                    continue;
+
+                // 复用旧 buffer 或新建。
+                if seg_count >= segs.len() {
+                    segs.push((0, TextBuffer::new(&mut self.font_system, metrics)));
                 }
-                while used >= self.text_buffers.len() {
-                    self.text_buffers
-                        .push(TextBuffer::new(&mut self.font_system, metrics));
-                }
-                let buf = &mut self.text_buffers[used];
+                let (col_slot, buf) = &mut segs[seg_count];
+                *col_slot = start_col;
                 buf.set_metrics(&mut self.font_system, metrics);
                 buf.set_size(&mut self.font_system, None, Some(ch));
                 buf.set_rich_text(
                     &mut self.font_system,
-                    spans
-                        .iter()
-                        .filter(|(s, _, _)| *s < trimmed_len)
-                        .map(|(s, e, a)| (&line[*s..(*e).min(trimmed_len)], a.clone())),
+                    spans.iter().map(|(s, e, a)| (&line[*s..*e], a.clone())),
                     &base_attrs,
                     Shaping::Advanced,
                     None,
                 );
-                placed.push((used, pad + start_col as f32 * cw, y));
-                used += 1;
+                seg_count += 1;
             }
+            segs.truncate(seg_count);
+            self.row_segs[vr].segs = segs;
         }
 
-        let text_areas: Vec<TextArea> = placed
+        let fg_default = self.theme.foreground.to_glyphon();
+        let width = self.config.width as i32;
+        let text_areas: Vec<TextArea> = self
+            .row_segs
             .iter()
-            .map(|&(i, x, y)| TextArea {
-                buffer: &self.text_buffers[i],
-                left: x,
-                top: y,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: 0,
-                    top: y as i32,
-                    right: self.config.width as i32,
-                    bottom: (y + ch) as i32,
-                },
-                default_color: self.theme.foreground.to_glyphon(),
-                custom_glyphs: &[],
+            .take(rows)
+            .enumerate()
+            .flat_map(|(vr, entry)| {
+                let y = pad + vr as f32 * ch;
+                entry.segs.iter().map(move |(col, buf)| TextArea {
+                    buffer: buf,
+                    left: pad + *col as f32 * cw,
+                    top: y,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: y as i32,
+                        right: width,
+                        bottom: (y + ch) as i32,
+                    },
+                    default_color: fg_default,
+                    custom_glyphs: &[],
+                })
             })
             .collect();
 
@@ -468,6 +476,33 @@ impl Renderer {
         self.atlas.trim();
         Ok(())
     }
+}
+
+/// 行内容哈希（FNV-1a）：字符 + 前景/背景色 + 样式标志。
+/// 用于行级排版缓存命中判断。
+fn hash_row(row: &lumen_term::Row, cols: usize) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn color_code(c: lumen_term::Color) -> u32 {
+        match c {
+            lumen_term::Color::Default => 0,
+            lumen_term::Color::Indexed(i) => 0x100 | i as u32,
+            lumen_term::Color::Rgb(r, g, b) => {
+                0x0200_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+            }
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for cell in row.cells().iter().take(cols) {
+        for v in [
+            cell.ch as u32,
+            color_code(cell.fg),
+            color_code(cell.bg),
+            cell.flags.bits() as u32,
+        ] {
+            h = (h ^ v as u64).wrapping_mul(PRIME);
+        }
+    }
+    h
 }
 
 /// 在系统字体库中挑选等宽字体：Cascadia Mono → Consolas → 任意 Monospace。
