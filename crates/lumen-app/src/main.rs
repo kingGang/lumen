@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod input;
+mod profile;
 mod session;
 mod settings;
 mod shell;
@@ -101,6 +102,9 @@ struct AppState {
     proxy: EventLoopProxy<PtyWake>,
     /// 应用设置（设置页编辑的数据源；变更即写盘）。
     settings: settings::Settings,
+    /// 登录档案（mock）：None = 未登录。顶栏头像、头像菜单、设置页
+    /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
+    profile: Option<profile::Profile>,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
@@ -295,6 +299,13 @@ impl App {
             app_settings.save();
         }
 
+        // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
+        let user_profile = profile::Profile::load();
+        match &user_profile {
+            Some(p) => info!("登录态加载：{} <{}>（本地 mock）", p.display_name, p.email),
+            None => info!("登录态：未登录"),
+        }
+
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
         shell::theme::apply_style(
@@ -316,10 +327,12 @@ impl App {
             egui_wgpu::RendererOptions::default(),
         );
 
-        // 终端区初值：窗口减去侧栏宽度（首帧 egui 布局后按实际矩形校正）。
+        // 终端区初值：窗口减去侧栏宽度与顶栏高度（首帧 egui 布局后
+        // 按实际矩形校正，文件树栏宽度即在首帧补扣）。
         let sidebar_px = (shell::SIDEBAR_WIDTH * scale).round();
+        let topbar_px = (shell::topbar::HEIGHT * scale).round();
         let term_w = ((size.width as f32 - sidebar_px).max(1.0)) as u32;
-        let term_h = size.height.max(1);
+        let term_h = ((size.height as f32 - topbar_px).max(1.0)) as u32;
         renderer.ensure_offscreen(term_w, term_h);
         let term_tex_id = egui_renderer.register_native_texture(
             renderer.device(),
@@ -371,6 +384,7 @@ impl App {
             wake_pending,
             proxy: self.proxy.clone(),
             settings: app_settings,
+            profile: user_profile,
             modifiers: ModifiersState::default(),
             clipboard,
             last_key_at: None,
@@ -379,7 +393,7 @@ impl App {
             egui_state,
             egui_renderer,
             term_tex_id,
-            term_rect_px: (sidebar_px, 0.0, term_w as f32, term_h as f32),
+            term_rect_px: (sidebar_px, topbar_px, term_w as f32, term_h as f32),
             terminal_focused: true,
             egui_repaint_at: None,
             shell_state: shell::ShellState::default(),
@@ -678,6 +692,11 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     let shift = state.modifiers.shift_key();
                     match &event.logical_key {
+                        // 登录覆盖层打开期间外壳快捷键全部不响应（键盘归
+                        // egui 的输入框，Esc 关闭由 Modal 处理）；按键也
+                        // 不会直通 PTY——下方 terminal_focused=false 的闸
+                        // 会拦住。
+                        _ if state.shell_state.login.open => {}
                         // Ctrl+, 开/关设置页（终端焦点与 IME 路由随之切换）。
                         Key::Character(c) if !shift && c.as_str() == "," => {
                             if state.shell_state.settings.open {
@@ -1014,19 +1033,18 @@ impl ApplicationHandler<PtyWake> for App {
                     .cwd()
                     .map(std::path::Path::to_path_buf);
                 let shell_idle = state.sessions[state.active].term.shell_waiting_input();
+                let shell_input = shell::ShellInput {
+                    term_tex: tex_id,
+                    sessions: &entries,
+                    profile: state.profile.as_ref(),
+                    cwd: active_cwd.as_deref(),
+                    shell_idle,
+                };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
-                    shell_out = Some(shell::show(
-                        ui,
-                        tex_id,
-                        &entries,
-                        shell_state,
-                        app_settings,
-                        active_cwd.as_deref(),
-                        shell_idle,
-                    ));
+                    shell_out = Some(shell::show(ui, &shell_input, shell_state, app_settings));
                 });
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
@@ -1071,14 +1089,20 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
 
-                // —— 设置页动作：焦点路由 + 外观变更即时生效 + 写盘 ——
-                if shell_out.settings_closed {
+                // —— 覆盖层（设置页/登录页）焦点路由：先处理关闭再处理
+                // 打开——登录页关闭时设置页可能仍开着（Account 入口的
+                // 叠层场景），后判打开保证焦点不被错误交还终端 ——
+                if shell_out.settings_closed || shell_out.login_closed {
                     // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
                     state.terminal_focused = true;
                 }
-                if shell_out.settings_opened || state.shell_state.settings.open {
-                    // 打开期间键盘/IME 恒归 egui（设置页是覆盖层，
-                    // 终端的 PTY 消化与渲染照常进行，只是不收键盘）。
+                if shell_out.settings_opened
+                    || state.shell_state.settings.open
+                    || shell_out.login_opened
+                    || state.shell_state.login.open
+                {
+                    // 打开期间键盘/IME 恒归 egui（覆盖层之下终端的 PTY
+                    // 消化与渲染照常进行，只是不收键盘）。
                     state.terminal_focused = false;
                 }
                 if shell_out.settings_font_changed {
@@ -1104,6 +1128,21 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.settings_font_changed || shell_out.settings_theme_changed {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。
                     state.settings.save();
+                }
+
+                // —— 登录/登出动作：state.profile 是唯一数据源，更新后
+                // 顶栏头像、头像菜单、设置页 Account 三处下一帧即联动 ——
+                if let Some(p) = shell_out.logged_in {
+                    // mock 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
+                    p.save();
+                    info!("登录成功（mock）：{} <{}>", p.display_name, p.email);
+                    state.profile = Some(p);
+                }
+                if shell_out.logged_out {
+                    // 登出：删 profile.json，三处 UI 即时回未登录态。
+                    profile::Profile::delete();
+                    info!("已登出（profile.json 已删除）");
+                    state.profile = None;
                 }
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序打开 ——

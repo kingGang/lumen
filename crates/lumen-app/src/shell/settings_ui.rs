@@ -8,6 +8,7 @@
 //! Esc / 右上角 ✕ 关闭。设置页打开期间 PTY 消化与终端渲染照常进行
 //! ——覆盖层只是 UI 层。
 
+use crate::profile::Profile;
 use crate::settings::{self, Settings, ThemeChoice};
 
 use super::theme::Palette;
@@ -95,6 +96,12 @@ impl SettingsUiState {
         self.custom_font_mode = !fam.is_empty() && !FONT_PRESETS.contains(&fam);
         self.custom_font_buf = fam.to_owned();
     }
+
+    /// 打开设置页并定位到 Keyboard shortcuts 分类（头像菜单入口）。
+    pub fn open_with_shortcuts(&mut self, settings: &Settings) {
+        self.open_with(settings);
+        self.category = Category::Shortcuts;
+    }
 }
 
 /// 一帧设置页 UI 的产出。
@@ -106,6 +113,10 @@ pub struct SettingsOutput {
     pub font_changed: bool,
     /// 主题变更（main 据此切终端 Theme + egui 样式）。
     pub theme_changed: bool,
+    /// Account：点击了 Log out（main 删 profile 并清全局登录态）。
+    pub log_out: bool,
+    /// Account：未登录态点击了 Log in（打开登录覆盖层）。
+    pub open_login: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -113,6 +124,7 @@ pub fn show(
     ctx: &egui::Context,
     st: &mut SettingsUiState,
     settings: &mut Settings,
+    profile: Option<&Profile>,
     pal: &Palette,
 ) -> SettingsOutput {
     let mut out = SettingsOutput::default();
@@ -178,7 +190,7 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(&mut content_ui, |ui| match st.category {
-                    Category::Account => account(ui, pal),
+                    Category::Account => account(ui, profile, pal, &mut out),
                     Category::Appearance => appearance(ui, st, settings, pal, &mut out),
                     Category::Shortcuts => shortcuts(ui, pal),
                     Category::About => about(ui, pal),
@@ -220,32 +232,76 @@ fn heading(ui: &mut egui::Ui, pal: &Palette, text: &str) {
     ui.add_space(16.0);
 }
 
-/// Account：本期占位（真登录 M3.5 接入）。
-fn account(ui: &mut egui::Ui, pal: &Palette) {
+/// Account（M3.5，参照截图 docs/截图/设置界面.png）：已登录展示
+/// 圆头像、展示名、邮箱与 Log out；未登录展示占位头像与 Log in 入口。
+/// 登录态与顶栏头像、头像菜单同源 main 的 `Option<Profile>`。
+fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut SettingsOutput) {
     heading(ui, pal, "Account");
     ui.horizontal(|ui| {
-        // 未登录占位头像：圆底 + 人形图标（egui 自带 emoji 字体覆盖）。
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(rect.center(), 22.0, pal.bg_highlight);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "👤",
-            egui::FontId::proportional(22.0),
-            pal.fg_dim,
-        );
+        match profile {
+            Some(p) => {
+                // 已登录头像：强调色圆底 + 展示名首字母（与顶栏一致）。
+                ui.painter().circle_filled(rect.center(), 22.0, pal.accent);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    p.avatar_letter(),
+                    egui::FontId::proportional(20.0),
+                    pal.bg_dark,
+                );
+            }
+            None => {
+                // 未登录占位头像：圆底 + 人形图标（egui 自带 emoji 字体）。
+                ui.painter()
+                    .circle_filled(rect.center(), 22.0, pal.bg_highlight);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "👤",
+                    egui::FontId::proportional(22.0),
+                    pal.fg_dim,
+                );
+            }
+        }
         ui.vertical(|ui| {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("未登录").color(pal.fg));
-            ui.label(
-                egui::RichText::new("登录功能将在后续版本提供")
-                    .size(11.0)
-                    .color(pal.fg_dim),
-            );
+            match profile {
+                Some(p) => {
+                    ui.label(egui::RichText::new(&p.display_name).color(pal.fg));
+                    ui.label(
+                        egui::RichText::new(&p.email).size(11.0).color(pal.fg_dim),
+                    );
+                }
+                None => {
+                    ui.label(egui::RichText::new("未登录").color(pal.fg));
+                    ui.label(
+                        egui::RichText::new("本地模拟登录，真账号后续版本接入")
+                            .size(11.0)
+                            .color(pal.fg_dim),
+                    );
+                }
+            }
         });
     });
+    ui.add_space(20.0);
+    match profile {
+        Some(_) => {
+            let btn = egui::Button::new(egui::RichText::new("Log out").color(pal.fg))
+                .min_size(egui::vec2(120.0, 30.0));
+            if ui.add(btn).clicked() {
+                out.log_out = true;
+            }
+        }
+        None => {
+            let btn = egui::Button::new(egui::RichText::new("Log in").color(pal.fg))
+                .min_size(egui::vec2(120.0, 30.0));
+            if ui.add(btn).clicked() {
+                out.open_login = true;
+            }
+        }
+    }
 }
 
 /// Appearance：主题 / 字体 / 字号，全部即时生效。

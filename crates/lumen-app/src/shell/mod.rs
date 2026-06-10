@@ -1,14 +1,18 @@
-//! 应用外壳 UI（egui）：侧栏 + 文件树 + 终端工作区布局 + 设置覆盖层。
+//! 应用外壳 UI（egui）：顶栏 + 侧栏 + 文件树 + 终端工作区布局 +
+//! 设置/登录覆盖层。
 //!
 //! M3.2 起侧栏是真功能的会话 tab 列表：条目（标题 + 未读点 + 激活
 //! 高亮）点击切换、右键菜单重命名/关闭、底部新建。M3.3 增加中间一栏
 //! 文件树（跟随激活会话 cwd，可折叠）。M3.4 增加设置界面（全屏覆盖
-//! 层，入口为侧栏底部齿轮与 Ctrl+,）。UI 只产出动作（[`ShellOutput`]），
-//! 会话增删切换/PTY 写入/设置即时生效由 main.rs 执行。
+//! 层，入口为侧栏底部齿轮与 Ctrl+,）。M3.5 增加顶栏（标题 + 头像
+//! 菜单）与登录覆盖层（mock）。UI 只产出动作（[`ShellOutput`]），
+//! 会话增删切换/PTY 写入/设置即时生效/登录写盘由 main.rs 执行。
 
 pub mod filetree;
+pub mod login_ui;
 pub mod settings_ui;
 pub mod theme;
+pub mod topbar;
 
 /// 左侧会话栏宽度（逻辑像素）。
 pub const SIDEBAR_WIDTH: f32 = 180.0;
@@ -34,6 +38,22 @@ pub struct ShellState {
     pub filetree: filetree::FileTreeState,
     /// 设置页（开关/分类/字体编辑缓冲等跨帧状态）。
     pub settings: settings_ui::SettingsUiState,
+    /// 登录覆盖层（开关/输入缓冲等跨帧状态）。
+    pub login: login_ui::LoginUiState,
+}
+
+/// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
+pub struct ShellInput<'a> {
+    /// 终端离屏纹理的 egui 句柄。
+    pub term_tex: egui::TextureId,
+    /// 会话条目（侧栏列表；顶栏标题取自其中的激活条目）。
+    pub sessions: &'a [SessionEntry],
+    /// 登录态（顶栏头像、头像菜单、设置页 Account 三处同源展示）。
+    pub profile: Option<&'a crate::profile::Profile>,
+    /// 激活会话的 cwd（文件树跟随；OSC 9;9 上报）。
+    pub cwd: Option<&'a std::path::Path>,
+    /// 激活会话 shell 空闲（文件树 cd 注入闸门）。
+    pub shell_idle: bool,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -62,20 +82,26 @@ pub struct ShellOutput {
     pub settings_font_changed: bool,
     /// 设置页改了主题（main 切终端 Theme + egui 样式联动）。
     pub settings_theme_changed: bool,
+    /// 登录覆盖层本帧被打开（main 把终端焦点交给 egui）。
+    pub login_opened: bool,
+    /// 登录覆盖层本帧被关闭（main 按覆盖层整体状态决定焦点归属）。
+    pub login_closed: bool,
+    /// mock 登录成功的档案（main 写盘并更新全局登录态——顶栏头像、
+    /// 头像菜单、设置页 Account 三处同源即时联动）。
+    pub logged_in: Option<crate::profile::Profile>,
+    /// 请求登出（头像菜单或设置页 Account；main 删盘并清登录态）。
+    pub logged_out: bool,
 }
 
-/// 绘制整个外壳：左侧会话栏 + 中间文件树 + 中央终端纹理 + 设置覆盖层。
-/// `cwd`/`shell_idle` 均取自激活会话（文件树跟随与 cd 注入闸门）；
-/// `app_settings` 是设置页直接编辑的数据（变更经 [`ShellOutput`] 通知
-/// main 即时生效与写盘）。
+/// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
+/// 设置/登录覆盖层。输入是 main 按帧构造的状态快照（[`ShellInput`]）；
+/// `app_settings` 是设置页直接编辑的数据（变更经 [`ShellOutput`]
+/// 通知 main 即时生效与写盘）。
 pub fn show(
     root: &mut egui::Ui,
-    term_tex: egui::TextureId,
-    sessions: &[SessionEntry],
+    input: &ShellInput<'_>,
     st: &mut ShellState,
     app_settings: &mut crate::settings::Settings,
-    cwd: Option<&std::path::Path>,
-    shell_idle: bool,
 ) -> ShellOutput {
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
@@ -90,6 +116,10 @@ pub fn show(
         settings_closed: false,
         settings_font_changed: false,
         settings_theme_changed: false,
+        login_opened: false,
+        login_closed: false,
+        logged_in: None,
+        logged_out: false,
     };
     let pal = theme::palette(app_settings.appearance.theme.is_light());
     // 重命名目标可能已被关闭（进程退出等）：清掉孤儿编辑态，
@@ -97,9 +127,34 @@ pub fn show(
     if st
         .renaming
         .as_ref()
-        .is_some_and(|(id, _)| !sessions.iter().any(|e| e.id == *id))
+        .is_some_and(|(id, _)| !input.sessions.iter().any(|e| e.id == *id))
     {
         st.renaming = None;
+    }
+
+    // —— 顶栏（先于侧栏加入面板布局，横贯整窗）：标题 + 头像菜单 ——
+    // 标题与窗口标题同源（激活会话的 display_title，侧栏条目已做
+    // 空回退），无激活条目（防御）时退回应用名。
+    let active_title = input
+        .sessions
+        .iter()
+        .find(|e| e.active)
+        .map_or("Lumen", |e| e.title.as_str());
+    let tb = topbar::show(root, active_title, input.profile, pal);
+    if tb.open_settings {
+        out.settings_opened = true;
+    }
+    if tb.open_shortcuts {
+        // 直接带分类打开：下方 settings_opened 分支见已 open 不会再
+        // 以默认分类重复初始化。
+        st.settings.open_with_shortcuts(app_settings);
+        out.settings_opened = true;
+    }
+    if tb.open_login {
+        out.login_opened = true;
+    }
+    if tb.log_out {
+        out.logged_out = true;
     }
 
     egui::Panel::left("lumen_sidebar")
@@ -111,11 +166,11 @@ pub fn show(
                 .fill(pal.bg_dark)
                 .inner_margin(egui::Margin::symmetric(8, 10)),
         )
-        .show_inside(root, |ui| sidebar_ui(ui, sessions, st, pal, &mut out));
+        .show_inside(root, |ui| sidebar_ui(ui, input.sessions, st, pal, &mut out));
 
     // 中间一栏：文件树（可折叠；树根跟随激活会话 cwd）。开合改变
     // 终端区宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
-    let ft = filetree::show(root, &mut st.filetree, cwd, shell_idle, pal);
+    let ft = filetree::show(root, &mut st.filetree, input.cwd, input.shell_idle, pal);
     out.cd_dir = ft.cd_dir;
     out.open_file = ft.open_file;
 
@@ -125,7 +180,7 @@ pub fn show(
             let rect = ui.available_rect_before_wrap();
             ui.put(
                 rect,
-                egui::Image::new(egui::load::SizedTexture::new(term_tex, rect.size())),
+                egui::Image::new(egui::load::SizedTexture::new(input.term_tex, rect.size())),
             );
             // 点击终端区 → 焦点交还终端。选区/块点击/滚轮仍走
             // window_event 按终端区矩形路由（见 main.rs）。
@@ -140,12 +195,38 @@ pub fn show(
         st.settings.open_with(app_settings);
     }
     if st.settings.open {
-        let s_out = settings_ui::show(root.ctx(), &mut st.settings, app_settings, pal);
+        let s_out =
+            settings_ui::show(root.ctx(), &mut st.settings, app_settings, input.profile, pal);
         out.settings_font_changed = s_out.font_changed;
         out.settings_theme_changed = s_out.theme_changed;
+        if s_out.log_out {
+            out.logged_out = true;
+        }
+        if s_out.open_login {
+            // Account 的 Log in：登录卡片叠在设置页之上（后绘制者在
+            // 上层），登录成功后 Account 即时显示已登录态。
+            out.login_opened = true;
+        }
         if s_out.closed {
             st.settings.open = false;
             out.settings_closed = true;
+        }
+    }
+
+    // —— 登录覆盖层（最后绘制 = 盖在设置页之上）——
+    // 入口：头像菜单 Log in / 设置页 Account 的 Log in，本帧点击
+    // 立即打开（同帧呈现）。
+    if out.login_opened && !st.login.open {
+        st.login.open_clean();
+    }
+    if st.login.open {
+        let l_out = login_ui::show(root.ctx(), &mut st.login, pal);
+        if l_out.logged_in.is_some() {
+            out.logged_in = l_out.logged_in;
+        }
+        if l_out.closed {
+            st.login.open = false;
+            out.login_closed = true;
         }
     }
     out
