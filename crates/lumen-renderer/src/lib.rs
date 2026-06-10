@@ -1,6 +1,10 @@
 //! Lumen 的渲染层：wgpu surface 管理 + glyphon 文本渲染 + 矩形管线。
 //!
 //! 每帧流程：Grid → (背景/光标/下划线矩形, 每行 rich text) → GPU。
+//!
+//! M3 起终端内容渲染到**持久离屏纹理**（egui 以 `ui.image` 把它嵌进
+//! 工作区），surface 的取帧/呈现所有权上移到 app 层（egui pass 是
+//! surface 的唯一写入方）。
 
 mod rect;
 mod theme;
@@ -27,12 +31,71 @@ struct RowSegs {
     segs: Vec<(usize, TextBuffer)>,
 }
 
+/// 终端内容的持久离屏渲染目标。
+///
+/// 同一张纹理持有两个视图：终端管线写入纹理本身格式（通常 sRGB）的
+/// 渲染视图；egui 采样用去掉 sRGB 后缀的同布局视图——egui 的着色器
+/// 期望「非 sRGB-aware」纹理（它自己做 gamma→linear），若用 sRGB 视图
+/// 采样会被硬件先转线性、再被 egui 二次转换，画面整体偏暗。
+struct Offscreen {
+    texture: wgpu::Texture,
+    /// 终端管线的渲染目标视图（纹理本身格式）。
+    render_view: wgpu::TextureView,
+    /// 供 egui 采样的视图（非 sRGB 格式重解释）。
+    sample_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
+impl Offscreen {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, width: u32, height: u32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        let sample_format = format.remove_srgb_suffix();
+        let view_formats: &[wgpu::TextureFormat] = if sample_format == format {
+            &[]
+        } else {
+            std::slice::from_ref(&sample_format)
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("lumen offscreen"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats,
+        });
+        let render_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sample_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(sample_format),
+            ..Default::default()
+        });
+        Self {
+            texture,
+            render_view,
+            sample_view,
+            width,
+            height,
+        }
+    }
+}
+
 /// 终端渲染器。持有 GPU 资源与字体系统。
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    /// 终端内容的离屏渲染目标（尺寸 = 终端区物理像素）。
+    offscreen: Offscreen,
 
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -95,7 +158,9 @@ impl Renderer {
             wgpu::PresentMode::AutoVsync
         };
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_DST 为过渡期直呈桥（present_offscreen）所需，
+            // egui 接入后恢复为仅 RENDER_ATTACHMENT。
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format,
             width: width.max(1),
             height: height.max(1),
@@ -105,6 +170,9 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        // 初始离屏纹理先按整窗尺寸建；app 层拿到 egui 布局的终端区
+        // 矩形后用 ensure_offscreen 重建到实际尺寸。
+        let offscreen = Offscreen::new(&device, format, config.width, config.height);
 
         let mut font_system = FontSystem::new();
         let font_family = pick_mono_family(&font_system);
@@ -130,6 +198,7 @@ impl Renderer {
             queue,
             surface,
             config,
+            offscreen,
             font_system,
             swash_cache: SwashCache::new(),
             viewport,
@@ -146,23 +215,24 @@ impl Renderer {
         })
     }
 
-    /// 单元格物理像素尺寸（app 用它换算窗口尺寸 ↔ 行列数）。
+    /// 单元格物理像素尺寸（app 用它换算终端区尺寸 ↔ 行列数）。
     pub fn cell_size(&self) -> (f32, f32) {
         (self.cell_w, self.cell_h)
     }
 
-    /// 当前能容纳的 (rows, cols)（扣除四周内边距）。
-    pub fn grid_size(&self) -> (usize, usize) {
-        let usable_h = (self.config.height as f32 - self.padding * 2.0).max(0.0);
-        let usable_w = (self.config.width as f32 - self.padding * 2.0).max(0.0);
+    /// 给定终端区物理像素尺寸能容纳的 (rows, cols)（扣除四周内边距）。
+    pub fn grid_size_for(&self, width: u32, height: u32) -> (usize, usize) {
+        let usable_h = (height as f32 - self.padding * 2.0).max(0.0);
+        let usable_w = (width as f32 - self.padding * 2.0).max(0.0);
         let rows = (usable_h / self.cell_h).floor() as usize;
         let cols = (usable_w / self.cell_w).floor() as usize;
         (rows.max(1), cols.max(1))
     }
 
-    /// 像素坐标 → 视图格子坐标（行, 列），自动夹紧到网格范围。
+    /// 终端区内像素坐标（相对终端区原点）→ 视图格子坐标（行, 列），
+    /// 自动夹紧到网格范围。
     pub fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
-        let (rows, cols) = self.grid_size();
+        let (rows, cols) = self.grid_size_for(self.offscreen.width, self.offscreen.height);
         let col = ((px as f32 - self.padding) / self.cell_w).floor() as isize;
         let row = ((py as f32 - self.padding) / self.cell_h).floor() as isize;
         (
@@ -171,8 +241,62 @@ impl Renderer {
         )
     }
 
-    /// 窗口物理尺寸变化。
-    pub fn resize(&mut self, width: u32, height: u32) {
+    /// 格子在终端区内的像素原点（IME 候选框定位等）。
+    pub fn cell_origin(&self, row: usize, col: usize) -> (f32, f32) {
+        (
+            self.padding + col as f32 * self.cell_w,
+            self.padding + row as f32 * self.cell_h,
+        )
+    }
+
+    /// wgpu 设备（egui 渲染器等外部管线共用同一设备）。
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// wgpu 队列。
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// surface 像素格式（外部渲染管线的目标格式须与之一致）。
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    /// surface 当前物理尺寸。
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// 当前主题。
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// 终端内容的离屏纹理。
+    pub fn offscreen_texture(&self) -> &wgpu::Texture {
+        &self.offscreen.texture
+    }
+
+    /// 供 egui 采样的离屏视图（非 sRGB 重解释，缘由见 [`Offscreen`]）。
+    pub fn offscreen_view(&self) -> &wgpu::TextureView {
+        &self.offscreen.sample_view
+    }
+
+    /// 确保离屏纹理为指定尺寸；尺寸变化时重建并返回 true
+    /// （调用方需重新把新视图绑定到 egui 纹理 id）。
+    pub fn ensure_offscreen(&mut self, width: u32, height: u32) -> bool {
+        let (width, height) = (width.max(1), height.max(1));
+        if (self.offscreen.width, self.offscreen.height) == (width, height) {
+            return false;
+        }
+        self.offscreen = Offscreen::new(&self.device, self.config.format, width, height);
+        true
+    }
+
+    /// 窗口 surface 物理尺寸变化（离屏纹理由 [`Self::ensure_offscreen`] 单独管理）。
+    pub fn resize_surface(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
@@ -181,7 +305,47 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// 渲染一帧。
+    /// 取下一帧 surface 纹理。Lost/Outdated 时重新配置并返回 None
+    /// （调用方跳过本帧呈现，等下一次重绘）。
+    pub fn acquire_frame(&mut self) -> Option<wgpu::SurfaceTexture> {
+        use wgpu::CurrentSurfaceTexture;
+        match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => Some(f),
+            CurrentSurfaceTexture::Lost | CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                None
+            }
+            // Timeout/Occluded/校验错误：跳过本帧。
+            _ => None,
+        }
+    }
+
+    /// 【过渡期直呈桥】把离屏纹理拷贝到 surface 并呈现。
+    /// 仅供 egui 接入前的中间状态使用，egui 合流后移除。
+    pub fn present_offscreen(&mut self) {
+        let Some(frame) = self.acquire_frame() else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lumen blit"),
+            });
+        encoder.copy_texture_to_texture(
+            self.offscreen.texture.as_image_copy(),
+            frame.texture.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.offscreen.width.min(self.config.width),
+                height: self.offscreen.height.min(self.config.height),
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+    }
+
+    /// 渲染一帧终端内容到离屏纹理（不触碰 surface，呈现由 app 层的
+    /// egui pass 完成）。
     ///
     /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为要绘制的
     /// 光标屏幕坐标（None 不画）——由上层做位置防抖后传入，不直接读
@@ -194,19 +358,9 @@ impl Renderer {
         cursor: Option<(usize, usize)>,
         selected_block: Option<u64>,
     ) -> Result<()> {
-        use wgpu::CurrentSurfaceTexture;
-        let frame = match self.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => f,
-            CurrentSurfaceTexture::Lost | CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
-            }
-            // Timeout/Occluded/校验错误：跳过本帧。
-            _ => return Ok(()),
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        // 离屏视图按值克隆（Arc 浅拷贝），避免长借用 self 卡住后续字段访问。
+        let view = self.offscreen.render_view.clone();
+        let (target_w, target_h) = (self.offscreen.width, self.offscreen.height);
 
         let grid = term.grid();
         let rows = grid.rows();
@@ -326,12 +480,8 @@ impl Renderer {
                 });
             }
         }
-        self.rects.prepare(
-            &self.device,
-            &self.queue,
-            (self.config.width, self.config.height),
-            &instances,
-        );
+        self.rects
+            .prepare(&self.device, &self.queue, (target_w, target_h), &instances);
 
         // ---- 文本排版：按网格分段强制对齐，行级缓存 ----
         // 窄字符连续成段、宽字符（CJK 等）与一切非 ASCII 字符单独成段，
@@ -454,7 +604,7 @@ impl Renderer {
         }
 
         let fg_default = self.theme.foreground.to_glyphon();
-        let width = self.config.width as i32;
+        let width = target_w as i32;
         let text_areas: Vec<TextArea> = self
             .row_segs
             .iter()
@@ -482,8 +632,8 @@ impl Renderer {
         self.viewport.update(
             &self.queue,
             Resolution {
-                width: self.config.width,
-                height: self.config.height,
+                width: target_w,
+                height: target_h,
             },
         );
         self.text_renderer
@@ -527,7 +677,6 @@ impl Renderer {
                 .context("glyphon render 失败")?;
         }
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
         self.atlas.trim();
         Ok(())
     }

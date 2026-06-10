@@ -258,7 +258,8 @@ impl App {
         let scale = window.scale_factor() as f32;
         let renderer = Renderer::new(window.clone(), size.width, size.height, scale)
             .context("初始化渲染器失败")?;
-        let (rows, cols) = renderer.grid_size();
+        // 过渡期终端区 = 整窗（egui 接入后由布局矩形决定）。
+        let (rows, cols) = renderer.grid_size_for(size.width, size.height);
         info!("终端尺寸: {rows} 行 x {cols} 列");
 
         let term = Terminal::new(rows, cols, SCROLLBACK);
@@ -479,8 +480,9 @@ impl ApplicationHandler<PtyWake> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::Resized(size) => {
-                state.renderer.resize(size.width, size.height);
-                let (rows, cols) = state.renderer.grid_size();
+                state.renderer.resize_surface(size.width, size.height);
+                state.renderer.ensure_offscreen(size.width, size.height);
+                let (rows, cols) = state.renderer.grid_size_for(size.width, size.height);
                 state.term.resize(rows, cols);
                 let _ = state.pty.resize(rows as u16, cols as u16);
                 // 尺寸变化会夹紧光标位置，立即同步绘制态。
@@ -714,6 +716,8 @@ impl ApplicationHandler<PtyWake> for App {
                 ) {
                     error!("渲染失败: {e:#}");
                 }
+                // 过渡期直呈桥：离屏纹理拷到 surface（egui 接入后移除）。
+                state.renderer.present_offscreen();
                 let gap = state
                     .last_render_at
                     .map(|t| render_t0.duration_since(t))
