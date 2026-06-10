@@ -42,6 +42,11 @@ impl ThemeChoice {
         }
     }
 
+    /// 是否浅色主题（外壳 egui 色板联动用）。
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::TokyoNightLight)
+    }
+
     /// 对应的终端配色主题（lumen-renderer 侧）。
     pub fn terminal_theme(self) -> lumen_renderer::Theme {
         match self {

@@ -99,6 +99,8 @@ struct AppState {
     wake_pending: Arc<AtomicBool>,
     /// 事件循环唤醒句柄（补发 wake / 新建会话的转发线程用）。
     proxy: EventLoopProxy<PtyWake>,
+    /// 应用设置（设置页编辑的数据源；变更即写盘）。
+    settings: settings::Settings,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
     /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
@@ -283,6 +285,10 @@ impl App {
                 &ap.font_family
             }
         );
+        // 字体回退提示（设置页 Appearance 展示）。
+        let font_hint = (!ap.font_family.is_empty()
+            && !actual_family.eq_ignore_ascii_case(&ap.font_family))
+        .then(|| format!("系统中未找到「{}」，已回退「{actual_family}」", ap.font_family));
         // 首次启动（无设置文件）落盘默认值，方便用户直接手改；
         // 文件存在但损坏时不在此覆盖（保留现场，变更时才写）。
         if settings::Settings::path().is_some_and(|p| !p.exists()) {
@@ -291,7 +297,10 @@ impl App {
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();
-        shell::theme::apply_style(&egui_ctx);
+        shell::theme::apply_style(
+            &egui_ctx,
+            shell::theme::palette(app_settings.appearance.theme.is_light()),
+        );
         shell::theme::install_cjk_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -347,7 +356,7 @@ impl App {
             .ok()
             .and_then(|p| std::fs::File::create(p).ok());
 
-        Ok(AppState {
+        let mut state = AppState {
             perf,
             perf_t0: Instant::now(),
             last_render_at: None,
@@ -361,6 +370,7 @@ impl App {
             carry: None,
             wake_pending,
             proxy: self.proxy.clone(),
+            settings: app_settings,
             modifiers: ModifiersState::default(),
             clipboard,
             last_key_at: None,
@@ -373,7 +383,9 @@ impl App {
             terminal_focused: true,
             egui_repaint_at: None,
             shell_state: shell::ShellState::default(),
-        })
+        };
+        state.shell_state.settings.font_hint = font_hint;
+        Ok(state)
     }
 }
 
@@ -653,7 +665,7 @@ impl ApplicationHandler<PtyWake> for App {
                 let pressed = event.state == ElementState::Pressed;
                 // —— 外壳级快捷键：Ctrl+T 新建 / Ctrl+W 关闭当前 /
                 // Ctrl+Tab 下一个（Ctrl+Shift+Tab 上一个）/
-                // Ctrl+B 文件树开合 ——
+                // Ctrl+B 文件树开合 / Ctrl+, 设置页开合 ——
                 // 路由规则：非 alt-screen 时优先于终端直通拦截（窗口级，
                 // 终端是否聚焦都生效）；**alt screen 激活时全部直通终端
                 // 不拦截**——vim 的 Ctrl+W 是窗口操作前缀键、全屏 TUI
@@ -666,6 +678,22 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     let shift = state.modifiers.shift_key();
                     match &event.logical_key {
+                        // Ctrl+, 开/关设置页（终端焦点与 IME 路由随之切换）。
+                        Key::Character(c) if !shift && c.as_str() == "," => {
+                            if state.shell_state.settings.open {
+                                state.shell_state.settings.open = false;
+                                state.terminal_focused = true;
+                            } else {
+                                state.shell_state.settings.open_with(&state.settings);
+                                state.terminal_focused = false;
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
+                        // 设置页打开期间其余外壳快捷键不响应（避免在覆盖
+                        // 层背后偷偷增删会话）；按键也不会直通 PTY——
+                        // 下方 terminal_focused=false 的闸会拦住。
+                        _ if state.shell_state.settings.open => {}
                         Key::Character(c) if !shift && c.eq_ignore_ascii_case("t") => {
                             state.new_session();
                             return;
@@ -987,6 +1015,7 @@ impl ApplicationHandler<PtyWake> for App {
                     .map(std::path::Path::to_path_buf);
                 let shell_idle = state.sessions[state.active].term.shell_waiting_input();
                 let shell_state = &mut state.shell_state;
+                let app_settings = &mut state.settings;
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
                     shell_out = Some(shell::show(
@@ -994,6 +1023,7 @@ impl ApplicationHandler<PtyWake> for App {
                         tex_id,
                         &entries,
                         shell_state,
+                        app_settings,
                         active_cwd.as_deref(),
                         shell_idle,
                     ));
@@ -1041,6 +1071,41 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
 
+                // —— 设置页动作：焦点路由 + 外观变更即时生效 + 写盘 ——
+                if shell_out.settings_closed {
+                    // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
+                    state.terminal_focused = true;
+                }
+                if shell_out.settings_opened || state.shell_state.settings.open {
+                    // 打开期间键盘/IME 恒归 egui（设置页是覆盖层，
+                    // 终端的 PTY 消化与渲染照常进行，只是不收键盘）。
+                    state.terminal_focused = false;
+                }
+                if shell_out.settings_font_changed {
+                    // 字体/字号即时生效：重建字体度量（行排版缓存随之
+                    // 失效）；cell 尺寸变化引发的行列数重算与全会话
+                    // resize 在下方矩形检查统一处理（同一帧内完成）。
+                    let ap = &state.settings.appearance;
+                    let actual = state.renderer.reconfigure_font(&ap.font_family, ap.font_size);
+                    state.shell_state.settings.font_hint = (!ap.font_family.is_empty()
+                        && !actual.eq_ignore_ascii_case(&ap.font_family))
+                    .then(|| format!("系统中未找到「{}」，已回退「{actual}」", ap.font_family));
+                }
+                if shell_out.settings_theme_changed {
+                    // 主题即时生效：终端配色（含行排版缓存失效，行哈希
+                    // 不含主题解析色）+ 外壳 egui 样式联动。
+                    let theme = state.settings.appearance.theme;
+                    state.renderer.set_theme(theme.terminal_theme());
+                    shell::theme::apply_style(
+                        &state.egui_ctx,
+                        shell::theme::palette(theme.is_light()),
+                    );
+                }
+                if shell_out.settings_font_changed || shell_out.settings_theme_changed {
+                    // 变更即写盘（写临时文件后改名，防半写损坏）。
+                    state.settings.save();
+                }
+
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序打开 ——
                 if let Some(dir) = shell_out.cd_dir {
                     // UI 已按 shell 空闲闸门过滤，这里直接注入。
@@ -1076,19 +1141,22 @@ impl ApplicationHandler<PtyWake> for App {
                         wgpu::FilterMode::Nearest,
                         state.term_tex_id,
                     );
-                    let (rows, cols) = state.renderer.grid_size_for(tw, th);
-                    let g = state.sessions[state.active].term.grid();
-                    if (rows, cols) != (g.rows(), g.cols()) {
-                        // 所有 tab 共享同一终端视口矩形：resize 对全部会
-                        // 话立即生效（懒 resize 会让后台 TUI 在切换瞬间
-                        // 花屏），新建会话也以此行列数初始化。
-                        for s in &mut state.sessions {
-                            s.term.resize(rows, cols);
-                            let _ = s.pty.resize(rows as u16, cols as u16);
-                            // 尺寸变化会夹紧光标位置，立即同步绘制态。
-                            let g = s.term.grid();
-                            s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
-                        }
+                }
+                // 行列数同时受终端区矩形与 cell 尺寸（设置页字体/字号）
+                // 影响，每帧对照激活会话网格检测（廉价的整数比较）。
+                // 所有 tab 共享同一终端视口矩形：resize 对全部会话立即
+                // 生效（懒 resize 会让后台 TUI 在切换瞬间花屏），新建
+                // 会话也以此行列数初始化。设置页改字号即时生效走的就是
+                // 这条链路：cell 尺寸变 → 行列数变 → term/pty resize。
+                let (rows, cols) = state.renderer.grid_size_for(tw, th);
+                let g = state.sessions[state.active].term.grid();
+                if (rows, cols) != (g.rows(), g.cols()) {
+                    for s in &mut state.sessions {
+                        s.term.resize(rows, cols);
+                        let _ = s.pty.resize(rows as u16, cols as u16);
+                        // 尺寸变化会夹紧光标位置，立即同步绘制态。
+                        let g = s.term.grid();
+                        s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
                     }
                 }
 

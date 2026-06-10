@@ -30,8 +30,6 @@ const STRIP_WIDTH: f32 = 22.0;
 const MAX_ENTRIES_PER_DIR: usize = 1000;
 /// 「shell 忙」轻提示的展示时长。
 const HINT_DURATION: Duration = Duration::from_secs(3);
-/// 面板底色（比 tab 侧栏浅一线，区分两栏）。
-const FILL: egui::Color32 = egui::Color32::from_rgb(0x19, 0x1a, 0x27);
 
 /// 节点种类（Overflow/Unreadable 是不可交互的占位行）。
 #[derive(Clone, Copy)]
@@ -129,6 +127,7 @@ pub fn show(
     st: &mut FileTreeState,
     cwd: Option<&Path>,
     shell_idle: bool,
+    pal: &theme::Palette,
 ) -> FileTreeOutput {
     let mut out = FileTreeOutput::default();
     st.sync_root(cwd);
@@ -140,11 +139,11 @@ pub fn show(
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(FILL)
+                    .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(1, 8)),
             )
             .show_inside(root, |ui| {
-                let btn = egui::Button::new(egui::RichText::new("▶").size(9.0).color(theme::FG_DIM))
+                let btn = egui::Button::new(egui::RichText::new("▶").size(9.0).color(pal.fg_dim))
                     .small();
                 if ui.add(btn).on_hover_text("展开文件树 (Ctrl+B)").clicked() {
                     st.visible = true;
@@ -159,32 +158,38 @@ pub fn show(
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
-                .fill(FILL)
+                .fill(pal.filetree_fill)
                 .inner_margin(egui::Margin::symmetric(6, 8)),
         )
-        .show_inside(root, |ui| panel_ui(ui, st, shell_idle, &mut out));
+        .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, &mut out));
     out
 }
 
 /// 面板内容：工具条 + 轻提示 + 树。
-fn panel_ui(ui: &mut egui::Ui, st: &mut FileTreeState, shell_idle: bool, out: &mut FileTreeOutput) {
+fn panel_ui(
+    ui: &mut egui::Ui,
+    st: &mut FileTreeState,
+    shell_idle: bool,
+    pal: &theme::Palette,
+    out: &mut FileTreeOutput,
+) {
     // —— 工具条：收起按钮 + 根目录名（悬停看全路径）+ 刷新 ——
     ui.horizontal(|ui| {
         let collapse =
-            egui::Button::new(egui::RichText::new("◀").size(9.0).color(theme::FG_DIM)).small();
+            egui::Button::new(egui::RichText::new("◀").size(9.0).color(pal.fg_dim)).small();
         if ui.add(collapse).on_hover_text("收起文件树 (Ctrl+B)").clicked() {
             st.visible = false;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let refresh =
-                egui::Button::new(egui::RichText::new("刷新").size(10.0).color(theme::FG_DIM))
+                egui::Button::new(egui::RichText::new("刷新").size(10.0).color(pal.fg_dim))
                     .small();
             if ui.add(refresh).on_hover_text("重新读取目录").clicked() {
                 st.reset_nodes();
             }
             let title = st.root.as_deref().map_or_else(|| "文件".to_owned(), display_name);
             let label = egui::Label::new(
-                egui::RichText::new(title).size(12.0).color(theme::FG),
+                egui::RichText::new(title).size(12.0).color(pal.fg),
             )
             .truncate();
             let resp = ui.add(label);
@@ -201,7 +206,7 @@ fn panel_ui(ui: &mut egui::Ui, st: &mut FileTreeState, shell_idle: bool, out: &m
             ui.label(
                 egui::RichText::new("Shell 忙碌中，未执行 cd")
                     .size(10.0)
-                    .color(theme::FG_DIM),
+                    .color(pal.fg_dim),
             );
             // 到点重画一帧清掉提示。
             ui.ctx().request_repaint_after(until - now);
@@ -215,7 +220,7 @@ fn panel_ui(ui: &mut egui::Ui, st: &mut FileTreeState, shell_idle: bool, out: &m
         ui.label(
             egui::RichText::new("等待 shell 上报路径…")
                 .size(11.0)
-                .color(theme::FG_DIM),
+                .color(pal.fg_dim),
         );
         return;
     }
@@ -235,7 +240,7 @@ fn panel_ui(ui: &mut egui::Ui, st: &mut FileTreeState, shell_idle: bool, out: &m
                 .allow_multi_selection(false)
                 .allow_drag_and_drop(false)
                 .show_state(ui, tree, |builder| {
-                    add_node(builder, nodes, listings, 0);
+                    add_node(builder, nodes, listings, 0, pal);
                 });
             // 激活动作（双击/回车）：目录 → cd（shell 空闲才发），
             // 文件 → 系统默认程序打开。单选模式下至多一个节点。
@@ -270,6 +275,7 @@ fn add_node(
     nodes: &mut Vec<NodeInfo>,
     listings: &mut HashMap<usize, DirListing>,
     id: usize,
+    pal: &theme::Palette,
 ) {
     let kind = nodes[id].kind;
     match kind {
@@ -281,7 +287,7 @@ fn add_node(
             builder.node(NodeBuilder::leaf(id).activatable(false).label(
                 egui::RichText::new(format!("…还有 {n} 项未显示"))
                     .size(11.0)
-                    .color(theme::FG_DIM)
+                    .color(pal.fg_dim)
                     .italics(),
             ));
         }
@@ -289,7 +295,7 @@ fn add_node(
             builder.node(NodeBuilder::leaf(id).activatable(false).label(
                 egui::RichText::new("无法读取")
                     .size(11.0)
-                    .color(theme::FG_DIM)
+                    .color(pal.fg_dim)
                     .italics(),
             ));
         }
@@ -309,7 +315,7 @@ fn add_node(
                 // children 是 id 列表，克隆一份避免递归中长借用 listings。
                 let children = listings.get(&id).map(|l| l.children.clone()).unwrap_or_default();
                 for child in children {
-                    add_node(builder, nodes, listings, child);
+                    add_node(builder, nodes, listings, child, pal);
                 }
             }
             builder.close_dir();

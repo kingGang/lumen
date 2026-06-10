@@ -1,11 +1,13 @@
-//! 应用外壳 UI（egui）：侧栏 + 文件树 + 终端工作区布局。
+//! 应用外壳 UI（egui）：侧栏 + 文件树 + 终端工作区布局 + 设置覆盖层。
 //!
 //! M3.2 起侧栏是真功能的会话 tab 列表：条目（标题 + 未读点 + 激活
 //! 高亮）点击切换、右键菜单重命名/关闭、底部新建。M3.3 增加中间一栏
-//! 文件树（跟随激活会话 cwd，可折叠）。UI 只产出动作
-//! （[`ShellOutput`]），会话增删切换/PTY 写入由 main.rs 执行。
+//! 文件树（跟随激活会话 cwd，可折叠）。M3.4 增加设置界面（全屏覆盖
+//! 层，入口为侧栏底部齿轮与 Ctrl+,）。UI 只产出动作（[`ShellOutput`]），
+//! 会话增删切换/PTY 写入/设置即时生效由 main.rs 执行。
 
 pub mod filetree;
+pub mod settings_ui;
 pub mod theme;
 
 /// 左侧会话栏宽度（逻辑像素）。
@@ -30,6 +32,8 @@ pub struct ShellState {
     rename_focus: bool,
     /// 文件树（树根/展开/可见性等跨帧状态）。
     pub filetree: filetree::FileTreeState,
+    /// 设置页（开关/分类/字体编辑缓冲等跨帧状态）。
+    pub settings: settings_ui::SettingsUiState,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -50,15 +54,26 @@ pub struct ShellOutput {
     pub cd_dir: Option<std::path::PathBuf>,
     /// 文件树：激活了文件，用系统默认程序打开。
     pub open_file: Option<std::path::PathBuf>,
+    /// 设置页本帧被打开（main 把终端焦点交给 egui）。
+    pub settings_opened: bool,
+    /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
+    pub settings_closed: bool,
+    /// 设置页改了字体/字号（main 重配置 renderer 并全会话 resize）。
+    pub settings_font_changed: bool,
+    /// 设置页改了主题（main 切终端 Theme + egui 样式联动）。
+    pub settings_theme_changed: bool,
 }
 
-/// 绘制整个外壳：左侧会话栏 + 中间文件树 + 中央终端纹理。
-/// `cwd`/`shell_idle` 均取自激活会话（文件树跟随与 cd 注入闸门）。
+/// 绘制整个外壳：左侧会话栏 + 中间文件树 + 中央终端纹理 + 设置覆盖层。
+/// `cwd`/`shell_idle` 均取自激活会话（文件树跟随与 cd 注入闸门）；
+/// `app_settings` 是设置页直接编辑的数据（变更经 [`ShellOutput`] 通知
+/// main 即时生效与写盘）。
 pub fn show(
     root: &mut egui::Ui,
     term_tex: egui::TextureId,
     sessions: &[SessionEntry],
     st: &mut ShellState,
+    app_settings: &mut crate::settings::Settings,
     cwd: Option<&std::path::Path>,
     shell_idle: bool,
 ) -> ShellOutput {
@@ -71,7 +86,12 @@ pub fn show(
         new_session: false,
         cd_dir: None,
         open_file: None,
+        settings_opened: false,
+        settings_closed: false,
+        settings_font_changed: false,
+        settings_theme_changed: false,
     };
+    let pal = theme::palette(app_settings.appearance.theme.is_light());
     // 重命名目标可能已被关闭（进程退出等）：清掉孤儿编辑态，
     // 否则编辑框永不渲染、也永不失焦，键盘焦点会卡在 egui 侧。
     if st
@@ -88,14 +108,14 @@ pub fn show(
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
-                .fill(theme::BG_DARK)
+                .fill(pal.bg_dark)
                 .inner_margin(egui::Margin::symmetric(8, 10)),
         )
-        .show_inside(root, |ui| sidebar_ui(ui, sessions, st, &mut out));
+        .show_inside(root, |ui| sidebar_ui(ui, sessions, st, pal, &mut out));
 
     // 中间一栏：文件树（可折叠；树根跟随激活会话 cwd）。开合改变
     // 终端区宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
-    let ft = filetree::show(root, &mut st.filetree, cwd, shell_idle);
+    let ft = filetree::show(root, &mut st.filetree, cwd, shell_idle, pal);
     out.cd_dir = ft.cd_dir;
     out.open_file = ft.open_file;
 
@@ -113,18 +133,34 @@ pub fn show(
             out.term_clicked = resp.clicked();
             out.term_rect = rect;
         });
+
+    // —— 设置覆盖层（盖住三栏；终端在其下照常消化输出与渲染）——
+    // 齿轮按钮本帧点击 → 立即打开（同帧呈现，避免一帧裸跳）。
+    if out.settings_opened && !st.settings.open {
+        st.settings.open_with(app_settings);
+    }
+    if st.settings.open {
+        let s_out = settings_ui::show(root.ctx(), &mut st.settings, app_settings, pal);
+        out.settings_font_changed = s_out.font_changed;
+        out.settings_theme_changed = s_out.theme_changed;
+        if s_out.closed {
+            st.settings.open = false;
+            out.settings_closed = true;
+        }
+    }
     out
 }
 
-/// 侧栏内容：会话条目列表 + 底部新建按钮。
+/// 侧栏内容：会话条目列表 + 底部设置/新建按钮。
 fn sidebar_ui(
     ui: &mut egui::Ui,
     sessions: &[SessionEntry],
     st: &mut ShellState,
+    pal: &theme::Palette,
     out: &mut ShellOutput,
 ) {
     ui.add_space(2.0);
-    ui.label(egui::RichText::new("会话").size(11.0).color(theme::FG_DIM));
+    ui.label(egui::RichText::new("会话").size(11.0).color(pal.fg_dim));
     ui.add_space(4.0);
 
     for entry in sessions {
@@ -151,12 +187,12 @@ fn sidebar_ui(
         }
 
         let fill = if entry.active {
-            theme::BG_HIGHLIGHT
+            pal.bg_highlight
         } else {
             egui::Color32::TRANSPARENT
         };
         let btn = egui::Button::new(
-            egui::RichText::new(format!("● {}", entry.title)).color(theme::FG),
+            egui::RichText::new(format!("● {}", entry.title)).color(pal.fg),
         )
         .fill(fill)
         .wrap_mode(egui::TextWrapMode::Truncate)
@@ -179,14 +215,19 @@ fn sidebar_ui(
         // 未读小圆点（后台有新输出，切换到该 tab 时清除）。
         if entry.unseen {
             let center = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
-            ui.painter().circle_filled(center, 3.0, theme::ACCENT);
+            ui.painter().circle_filled(center, 3.0, pal.accent);
         }
     }
 
-    // 底部「＋」新建会话（继承当前 shell 配置，见 Session::spawn）。
+    // 底部（bottom_up：先加的在最底）：齿轮设置 → 新建会话。
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
         ui.add_space(2.0);
-        let plus = egui::Button::new(egui::RichText::new("＋ 新建会话").color(theme::FG_DIM))
+        let gear = egui::Button::new(egui::RichText::new("⚙ 设置").color(pal.fg_dim))
+            .min_size(egui::vec2(ui.available_width(), 26.0));
+        if ui.add(gear).on_hover_text("设置 (Ctrl+,)").clicked() {
+            out.settings_opened = true;
+        }
+        let plus = egui::Button::new(egui::RichText::new("＋ 新建会话").color(pal.fg_dim))
             .min_size(egui::vec2(ui.available_width(), 28.0));
         if ui.add(plus).clicked() {
             out.new_session = true;
