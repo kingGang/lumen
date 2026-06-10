@@ -81,6 +81,16 @@ impl Terminal {
         self.inner.bracketed_paste
     }
 
+    /// 光标是否处于「帧尾未归位」状态：最近一次 ESU（同步帧结束）
+    /// 发生在最近一次「显示光标」之后。
+    ///
+    /// 部分 TUI（如 codex）在 ESU 时光标停在重绘残留位、之后才另发
+    /// 「隐藏→移动→显示」把光标归位——该窗口内的光标位置不可信，
+    /// 上层应暂缓更新光标绘制位置，等下一次「显示光标」或超时。
+    pub fn cursor_unsettled(&self) -> bool {
+        self.inner.last_esu_seq > self.inner.last_cursor_show_seq
+    }
+
     /// 提取选区覆盖的文本：行尾去空白、行间以 `\n` 连接、跳过宽字符占位格。
     pub fn selection_text(&self, sel: &crate::Selection) -> String {
         let (s, e) = sel.normalized();
@@ -138,6 +148,10 @@ struct TermInner {
     sync_output: bool,
     /// DEC 2004 bracketed paste 已开启。
     bracketed_paste: bool,
+    /// 事件序号，用于判断「显示光标」与「ESU」的先后。
+    event_seq: u64,
+    last_cursor_show_seq: u64,
+    last_esu_seq: u64,
 }
 
 impl TermInner {
@@ -155,6 +169,9 @@ impl TermInner {
             bell: false,
             sync_output: false,
             bracketed_paste: false,
+            event_seq: 0,
+            last_cursor_show_seq: 0,
+            last_esu_seq: 0,
         }
     }
 
@@ -534,10 +551,22 @@ impl Perform for TermInner {
                 if private {
                     for g in params.iter() {
                         match g.first().copied().unwrap_or(0) {
-                            25 => self.grid.cursor.visible = on,
+                            25 => {
+                                self.grid.cursor.visible = on;
+                                if on {
+                                    self.event_seq += 1;
+                                    self.last_cursor_show_seq = self.event_seq;
+                                }
+                            }
                             1049 | 1047 => self.set_alt_screen(on),
                             2004 => self.bracketed_paste = on,
-                            2026 => self.sync_output = on,
+                            2026 => {
+                                self.sync_output = on;
+                                if !on {
+                                    self.event_seq += 1;
+                                    self.last_esu_seq = self.event_seq;
+                                }
+                            }
                             1048 => {
                                 if on {
                                     self.saved_cursor =
@@ -809,6 +838,20 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn 帧尾未归位判定() {
+        let mut t = term();
+        // codex 式帧：重绘后 show，再 ESU——帧尾未归位。
+        t.advance(b"\x1b[?2026h\x1b[?25l\x1b[1;1Hx\x1b[?25h\x1b[?2026l");
+        assert!(t.cursor_unsettled());
+        // 归位序列到达（hide + move + show）后恢复可信。
+        t.advance(b"\x1b[?25l\x1b[2;1H\x1b[?25h");
+        assert!(!t.cursor_unsettled());
+        // 普通打字流（无 ESU）从不进入未归位态。
+        t.advance(b"\x1b[?25labc\x1b[?25h");
+        assert!(!t.cursor_unsettled());
     }
 
     #[test]
