@@ -1,5 +1,7 @@
 //! 终端状态机：把 vte 解析事件应用到 Grid 上。
 
+use std::path::{Path, PathBuf};
+
 use log::trace;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
@@ -46,6 +48,32 @@ impl Terminal {
     /// 窗口标题（OSC 0/2 设置）。
     pub fn title(&self) -> &str {
         &self.inner.title
+    }
+
+    /// shell 上报的当前工作目录（OSC 9;9，ConEmu/Windows Terminal 约定，
+    /// 由 integration.ps1 在每个提示符发射）。尚未上报时为 None；
+    /// RIS 全重置后清空，下个提示符会重新上报。
+    pub fn cwd(&self) -> Option<&Path> {
+        self.inner.cwd.as_deref()
+    }
+
+    /// shell 是否正等待用户输入命令（文件树 cd 注入与 M4 输入编辑器的依据）。
+    ///
+    /// 判定（OSC 133 字段语义见 block.rs）：最后一个命令块已有「命令
+    /// 输入开始」标记（133;B，提示符渲染完毕）但尚无「输出开始」标记
+    /// （133;C，用户回车执行时才发）且未闭合。备用屏幕（vim 等全屏
+    /// 程序）一律视为忙。
+    ///
+    /// 已知局限：用户敲了半行命令未回车时仍判定为等待输入——此时注入
+    /// 命令会拼接在用户输入之后。调用方接受此局限，M4 输入编辑器接管
+    /// 命令行后消除。
+    pub fn shell_waiting_input(&self) -> bool {
+        !self.is_alt_screen()
+            && self
+                .inner
+                .blocks
+                .last()
+                .is_some_and(|b| b.cmd_line.is_some() && b.output_line.is_none() && !b.is_closed())
     }
 
     /// 已采集的命令块（OSC 133）。
@@ -233,6 +261,8 @@ struct TermInner {
     scroll_top: usize,
     scroll_bottom: usize,
     title: String,
+    /// shell 上报的当前工作目录（OSC 9;9）。
+    cwd: Option<PathBuf>,
     blocks: Vec<Block>,
     next_block_id: u64,
     /// 需回写 PTY 的应答字节（DSR 等）。
@@ -262,6 +292,7 @@ impl TermInner {
             scroll_top: 0,
             scroll_bottom: rows - 1,
             title: String::new(),
+            cwd: None,
             blocks: Vec::new(),
             next_block_id: 0,
             responses: Vec::new(),
@@ -515,6 +546,29 @@ impl TermInner {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 处理 OSC 9 扩展（ConEmu/Windows Terminal 系）。
+    /// 目前只认 `9;9;<path>` cwd 上报，其余子命令（9;4 进度条等）忽略。
+    fn handle_osc9(&mut self, params: &[&[u8]]) {
+        if params.get(1).copied() != Some(b"9".as_ref()) {
+            return;
+        }
+        // 路径里可能含分号（被 vte 按 ; 切开成多段），重新拼回。
+        let raw: Vec<u8> = params[2..].join(&b';');
+        let Ok(s) = std::str::from_utf8(&raw) else {
+            trace!("OSC 9;9 路径非 UTF-8，忽略");
+            return;
+        };
+        // Windows Terminal 官方脚本带双引号发送（ConEmu 规范引号可选）：
+        // 两端都有才剥除，单边引号视为路径本身的一部分。
+        let path = s
+            .strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'))
+            .unwrap_or(s);
+        if !path.is_empty() {
+            self.cwd = Some(PathBuf::from(path));
         }
     }
 }
@@ -818,6 +872,7 @@ impl Perform for TermInner {
                     self.title = title.to_owned();
                 }
             }
+            b"9" => self.handle_osc9(params),
             b"133" => self.handle_block_marker(params),
             _ => trace!("未实现的 OSC: {:?}", std::str::from_utf8(code)),
         }
@@ -1105,5 +1160,81 @@ mod tests {
         t.advance(b"\x1b[2;4r"); // 滚动区 2-4 行
         t.advance(b"\x1b[4;1Ha\r\nb"); // 在底部触发区内滚动
         assert_eq!(t.grid().scrollback_len(), 0);
+    }
+
+    #[test]
+    fn osc9_9_cwd上报_基础与覆盖() {
+        let mut t = term();
+        assert_eq!(t.cwd(), None);
+        t.advance(b"\x1b]9;9;C:\\Users\\dev\x07");
+        assert_eq!(t.cwd(), Some(Path::new("C:\\Users\\dev")));
+        // cd 后再次上报覆盖旧值。
+        t.advance(b"\x1b]9;9;D:\\proj\x07");
+        assert_eq!(t.cwd(), Some(Path::new("D:\\proj")));
+    }
+
+    #[test]
+    fn osc9_9_带引号与空格路径() {
+        let mut t = term();
+        // Windows Terminal 官方脚本风格：双引号包裹 + ST（ESC \）终止。
+        t.advance(b"\x1b]9;9;\"C:\\Program Files\\My App\"\x1b\\");
+        assert_eq!(t.cwd(), Some(Path::new("C:\\Program Files\\My App")));
+    }
+
+    #[test]
+    fn osc9_9_中文路径() {
+        let mut t = term();
+        t.advance("\x1b]9;9;C:\\用户\\海风 哥\x07".as_bytes());
+        assert_eq!(t.cwd(), Some(Path::new("C:\\用户\\海风 哥")));
+    }
+
+    #[test]
+    fn osc9_9_含分号路径重新拼接() {
+        let mut t = term();
+        // vte 把 OSC 参数按 ; 切开，路径里的分号需要拼回。
+        t.advance(b"\x1b]9;9;C:\\a;b\\c\x07");
+        assert_eq!(t.cwd(), Some(Path::new("C:\\a;b\\c")));
+    }
+
+    #[test]
+    fn osc9_其他子命令与空路径忽略() {
+        let mut t = term();
+        // OSC 9;4 是进度条（ConEmu/WT），不得误吞成 cwd。
+        t.advance(b"\x1b]9;4;1;50\x07");
+        assert_eq!(t.cwd(), None);
+        // 空路径忽略，不覆盖已有值。
+        t.advance(b"\x1b]9;9;C:\\ok\x07\x1b]9;9;\x07");
+        assert_eq!(t.cwd(), Some(Path::new("C:\\ok")));
+    }
+
+    #[test]
+    fn shell等待输入判定_完整命令周期() {
+        let mut t = term();
+        // 无块：未注入 integration 时不可判定为空闲。
+        assert!(!t.shell_waiting_input());
+        // A：提示符开始渲染，尚未到输入区。
+        t.advance(b"\x1b]133;A\x07$ ");
+        assert!(!t.shell_waiting_input());
+        // B：提示符结束，shell 等待输入。
+        t.advance(b"\x1b]133;B\x07");
+        assert!(t.shell_waiting_input());
+        // C：用户回车，命令开始执行（忙）。
+        t.advance(b"ls\r\n\x1b]133;C\x07out\r\n");
+        assert!(!t.shell_waiting_input());
+        // D + 新提示符 A/B：回到等待输入。
+        t.advance(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(t.shell_waiting_input());
+    }
+
+    #[test]
+    fn shell等待输入判定_备用屏幕视为忙() {
+        let mut t = term();
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(t.shell_waiting_input());
+        // 进入备用屏幕（理论上 C 标记已先到，这里是双保险路径）。
+        t.advance(b"\x1b[?1049h");
+        assert!(!t.shell_waiting_input());
+        t.advance(b"\x1b[?1049l");
+        assert!(t.shell_waiting_input());
     }
 }
