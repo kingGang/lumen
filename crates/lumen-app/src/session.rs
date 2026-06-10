@@ -1,0 +1,243 @@
+//! 会话：一个 PTY 子进程 + 终端状态机 + 每会话的渲染/交互状态。
+//!
+//! 多会话架构（M3.2，规格见 docs/M3应用外壳设计.md §2）：主循环持有
+//! `Vec<Session>`，各会话的 PTY 事件经独立转发线程汇入同一条全局通道
+//! （元素带会话 id），`PtyWake` 去重协议与单会话时代零变化。渲染调度
+//! 只对激活会话生效；后台会话照常消化数据并回写应答（DSR/DA 不回写
+//! 会卡死对端程序），有新输出时只标记未读点。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{Context, Result};
+use crossbeam_channel::Sender;
+use log::{error, info};
+use lumen_pty::{PtyEvent, PtySession};
+use lumen_term::{Selection, Terminal};
+use winit::event_loop::EventLoopProxy;
+
+use crate::PtyWake;
+
+/// 会话唯一标识。自增分配、关闭后不复用——全局通道里残留的已关闭
+/// 会话事件按 id 直接丢弃，不会误投给新会话。
+pub type SessionId = u64;
+
+/// 一个终端会话的全部独立状态。
+///
+/// Drop 即随 `PtySession` 杀掉 shell 子进程（关 tab = 杀进程）；
+/// 其读线程随后收到 EOF 退出，转发线程跟着结束，无需额外清理。
+pub struct Session {
+    pub id: SessionId,
+    pub term: Terminal,
+    pub pty: PtySession,
+    /// 用户重命名的标题；None 时跟随 term.title()（OSC 0/2）。
+    pub custom_title: Option<String>,
+    /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
+    pub last_esu_mark: u64,
+    /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
+    /// 状态（见 Terminal::cursor_unsettled）时冻结不跟随。
+    pub cursor_displayed: (usize, usize, bool),
+    /// 光标冻结起点（超时后强制信任当前位置）。
+    pub cursor_frozen_at: Option<Instant>,
+    /// 左键按住拖选中。
+    pub selecting: bool,
+    pub selection: Option<Selection>,
+    /// 选中的命令块 id。
+    pub selected_block: Option<u64>,
+    /// 静默渲染时刻：最后一批数据到达时间 + 静默窗口（每批后推）。
+    /// 渲染计划只在本会话激活时被调度与执行；切换激活时清除残留。
+    pub redraw_at: Option<Instant>,
+    /// 强制渲染时刻：首批未渲染数据 + 硬上限（保障最低刷新率）。
+    pub redraw_hard_at: Option<Instant>,
+    /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
+    pub redraw_abs_at: Option<Instant>,
+    /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
+    pub has_unseen_output: bool,
+}
+
+impl Session {
+    /// 启动一个新会话：spawn shell、起转发线程把事件（带会话 id）
+    /// 汇入全局通道，并以去重信号唤醒事件循环（信号挂起期间不重复
+    /// 发，避免事件风暴——协议与单会话时代一致）。
+    pub fn spawn(
+        id: SessionId,
+        rows: usize,
+        cols: usize,
+        scrollback: usize,
+        events_tx: Sender<(SessionId, PtyEvent)>,
+        wake_pending: Arc<AtomicBool>,
+        proxy: EventLoopProxy<PtyWake>,
+    ) -> Result<Self> {
+        let term = Terminal::new(rows, cols, scrollback);
+        let (pty, rx) = PtySession::spawn(
+            None,
+            &shell_integration_args(),
+            rows as u16,
+            cols as u16,
+        )?;
+        std::thread::Builder::new()
+            .name(format!("lumen-pty-forward-{id}"))
+            .spawn(move || {
+                for ev in rx {
+                    if events_tx.send((id, ev)).is_err() {
+                        break;
+                    }
+                    if !wake_pending.swap(true, Ordering::AcqRel)
+                        && proxy.send_event(PtyWake).is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .context("启动 PTY 转发线程失败")?;
+        info!("会话创建 id={id}（{rows} 行 x {cols} 列）");
+        Ok(Self {
+            id,
+            term,
+            pty,
+            custom_title: None,
+            last_esu_mark: 0,
+            cursor_displayed: (0, 0, true),
+            cursor_frozen_at: None,
+            selecting: false,
+            selection: None,
+            selected_block: None,
+            redraw_at: None,
+            redraw_hard_at: None,
+            redraw_abs_at: None,
+            has_unseen_output: false,
+        })
+    }
+
+    /// 展示用标题：用户自定义名优先，否则跟随终端 OSC 标题。
+    pub fn display_title(&self) -> &str {
+        self.custom_title
+            .as_deref()
+            .unwrap_or_else(|| self.term.title())
+    }
+
+    /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。
+    pub fn copy_selected_block(&mut self, clipboard: &mut Option<arboard::Clipboard>) -> bool {
+        let Some(id) = self.selected_block else {
+            return false;
+        };
+        let Some(block) = self.term.block_by_id(id) else {
+            return false;
+        };
+        let text = self.term.block_output_text(block);
+        if text.is_empty() {
+            return false;
+        }
+        match clipboard.as_mut().map(|c| c.set_text(text)) {
+            Some(Ok(())) => true,
+            other => {
+                if let Some(Err(e)) = other {
+                    error!("写剪贴板失败: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// 块间跳转：dir 为 -1（上一块）或 1（下一块），滚动到块首。
+    /// 返回是否发生了跳转（调用方据此请求重绘）。
+    pub fn jump_block(&mut self, dir: i64) -> bool {
+        // 选中的块可能已被上限淘汰：先清掉失效 id，按未选中逻辑走。
+        if self
+            .selected_block
+            .is_some_and(|id| self.term.block_by_id(id).is_none())
+        {
+            self.selected_block = None;
+        }
+        let blocks = self.term.blocks();
+        if blocks.is_empty() {
+            return false;
+        }
+        let idx = match self
+            .selected_block
+            .and_then(|id| blocks.iter().position(|b| b.id == id))
+        {
+            Some(i) => (i as i64 + dir).clamp(0, blocks.len() as i64 - 1) as usize,
+            // 未选中时：↑ 从最后一块开始，↓ 选最后一块。
+            None => {
+                if dir < 0 {
+                    blocks.len().saturating_sub(2)
+                } else {
+                    blocks.len() - 1
+                }
+            }
+        };
+        let (id, line) = (blocks[idx].id, blocks[idx].prompt_line);
+        self.selected_block = Some(id);
+        self.term.grid_mut().scroll_to_abs_line(line);
+        true
+    }
+
+    /// 复制选区文本到剪贴板，返回是否真的复制了内容。
+    pub fn copy_selection(&mut self, clipboard: &mut Option<arboard::Clipboard>) -> bool {
+        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let text = self.term.selection_text(&sel);
+        if text.is_empty() {
+            return false;
+        }
+        match clipboard.as_mut().map(|c| c.set_text(text)) {
+            Some(Ok(())) => true,
+            other => {
+                if let Some(Err(e)) = other {
+                    error!("写剪贴板失败: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// 粘贴剪贴板文本：换行规整为 CR，按需包 bracketed paste 标记。
+    pub fn paste_clipboard(&mut self, clipboard: &mut Option<arboard::Clipboard>) {
+        let Some(Ok(text)) = clipboard.as_mut().map(|c| c.get_text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        let payload = if self.term.bracketed_paste() {
+            let mut p = Vec::with_capacity(normalized.len() + 12);
+            p.extend_from_slice(b"\x1b[200~");
+            p.extend_from_slice(normalized.as_bytes());
+            p.extend_from_slice(b"\x1b[201~");
+            p
+        } else {
+            normalized.into_bytes()
+        };
+        self.term.grid_mut().scroll_to_bottom();
+        if let Err(e) = self.pty.write(&payload) {
+            error!("粘贴写入 PTY 失败: {e:#}");
+        }
+    }
+}
+
+/// 把 shell integration 脚本写到临时目录，返回注入用的启动参数。
+/// 写入失败时返回空参数（shell 照常可用，只是没有命令块标记）。
+fn shell_integration_args() -> Vec<String> {
+    let script = include_str!("../assets/integration.ps1");
+    let path = std::env::temp_dir().join("lumen_integration.ps1");
+    match std::fs::write(&path, script) {
+        Ok(()) => vec![
+            "-NoLogo".into(),
+            // 进程级放行：Windows PowerShell 5.1 默认 Restricted 策略
+            // 会拒绝加载任何 .ps1，注入会在终端顶部报红错。
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            format!(". '{}'", path.display()),
+        ],
+        Err(e) => {
+            error!("写出 shell integration 脚本失败: {e}");
+            Vec::new()
+        }
+    }
+}

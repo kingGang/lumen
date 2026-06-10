@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod input;
+mod session;
 mod shell;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use log::{error, info};
-use lumen_pty::{PtyEvent, PtySession};
+use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
-use lumen_term::{SelPoint, Selection, Terminal};
+use lumen_term::{SelPoint, Selection};
+use session::{Session, SessionId};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -41,6 +43,10 @@ const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// （动画残留位）——经实战验证 50ms 能盖住 codex 归位批的延迟，
 /// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
 const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
+/// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
+/// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在通道
+/// 里（靠 bounded 容量反压读线程），并补发一个 wake 下轮继续消化。
+const BG_DRAIN_CAP: usize = 256 * 1024;
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
@@ -61,29 +67,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// 把 shell integration 脚本写到临时目录，返回注入用的启动参数。
-/// 写入失败时返回空参数（shell 照常可用，只是没有命令块标记）。
-fn shell_integration_args() -> Vec<String> {
-    let script = include_str!("../assets/integration.ps1");
-    let path = std::env::temp_dir().join("lumen_integration.ps1");
-    match std::fs::write(&path, script) {
-        Ok(()) => vec![
-            "-NoLogo".into(),
-            // 进程级放行：Windows PowerShell 5.1 默认 Restricted 策略
-            // 会拒绝加载任何 .ps1，注入会在终端顶部报红错。
-            "-ExecutionPolicy".into(),
-            "Bypass".into(),
-            "-NoExit".into(),
-            "-Command".into(),
-            format!(". '{}'", path.display()),
-        ],
-        Err(e) => {
-            error!("写出 shell integration 脚本失败: {e}");
-            Vec::new()
-        }
-    }
-}
-
 struct App {
     proxy: EventLoopProxy<PtyWake>,
     state: Option<AppState>,
@@ -96,35 +79,27 @@ struct AppState {
     last_render_at: Option<Instant>,
     window: Arc<Window>,
     renderer: Renderer,
-    term: Terminal,
-    pty: PtySession,
-    pty_rx: Receiver<PtyEvent>,
-    /// 与转发线程共享的「wake 已挂起」标志，用于事件去重。
+    /// 全部会话（per-session 状态见 [`Session`]）。至少一个；最后
+    /// 一个关闭即退出应用。
+    sessions: Vec<Session>,
+    /// 激活会话在 `sessions` 中的下标。
+    active: usize,
+    /// 全局 PTY 事件通道接收端（各会话转发线程汇入，元素带会话 id）。
+    pty_rx: Receiver<(SessionId, PtyEvent)>,
+    /// 后台会话超出单轮消化上限时滞留的事件（下个 wake 优先处理，
+    /// 保持同会话事件顺序）。
+    carry: Option<(SessionId, PtyEvent)>,
+    /// 与转发线程共享的「wake 已挂起」标志，用于事件去重（全局一个，
+    /// 唤醒协议与单会话时代零变化）。
     wake_pending: Arc<AtomicBool>,
+    /// 事件循环唤醒句柄（补发 wake / 新建会话的转发线程用）。
+    proxy: EventLoopProxy<PtyWake>,
     modifiers: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
-    /// 静默渲染时刻：最后一批数据到达时间 + 静默窗口（每批后推）。
-    redraw_at: Option<Instant>,
-    /// 强制渲染时刻：首批未渲染数据 + 硬上限（保障最低刷新率）。
-    redraw_hard_at: Option<Instant>,
-    /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
-    redraw_abs_at: Option<Instant>,
-    /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
-    last_esu_mark: u64,
-    /// 最近一次按键时刻（端到端延迟埋点用）。
+    /// 最近一次按键时刻（端到端延迟埋点用，跟随激活会话即可）。
     last_key_at: Option<Instant>,
-    /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
-    /// 状态（见 Terminal::cursor_unsettled）时冻结不跟随。
-    cursor_displayed: (usize, usize, bool),
-    /// 光标冻结起点（超时后强制信任当前位置）。
-    cursor_frozen_at: Option<Instant>,
     /// 鼠标最近一次的窗口内像素位置。
     mouse_pos: (f64, f64),
-    /// 左键按住拖选中。
-    selecting: bool,
-    selection: Option<Selection>,
-    /// 选中的命令块 id。
-    selected_block: Option<u64>,
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
@@ -164,7 +139,7 @@ impl AppState {
         mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64
     }
 
-    /// 把当前鼠标像素位置换算成选区端点（绝对行号）。
+    /// 把当前鼠标像素位置换算成选区端点（绝对行号，取激活会话网格）。
     /// cell_at 接相对终端区原点的坐标。
     fn sel_point_at_mouse(&self) -> SelPoint {
         let (row, col) = self.renderer.cell_at(
@@ -172,108 +147,57 @@ impl AppState {
             self.mouse_pos.1 - self.term_rect_px.1 as f64,
         );
         SelPoint {
-            line: self.term.grid().view_top_abs_line() + row as u64,
+            line: self.sessions[self.active].term.grid().view_top_abs_line() + row as u64,
             col,
         }
     }
 
-    /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。
-    fn copy_selected_block(&mut self) -> bool {
-        let Some(id) = self.selected_block else {
-            return false;
-        };
-        let Some(block) = self.term.block_by_id(id) else {
-            return false;
-        };
-        let text = self.term.block_output_text(block);
-        if text.is_empty() {
-            return false;
-        }
-        match self.clipboard.as_mut().map(|c| c.set_text(text)) {
-            Some(Ok(())) => true,
-            other => {
-                if let Some(Err(e)) = other {
-                    error!("写剪贴板失败: {e}");
-                }
-                false
-            }
-        }
-    }
-
-    /// 块间跳转：dir 为 -1（上一块）或 1（下一块），滚动到块首。
-    fn jump_block(&mut self, dir: i64) {
-        // 选中的块可能已被上限淘汰：先清掉失效 id，按未选中逻辑走。
-        if self
-            .selected_block
-            .is_some_and(|id| self.term.block_by_id(id).is_none())
-        {
-            self.selected_block = None;
-        }
-        let blocks = self.term.blocks();
-        if blocks.is_empty() {
-            return;
-        }
-        let idx = match self
-            .selected_block
-            .and_then(|id| blocks.iter().position(|b| b.id == id))
-        {
-            Some(i) => (i as i64 + dir).clamp(0, blocks.len() as i64 - 1) as usize,
-            // 未选中时：↑ 从最后一块开始，↓ 选最后一块。
-            None => {
-                if dir < 0 {
-                    blocks.len().saturating_sub(2)
-                } else {
-                    blocks.len() - 1
-                }
-            }
-        };
-        let (id, line) = (blocks[idx].id, blocks[idx].prompt_line);
-        self.selected_block = Some(id);
-        self.term.grid_mut().scroll_to_abs_line(line);
+    /// 切换激活会话：清掉目标会话的冻结计时与渲染计划（属于「上次
+    /// 激活期间」的旧时间轴，带过来会借用过期的调度），清未读点，
+    /// 同步窗口标题并立即重绘。切到的终端默认拿键盘/IME 焦点。
+    fn activate(&mut self, idx: usize) {
+        self.active = idx;
+        let s = &mut self.sessions[idx];
+        s.cursor_frozen_at = None;
+        s.redraw_at = None;
+        s.redraw_hard_at = None;
+        s.redraw_abs_at = None;
+        s.has_unseen_output = false;
+        self.terminal_focused = true;
+        self.update_window_title();
         self.window.request_redraw();
     }
 
-    /// 复制选区文本到剪贴板，返回是否真的复制了内容。
-    fn copy_selection(&mut self) -> bool {
-        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
-            return false;
-        };
-        let text = self.term.selection_text(&sel);
-        if text.is_empty() {
-            return false;
+    /// 关闭会话：从列表移除即随 `PtySession` Drop 杀掉子进程。
+    /// 返回是否已无会话（调用方应退出应用）。
+    fn close_session(&mut self, idx: usize) -> bool {
+        let removed = self.sessions.remove(idx);
+        info!("关闭会话 id={}", removed.id);
+        // 丢弃属于该会话的滞留事件（通道里的残留靠 drain 时按 id 丢）。
+        if self.carry.as_ref().is_some_and(|(sid, _)| *sid == removed.id) {
+            self.carry = None;
         }
-        match self.clipboard.as_mut().map(|c| c.set_text(text)) {
-            Some(Ok(())) => true,
-            other => {
-                if let Some(Err(e)) = other {
-                    error!("写剪贴板失败: {e}");
-                }
-                false
-            }
+        drop(removed);
+        if self.sessions.is_empty() {
+            return true;
         }
+        if idx < self.active {
+            // 移除位在激活位之前：激活会话整体左移一位，无需切换。
+            self.active -= 1;
+        } else if idx == self.active {
+            // 关闭激活 tab：切到邻位（右邻顶上原位；无右邻取末位）。
+            self.activate(idx.min(self.sessions.len() - 1));
+        }
+        false
     }
 
-    /// 粘贴剪贴板文本：换行规整为 CR，按需包 bracketed paste 标记。
-    fn paste_clipboard(&mut self) {
-        let Some(Ok(text)) = self.clipboard.as_mut().map(|c| c.get_text()) else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        let payload = if self.term.bracketed_paste() {
-            let mut p = Vec::with_capacity(normalized.len() + 12);
-            p.extend_from_slice(b"\x1b[200~");
-            p.extend_from_slice(normalized.as_bytes());
-            p.extend_from_slice(b"\x1b[201~");
-            p
+    /// 窗口标题跟随激活会话（自定义名优先，无标题回退应用名）。
+    fn update_window_title(&self) {
+        let title = self.sessions[self.active].display_title();
+        if title.is_empty() {
+            self.window.set_title("Lumen");
         } else {
-            normalized.into_bytes()
-        };
-        self.term.grid_mut().scroll_to_bottom();
-        if let Err(e) = self.pty.write(&payload) {
-            error!("粘贴写入 PTY 失败: {e:#}");
+            self.window.set_title(&format!("Lumen — {title}"));
         }
     }
 }
@@ -325,35 +249,19 @@ impl App {
         let (rows, cols) = renderer.grid_size_for(term_w, term_h);
         info!("终端尺寸: {rows} 行 x {cols} 列");
 
-        let term = Terminal::new(rows, cols, SCROLLBACK);
-        let (pty, rx) = PtySession::spawn(
-            None,
-            &shell_integration_args(),
-            rows as u16,
-            cols as u16,
-        )?;
-
-        // 转发线程：把事件搬进主循环可 drain 的通道，并以去重信号唤醒
-        // 事件循环（信号挂起期间不重复发，避免事件风暴）。
-        let (tx2, rx2) = crossbeam_channel::bounded::<PtyEvent>(256);
+        // 全局 PTY 事件通道：各会话的转发线程汇入同一条（元素带会话
+        // id），bounded 容量对高产出会话形成背压。
+        let (pty_tx, pty_rx) = crossbeam_channel::bounded::<(SessionId, PtyEvent)>(256);
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let proxy = self.proxy.clone();
-        let pending = wake_pending.clone();
-        std::thread::Builder::new()
-            .name("lumen-pty-forward".into())
-            .spawn(move || {
-                for ev in rx {
-                    if tx2.send(ev).is_err() {
-                        break;
-                    }
-                    if !pending.swap(true, Ordering::AcqRel)
-                        && proxy.send_event(PtyWake).is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-            .context("启动 PTY 转发线程失败")?;
+        let first = Session::spawn(
+            0,
+            rows,
+            cols,
+            SCROLLBACK,
+            pty_tx,
+            wake_pending.clone(),
+            self.proxy.clone(),
+        )?;
 
         let clipboard = match arboard::Clipboard::new() {
             Ok(c) => Some(c),
@@ -373,23 +281,16 @@ impl App {
             last_render_at: None,
             window,
             renderer,
-            term,
-            pty,
-            pty_rx: rx2,
+            sessions: vec![first],
+            active: 0,
+            pty_rx,
+            carry: None,
             wake_pending,
+            proxy: self.proxy.clone(),
             modifiers: ModifiersState::default(),
             clipboard,
-            redraw_at: None,
-            redraw_hard_at: None,
-            redraw_abs_at: None,
-            last_esu_mark: 0,
             last_key_at: None,
-            cursor_displayed: (0, 0, true),
-            cursor_frozen_at: None,
             mouse_pos: (0.0, 0.0),
-            selecting: false,
-            selection: None,
-            selected_block: None,
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -418,17 +319,47 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if state.sessions.is_empty() {
+            return; // 退出流程中（exit 后仍可能有滞后事件）
+        }
         // 先清挂起标志再 drain：drain 期间新到的数据会触发下一个 wake，不丢。
         state.wake_pending.store(false, Ordering::Release);
 
         let drain_t0 = Instant::now();
-        let mut drained_bytes = 0usize;
-        let mut got_data = false;
-        let mut exited = false;
-        while let Ok(ev) = state.pty_rx.try_recv() {
+        // 每会话本轮已消化字节数 / 是否有新数据（按 sessions 下标）。
+        let mut consumed = vec![0usize; state.sessions.len()];
+        let mut got_data = vec![false; state.sessions.len()];
+        let mut exited: Vec<SessionId> = Vec::new();
+        // 后台会话超限导致提前停止 drain（需补发 wake 续处理）。
+        let mut backlog = false;
+        // Receiver 克隆一份避免 drain 循环内长借用 state。
+        let rx = state.pty_rx.clone();
+        // 上轮滞留的事件优先处理（保持同会话事件顺序）。
+        let mut pending = state.carry.take();
+        loop {
+            let (sid, ev) = match pending.take() {
+                Some(x) => x,
+                None => match rx.try_recv() {
+                    Ok(x) => x,
+                    Err(_) => break,
+                },
+            };
+            // 已关闭会话的残留事件直接丢弃。
+            let Some(idx) = state.sessions.iter().position(|s| s.id == sid) else {
+                continue;
+            };
             match ev {
                 PtyEvent::Data(bytes) => {
-                    drained_bytes += bytes.len();
+                    if idx != state.active && consumed[idx] >= BG_DRAIN_CAP {
+                        // 后台会话本轮额度用尽：事件滞留、停止 drain
+                        // （通道 FIFO，不能越过它取后面的事件），剩余
+                        // 留到补发的下一个 wake 再消化，前台打字不被
+                        // yes 级后台输出抢占主线程。
+                        state.carry = Some((sid, PtyEvent::Data(bytes)));
+                        backlog = true;
+                        break;
+                    }
+                    consumed[idx] += bytes.len();
                     // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
                     if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
                         use std::io::Write;
@@ -440,34 +371,42 @@ impl ApplicationHandler<PtyWake> for App {
                             let _ = f.write_all(&bytes);
                         }
                     }
-                    state.term.advance(&bytes);
-                    got_data = true;
+                    state.sessions[idx].term.advance(&bytes);
+                    got_data[idx] = true;
                 }
-                PtyEvent::Exited => exited = true,
+                PtyEvent::Exited => exited.push(sid),
             }
         }
 
-        if got_data {
+        // —— 每会话的批后处理：应答回写对所有会话照常执行（后台不回
+        // 写 DSR/DA 会卡死对端程序）；渲染调度只对激活会话生效，后台
+        // 只更新 ESU 标记并标未读点。
+        let mut active_stats = None;
+        for (idx, s) in state.sessions.iter_mut().enumerate() {
+            if !got_data[idx] {
+                continue;
+            }
+            let is_active = idx == state.active;
             // 终端应答（DSR/DA/DECRQM 等）回写给 shell。
-            let resp = state.term.take_responses();
+            let resp = s.term.take_responses();
             if !resp.is_empty() {
-                let _ = state.pty.write(&resp);
+                let _ = s.pty.write(&resp);
             }
             // 进入备用屏幕（vim/codex 全屏）时块交互无意义且不可见，
             // 清掉选中态，避免 Ctrl+C 被残留选中块吞成「复制」。
-            if state.term.is_alt_screen() && state.selected_block.is_some() {
-                state.selected_block = None;
+            if s.term.is_alt_screen() && s.selected_block.is_some() {
+                s.selected_block = None;
             }
-            if !state.term.title().is_empty() {
-                state
-                    .window
-                    .set_title(&format!("Lumen — {}", state.term.title()));
-            }
-            let sync = state.term.is_synchronized();
-            let esu_mark = state.term.esu_mark();
-            let frame_completed = esu_mark != state.last_esu_mark && !sync;
-            state.last_esu_mark = esu_mark;
+            let sync = s.term.is_synchronized();
+            let esu_mark = s.term.esu_mark();
+            let frame_completed = esu_mark != s.last_esu_mark && !sync;
+            s.last_esu_mark = esu_mark;
 
+            if !is_active {
+                s.has_unseen_output = true;
+                continue;
+            }
+            active_stats = Some((sync, frame_completed, s.term.cursor_unsettled()));
             if frame_completed {
                 // 本批完成了 DEC 2026 同步帧：协议语义就是「立即原子
                 // 呈现」，零等待直接渲染（codex 打字回显走这条快路）。
@@ -479,13 +418,13 @@ impl ApplicationHandler<PtyWake> for App {
                     .is_some_and(|t| now.duration_since(t) < Duration::from_millis(8));
                 if recent {
                     let at = state.last_render_at.unwrap() + Duration::from_millis(8);
-                    state.redraw_at = Some(at);
-                    state.redraw_hard_at = None;
-                    state.redraw_abs_at = Some(at + Duration::from_millis(50));
+                    s.redraw_at = Some(at);
+                    s.redraw_hard_at = None;
+                    s.redraw_abs_at = Some(at + Duration::from_millis(50));
                 } else {
-                    state.redraw_at = None;
-                    state.redraw_hard_at = None;
-                    state.redraw_abs_at = None;
+                    s.redraw_at = None;
+                    s.redraw_hard_at = None;
+                    s.redraw_abs_at = None;
                     state.window.request_redraw();
                 }
             } else {
@@ -493,21 +432,45 @@ impl ApplicationHandler<PtyWake> for App {
                 // 数据推后渲染时刻，流停了才画（见 about_to_wait）；
                 // 硬上限自首批起算，保障刷新率。
                 let now = Instant::now();
-                state.redraw_at = Some(now + REDRAW_DEBOUNCE);
-                if state.redraw_hard_at.is_none() {
-                    state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
-                    state.redraw_abs_at = Some(now + REDRAW_ABS_CAP);
+                s.redraw_at = Some(now + REDRAW_DEBOUNCE);
+                if s.redraw_hard_at.is_none() {
+                    s.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
+                    s.redraw_abs_at = Some(now + REDRAW_ABS_CAP);
                 }
             }
-            let unsettled = state.term.cursor_unsettled();
+        }
+        // 窗口标题跟随激活会话（OSC 标题可能随本批数据更新）。
+        if active_stats.is_some() {
+            state.update_window_title();
+        }
+        let total: usize = consumed.iter().sum();
+        if total > 0 {
+            let (sync, fc, unsettled) = active_stats.unwrap_or_default();
             state.perf_log(format_args!(
-                "drain {drained_bytes}B 耗时 {:?} sync={sync} esu帧={frame_completed} unsettled={unsettled}",
+                "drain {total}B 耗时 {:?} sync={sync} esu帧={fc} unsettled={unsettled} 后台积压={backlog}",
                 drain_t0.elapsed()
             ));
         }
-        if exited {
-            info!("shell 已退出，关闭窗口");
-            event_loop.exit();
+
+        // —— 生命周期：shell 退出关闭对应 tab，最后一个 tab 关闭才退出。
+        for sid in exited {
+            let Some(idx) = state.sessions.iter().position(|s| s.id == sid) else {
+                continue;
+            };
+            info!("会话 id={sid} 的 shell 已退出，关闭对应 tab");
+            if state.close_session(idx) {
+                info!("最后一个会话已关闭，退出应用");
+                event_loop.exit();
+                return;
+            }
+        }
+
+        // 后台数据滞留：补发一个 wake 接着消化（与转发线程同一套去重）。
+        if backlog
+            && !state.wake_pending.swap(true, Ordering::AcqRel)
+            && state.proxy.send_event(PtyWake).is_err()
+        {
+            error!("补发 PtyWake 失败：事件循环已关闭");
         }
     }
 
@@ -515,11 +478,16 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if state.sessions.is_empty() {
+            return; // 退出流程中
+        }
+        // 渲染调度只看激活会话的计划（后台会话不设计划、不打扰渲染）。
+        let s = &mut state.sessions[state.active];
         // 终端渲染时刻 = 静默窗口与强制刷新中先到者；egui 重绘计划
         // （动画等）独立成项，与终端计划取 min 定下次唤醒。
-        let term_due = state
+        let term_due = s
             .redraw_at
-            .map(|soft| state.redraw_hard_at.map_or(soft, |h| soft.min(h)));
+            .map(|soft| s.redraw_hard_at.map_or(soft, |h| soft.min(h)));
         let due = match (term_due, state.egui_repaint_at) {
             // 没有任何待渲染计划时必须显式回到 Wait：ControlFlow 是粘性的，
             // 残留的 WaitUntil(过去时刻) 会让事件循环全速空转（曾导致
@@ -542,8 +510,8 @@ impl ApplicationHandler<PtyWake> for App {
         // 到点也跟着顺延（2ms 粒度，对 UI 动画无感），避免把半成品
         // 终端帧画上屏。
         if term_due.is_some_and(|t| now >= t)
-            && state.term.is_synchronized()
-            && state.redraw_abs_at.is_some_and(|a| now < a)
+            && s.term.is_synchronized()
+            && s.redraw_abs_at.is_some_and(|a| now < a)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(2)));
             return;
@@ -551,9 +519,9 @@ impl ApplicationHandler<PtyWake> for App {
         // 只清掉已到点的计划：egui 提前到点不应连带提前终端的静默合
         // 帧计划（半成品 TUI 帧会闪烁），反之亦然。
         if term_due.is_some_and(|t| now >= t) {
-            state.redraw_at = None;
-            state.redraw_hard_at = None;
-            state.redraw_abs_at = None;
+            s.redraw_at = None;
+            s.redraw_hard_at = None;
+            s.redraw_abs_at = None;
         }
         if state.egui_repaint_at.is_some_and(|e| now >= e) {
             state.egui_repaint_at = None;
@@ -566,6 +534,9 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if state.sessions.is_empty() {
+            return; // 退出流程中（exit 后仍可能有滞后事件）
+        }
 
         // —— egui 先行消化事件 ——
         // 终端聚焦时键盘与 IME 整体绕过 egui：Tab/方向键不被 egui 的
@@ -611,15 +582,16 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 use winit::keyboard::{Key, NamedKey};
                 let pressed = event.state == ElementState::Pressed;
+                let active = state.active;
                 // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
                 if !pressed {
-                    if state.term.win32_input()
+                    if state.sessions[active].term.win32_input()
                         && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
                     {
                         if let Some(bytes) =
                             input::encode_key_win32(&event, state.modifiers, false)
                         {
-                            if let Err(e) = state.pty.write(&bytes) {
+                            if let Err(e) = state.sessions[active].pty.write(&bytes) {
                                 error!("写入 PTY 失败: {e:#}");
                             }
                         }
@@ -628,14 +600,17 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // Shift+PgUp/PgDn 本地翻屏，不发给 shell。
                 if state.modifiers.shift_key() {
-                    let rows = state.term.grid().rows() as isize;
+                    let rows = state.sessions[active].term.grid().rows() as isize;
                     let scrolled = match event.logical_key {
                         Key::Named(NamedKey::PageUp) => {
-                            state.term.grid_mut().scroll_display(rows - 1);
+                            state.sessions[active].term.grid_mut().scroll_display(rows - 1);
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {
-                            state.term.grid_mut().scroll_display(-(rows - 1));
+                            state.sessions[active]
+                                .term
+                                .grid_mut()
+                                .scroll_display(-(rows - 1));
                             true
                         }
                         _ => false,
@@ -646,21 +621,25 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     // Shift+Insert 粘贴。
                     if matches!(event.logical_key, Key::Named(NamedKey::Insert)) {
-                        state.paste_clipboard();
+                        state.sessions[active].paste_clipboard(&mut state.clipboard);
                         return;
                     }
                 }
                 if state.modifiers.control_key() {
                     // Ctrl+↑/↓：命令块间跳转。备用屏幕（vim/codex）里
                     // 块不可见也无意义，按键放行给应用。
-                    if !state.term.is_alt_screen() {
+                    if !state.sessions[active].term.is_alt_screen() {
                         match event.logical_key {
                             Key::Named(NamedKey::ArrowUp) => {
-                                state.jump_block(-1);
+                                if state.sessions[active].jump_block(-1) {
+                                    state.window.request_redraw();
+                                }
                                 return;
                             }
                             Key::Named(NamedKey::ArrowDown) => {
-                                state.jump_block(1);
+                                if state.sessions[active].jump_block(1) {
+                                    state.window.request_redraw();
+                                }
                                 return;
                             }
                             _ => {}
@@ -674,17 +653,18 @@ impl ApplicationHandler<PtyWake> for App {
                         // Ctrl+C 优先级：文本选区复制 → 选中块复制输出 →
                         // 发送中断（Windows Terminal 惯例扩展）。
                         Some('c') => {
-                            if state.copy_selection() {
-                                state.selection = None;
+                            if state.sessions[active].copy_selection(&mut state.clipboard) {
+                                state.sessions[active].selection = None;
                                 state.window.request_redraw();
                                 return;
                             }
                             // 块处于选中态（用户可见高亮）就必须消费按键：
                             // 复制失败（空输出/块已淘汰）也只清选中、绝不
                             // 下穿成中断——误发 ^C 会取消用户输入的命令行。
-                            if state.selected_block.is_some() {
-                                state.copy_selected_block();
-                                state.selected_block = None;
+                            if state.sessions[active].selected_block.is_some() {
+                                state.sessions[active]
+                                    .copy_selected_block(&mut state.clipboard);
+                                state.sessions[active].selected_block = None;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -694,7 +674,7 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         // Ctrl+V / Ctrl+Shift+V 粘贴。
                         Some('v') => {
-                            state.paste_clipboard();
+                            state.sessions[active].paste_clipboard(&mut state.clipboard);
                             return;
                         }
                         _ => {}
@@ -702,7 +682,7 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // win32-input-mode 实验性开关（LUMEN_WIN32_INPUT=1 启用）：
                 // 实测当前编码实现反而更卡，默认关闭待核对协议规范。
-                let use_win32 = state.term.win32_input()
+                let use_win32 = state.sessions[active].term.win32_input()
                     && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
                 let bytes = if use_win32 {
                     input::encode_key_win32(&event, state.modifiers, true)
@@ -710,9 +690,9 @@ impl ApplicationHandler<PtyWake> for App {
                     input::encode_key(&event, state.modifiers)
                 };
                 if let Some(bytes) = bytes {
-                    state.term.grid_mut().scroll_to_bottom();
+                    state.sessions[active].term.grid_mut().scroll_to_bottom();
                     let write_t0 = Instant::now();
-                    if let Err(e) = state.pty.write(&bytes) {
+                    if let Err(e) = state.sessions[active].pty.write(&bytes) {
                         error!("写入 PTY 失败: {e:#}");
                     }
                     state.last_key_at = Some(write_t0);
@@ -724,9 +704,10 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
-                if state.selecting {
+                if state.sessions[state.active].selecting {
                     let head = state.sel_point_at_mouse();
-                    if let Some(sel) = state.selection.as_mut() {
+                    let active = state.active;
+                    if let Some(sel) = state.sessions[active].selection.as_mut() {
                         if sel.head != head {
                             sel.head = head;
                             state.window.request_redraw();
@@ -748,29 +729,30 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.terminal_focused = true;
                     let p = state.sel_point_at_mouse();
-                    state.selecting = true;
+                    let s = &mut state.sessions[state.active];
+                    s.selecting = true;
                     // 单击先建立空选区（不高亮），拖动后才有内容。
-                    state.selection = Some(Selection { anchor: p, head: p });
+                    s.selection = Some(Selection { anchor: p, head: p });
                     state.window.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Released) => {
                     // 本次按下不在终端区（点的是 egui 面板）则与终端无关。
-                    if !state.selecting {
+                    if !state.sessions[state.active].selecting {
                         return;
                     }
-                    state.selecting = false;
-                    if state.selection.is_some_and(|s| s.is_empty()) {
+                    state.sessions[state.active].selecting = false;
+                    if state.sessions[state.active]
+                        .selection
+                        .is_some_and(|s| s.is_empty())
+                    {
                         // 单击（未拖动）：选中/清除所在命令块。
                         // 备用屏幕下块行号坐标系不可用，不做块选中。
-                        state.selection = None;
-                        if !state.term.is_alt_screen() {
-                            let p = state.sel_point_at_mouse();
-                            let hit = state.term.block_at_line(p.line).map(|b| b.id);
-                            state.selected_block = if hit == state.selected_block {
-                                None
-                            } else {
-                                hit
-                            };
+                        let p = state.sel_point_at_mouse();
+                        let s = &mut state.sessions[state.active];
+                        s.selection = None;
+                        if !s.term.is_alt_screen() {
+                            let hit = s.term.block_at_line(p.line).map(|b| b.id);
+                            s.selected_block = if hit == s.selected_block { None } else { hit };
                         }
                         state.window.request_redraw();
                     }
@@ -780,11 +762,12 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
                     // 右键：有选区则复制，否则粘贴（Windows Terminal 惯例）。
-                    if state.copy_selection() {
-                        state.selection = None;
+                    let active = state.active;
+                    if state.sessions[active].copy_selection(&mut state.clipboard) {
+                        state.sessions[active].selection = None;
                         state.window.request_redraw();
                     } else {
-                        state.paste_clipboard();
+                        state.sessions[active].paste_clipboard(&mut state.clipboard);
                     }
                 }
                 _ => {}
@@ -795,7 +778,7 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.terminal_focused {
                     return;
                 }
-                if let Err(e) = state.pty.write(text.as_bytes()) {
+                if let Err(e) = state.sessions[state.active].pty.write(text.as_bytes()) {
                     error!("写入 PTY 失败: {e:#}");
                 }
             }
@@ -811,7 +794,10 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 };
                 if lines != 0 {
-                    state.term.grid_mut().scroll_display(lines);
+                    state.sessions[state.active]
+                        .term
+                        .grid_mut()
+                        .scroll_display(lines);
                     state.window.request_redraw();
                 }
             }
@@ -824,37 +810,40 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 let render_t0 = Instant::now();
 
-                state.term.grid_mut().take_dirty();
-                // 光标跟随策略：正常情况下零延迟跟随终端光标；处于
-                // 「帧尾未归位」窗口（ESU 后还没重新显示光标）时冻结
-                // 旧位置，等归位序列或超时，避免画出重绘残留位。
-                let now = Instant::now();
-                let g = state.term.grid();
-                let seen = (g.cursor.row, g.cursor.col, g.cursor.visible);
-                // 同行近距移动是打字/退格的特征，即时跟随不冻结；
-                // 动画残留位的特征是跨行大跳，才需要等归位确认。
-                let typing_move = seen.2
-                    && state.cursor_displayed.2
-                    && seen.0 == state.cursor_displayed.0
-                    && seen.1.abs_diff(state.cursor_displayed.1) <= 4;
-                if !state.term.cursor_unsettled() || typing_move {
-                    state.cursor_frozen_at = None;
-                    state.cursor_displayed = seen;
-                } else {
-                    let frozen = *state.cursor_frozen_at.get_or_insert(now);
-                    if now.duration_since(frozen) >= CURSOR_FREEZE_CAP {
-                        state.cursor_displayed = seen;
-                        state.cursor_frozen_at = None;
-                    } else if state.cursor_displayed != seen {
-                        // 安排超时时刻补画一帧，防止光标停滞在旧位。
-                        let at = frozen + CURSOR_FREEZE_CAP;
-                        state.redraw_at = Some(state.redraw_at.map_or(at, |x| x.min(at)));
+                {
+                    let s = &mut state.sessions[state.active];
+                    s.term.grid_mut().take_dirty();
+                    // 光标跟随策略：正常情况下零延迟跟随终端光标；处于
+                    // 「帧尾未归位」窗口（ESU 后还没重新显示光标）时冻结
+                    // 旧位置，等归位序列或超时，避免画出重绘残留位。
+                    let now = Instant::now();
+                    let g = s.term.grid();
+                    let seen = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                    // 同行近距移动是打字/退格的特征，即时跟随不冻结；
+                    // 动画残留位的特征是跨行大跳，才需要等归位确认。
+                    let typing_move = seen.2
+                        && s.cursor_displayed.2
+                        && seen.0 == s.cursor_displayed.0
+                        && seen.1.abs_diff(s.cursor_displayed.1) <= 4;
+                    if !s.term.cursor_unsettled() || typing_move {
+                        s.cursor_frozen_at = None;
+                        s.cursor_displayed = seen;
+                    } else {
+                        let frozen = *s.cursor_frozen_at.get_or_insert(now);
+                        if now.duration_since(frozen) >= CURSOR_FREEZE_CAP {
+                            s.cursor_displayed = seen;
+                            s.cursor_frozen_at = None;
+                        } else if s.cursor_displayed != seen {
+                            // 安排超时时刻补画一帧，防止光标停滞在旧位。
+                            let at = frozen + CURSOR_FREEZE_CAP;
+                            s.redraw_at = Some(s.redraw_at.map_or(at, |x| x.min(at)));
+                        }
                     }
                 }
 
                 // —— egui 帧：跑 UI 布局，产出本帧终端区矩形 ——
                 let raw_input = state.egui_state.take_egui_input(&state.window);
-                let title = state.term.title().to_owned();
+                let title = state.sessions[state.active].display_title().to_owned();
                 let tex_id = state.term_tex_id;
                 let mut shell_out = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
@@ -887,26 +876,32 @@ impl ApplicationHandler<PtyWake> for App {
                         state.term_tex_id,
                     );
                     let (rows, cols) = state.renderer.grid_size_for(tw, th);
-                    let g = state.term.grid();
+                    let g = state.sessions[state.active].term.grid();
                     if (rows, cols) != (g.rows(), g.cols()) {
-                        state.term.resize(rows, cols);
-                        let _ = state.pty.resize(rows as u16, cols as u16);
-                        // 尺寸变化会夹紧光标位置，立即同步绘制态。
-                        let g = state.term.grid();
-                        state.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                        // 所有 tab 共享同一终端视口矩形：resize 对全部会
+                        // 话立即生效（懒 resize 会让后台 TUI 在切换瞬间
+                        // 花屏），新建会话也以此行列数初始化。
+                        for s in &mut state.sessions {
+                            s.term.resize(rows, cols);
+                            let _ = s.pty.resize(rows as u16, cols as u16);
+                            // 尺寸变化会夹紧光标位置，立即同步绘制态。
+                            let g = s.term.grid();
+                            s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                        }
                     }
                 }
-                let cursor = state
-                    .cursor_displayed
-                    .2
-                    .then_some((state.cursor_displayed.0, state.cursor_displayed.1));
 
                 // —— 终端管线渲染到离屏纹理（damage/行缓存机制原样）——
+                let s = &state.sessions[state.active];
+                let cursor = s
+                    .cursor_displayed
+                    .2
+                    .then_some((s.cursor_displayed.0, s.cursor_displayed.1));
                 if let Err(e) = state.renderer.render(
-                    &state.term,
-                    state.selection.as_ref(),
+                    &s.term,
+                    s.selection.as_ref(),
                     cursor,
-                    state.selected_block,
+                    s.selected_block,
                 ) {
                     error!("渲染失败: {e:#}");
                 }
@@ -920,12 +915,13 @@ impl ApplicationHandler<PtyWake> for App {
                     .handle_platform_output(&state.window, full_output.platform_output);
                 if state.terminal_focused {
                     state.window.set_ime_allowed(true);
-                    let g = state.term.grid();
-                    let view_row = (g.display_offset() + state.cursor_displayed.0)
+                    let s = &state.sessions[state.active];
+                    let g = s.term.grid();
+                    let view_row = (g.display_offset() + s.cursor_displayed.0)
                         .min(g.rows().saturating_sub(1));
                     let (cx, cy) = state
                         .renderer
-                        .cell_origin(view_row, state.cursor_displayed.1);
+                        .cell_origin(view_row, s.cursor_displayed.1);
                     let (cw, ch) = state.renderer.cell_size();
                     state.window.set_ime_cursor_area(
                         winit::dpi::PhysicalPosition::new(
