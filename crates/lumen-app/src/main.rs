@@ -35,10 +35,11 @@ const REDRAW_HARD_CAP: Duration = Duration::from_millis(33);
 /// 帧完成，但等待不超过该时长（防应用卡死在 BSU 画面冻结）。
 const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// 光标「帧尾未归位」冻结的超时：ESU 后应用迟迟不发「显示光标」
-/// 归位序列时，超过该时长就信任当前位置。实测 codex 的归位批与
-/// 帧尾批毫秒级相继到达，10ms 足够；打字回显帧同样以 ESU 结尾，
-/// 该值过大会让光标每键滞后（曾设 50ms 导致快速输入光标追着跑）。
-const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(10);
+/// 归位序列时，超过该时长就信任当前位置。
+/// 打字光标走同行近距直通不受此值影响，它只兜「跨行大跳」
+/// （动画残留位）——经实战验证 50ms 能盖住 codex 归位批的延迟，
+/// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
+const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
