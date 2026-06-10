@@ -39,6 +39,9 @@ pub struct Renderer {
 
     theme: Theme,
     font_family: String,
+    /// 渲染与测量必须用同一字号：行高经过取整，从行高反推
+    /// 字号会放大 advance，长行下光标与文字逐字漂移。
+    font_size: f32,
     cell_w: f32,
     cell_h: f32,
     /// 内边距（物理像素）。
@@ -120,6 +123,7 @@ impl Renderer {
             rects,
             theme: Theme::default(),
             font_family,
+            font_size,
             cell_w,
             cell_h,
             padding: PADDING * scale_factor,
@@ -239,8 +243,7 @@ impl Renderer {
         // 窄字符连续成段、宽字符（CJK 等）单独成段，每段起点钉死在
         // col * cell_w。CJK fallback 字体的字形宽度往往 ≠ 2*cell_w，
         // 整行自由排版会让偏差逐字累计（光标与文字渐行渐远）。
-        let font_size = self.cell_h / LINE_HEIGHT_FACTOR;
-        let metrics = Metrics::new(font_size, self.cell_h);
+        let metrics = Metrics::new(self.font_size, self.cell_h);
         let family = self.font_family.clone();
         let base_attrs = Attrs::new().family(Family::Name(&family));
 
@@ -463,4 +466,42 @@ fn measure_cell(font_system: &mut FontSystem, family: &str, font_size: f32) -> (
         .and_then(|run| run.glyphs.first().map(|g| g.w))
         .unwrap_or(font_size * 0.6);
     (w, line_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 渲染字号必须与测量字号一致：用测量出的 cell_w 对照同字号下
+    /// 长串 ASCII 的排版宽度，偏差超过 0.5px 即说明 advance 不匹配，
+    /// 长行下光标会与文字逐字漂移（曾因从取整行高反推字号而出过此 bug）。
+    #[test]
+    fn 长行排版宽度与网格一致() {
+        let mut fs = FontSystem::new();
+        let family = pick_mono_family(&fs);
+        let font_size = 15.0_f32;
+        let (cell_w, cell_h) = measure_cell(&mut fs, &family, font_size);
+
+        let n = 60usize;
+        let text: String = "a".repeat(n);
+        let mut buf = TextBuffer::new(&mut fs, Metrics::new(font_size, cell_h));
+        buf.set_size(&mut fs, None, Some(cell_h));
+        buf.set_text(
+            &mut fs,
+            &text,
+            &Attrs::new().family(Family::Name(&family)),
+            Shaping::Advanced,
+            None,
+        );
+        let width = buf
+            .layout_runs()
+            .next()
+            .and_then(|run| run.glyphs.last().map(|g| g.x + g.w))
+            .expect("排版失败");
+        let expected = n as f32 * cell_w;
+        assert!(
+            (width - expected).abs() < 0.5,
+            "排版宽度 {width} 与网格宽度 {expected} 偏差过大"
+        );
+    }
 }

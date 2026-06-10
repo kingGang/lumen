@@ -110,6 +110,17 @@ impl ApplicationHandler<UserEvent> for App {
         };
         match event {
             UserEvent::Pty(PtyEvent::Data(bytes)) => {
+                // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
+                if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = f.write_all(&bytes);
+                    }
+                }
                 state.term.advance(&bytes);
                 // 终端应答（DSR/DA 等）回写给 shell。
                 let resp = state.term.take_responses();
