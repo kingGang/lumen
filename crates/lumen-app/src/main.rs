@@ -1,7 +1,8 @@
-//! Lumen 主程序：winit 事件循环，组装 PTY → 终端状态机 → 渲染器。
+//! Lumen 主程序：winit 事件循环，组装 PTY → 终端状态机 → 渲染器 → egui 外壳。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod input;
+mod shell;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use log::{error, info};
 use lumen_pty::{PtyEvent, PtySession};
-use lumen_renderer::Renderer;
+use lumen_renderer::{wgpu, Renderer};
 use lumen_term::{SelPoint, Selection, Terminal};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -124,6 +125,21 @@ struct AppState {
     selection: Option<Selection>,
     /// 选中的命令块 id。
     selected_block: Option<u64>,
+
+    // —— egui 外壳 ——
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    /// 终端纹理的 egui 句柄（离屏重建后原地换绑，id 不变）。
+    term_tex_id: egui::TextureId,
+    /// 终端区矩形（物理像素 x/y/w/h），来自最近一帧 egui 布局。
+    term_rect_px: (f32, f32, f32, f32),
+    /// 终端是否持有键盘/IME 焦点：点击终端区 true、点击 egui 面板
+    /// false。egui 不会为非控件区域持焦点，键盘与 IME 路由全靠它。
+    terminal_focused: bool,
+    /// egui 主动要求的下次重绘时刻（动画等），about_to_wait 里与
+    /// 终端渲染计划合流取 min。
+    egui_repaint_at: Option<Instant>,
 }
 
 impl AppState {
@@ -136,9 +152,25 @@ impl AppState {
         }
     }
 
+    /// 鼠标当前位置是否落在终端区矩形内。
+    ///
+    /// M3.1 终端区鼠标交互（选区/块点击/滚轮）以此为闸，不依赖 egui
+    /// 的 consumed（CentralPanel 覆盖终端区，悬停即视为「在 egui 区域
+    /// 上」，consumed 对鼠标无判别力）。M3.2+ 出现盖在终端上的弹层
+    /// 时需在此叠加 egui 层命中检测。
+    fn mouse_in_term(&self) -> bool {
+        let (x, y, w, h) = self.term_rect_px;
+        let (mx, my) = self.mouse_pos;
+        mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64
+    }
+
     /// 把当前鼠标像素位置换算成选区端点（绝对行号）。
+    /// cell_at 接相对终端区原点的坐标。
     fn sel_point_at_mouse(&self) -> SelPoint {
-        let (row, col) = self.renderer.cell_at(self.mouse_pos.0, self.mouse_pos.1);
+        let (row, col) = self.renderer.cell_at(
+            self.mouse_pos.0 - self.term_rect_px.0 as f64,
+            self.mouse_pos.1 - self.term_rect_px.1 as f64,
+        );
         SelPoint {
             line: self.term.grid().view_top_abs_line() + row as u64,
             col,
@@ -253,13 +285,44 @@ impl App {
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0));
         let window = Arc::new(event_loop.create_window(attrs).context("创建窗口失败")?);
         window.set_ime_allowed(true);
+        // 告知输入法处于终端语境（egui-winit 内部有同等映射）。
+        window.set_ime_purpose(winit::window::ImePurpose::Terminal);
 
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
-        let renderer = Renderer::new(window.clone(), size.width, size.height, scale)
+        let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale)
             .context("初始化渲染器失败")?;
-        // 过渡期终端区 = 整窗（egui 接入后由布局矩形决定）。
-        let (rows, cols) = renderer.grid_size_for(size.width, size.height);
+
+        // —— egui 三件套 ——
+        let egui_ctx = egui::Context::default();
+        shell::theme::apply_style(&egui_ctx);
+        shell::theme::install_cjk_fonts(&egui_ctx);
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(scale),
+            None,
+            Some(renderer.device().limits().max_texture_dimension_2d as usize),
+        );
+        let mut egui_renderer = egui_wgpu::Renderer::new(
+            renderer.device(),
+            renderer.surface_format(),
+            egui_wgpu::RendererOptions::default(),
+        );
+
+        // 终端区初值：窗口减去侧栏宽度（首帧 egui 布局后按实际矩形校正）。
+        let sidebar_px = (shell::SIDEBAR_WIDTH * scale).round();
+        let term_w = ((size.width as f32 - sidebar_px).max(1.0)) as u32;
+        let term_h = size.height.max(1);
+        renderer.ensure_offscreen(term_w, term_h);
+        let term_tex_id = egui_renderer.register_native_texture(
+            renderer.device(),
+            renderer.offscreen_view(),
+            wgpu::FilterMode::Nearest,
+        );
+
+        let (rows, cols) = renderer.grid_size_for(term_w, term_h);
         info!("终端尺寸: {rows} 行 x {cols} 列");
 
         let term = Terminal::new(rows, cols, SCROLLBACK);
@@ -327,6 +390,13 @@ impl App {
             selecting: false,
             selection: None,
             selected_block: None,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            term_tex_id,
+            term_rect_px: (sidebar_px, 0.0, term_w as f32, term_h as f32),
+            terminal_focused: true,
+            egui_repaint_at: None,
         })
     }
 }
@@ -445,29 +515,49 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        let Some(soft) = state.redraw_at else {
-            // 没有待渲染计划时必须显式回到 Wait：ControlFlow 是粘性的，
+        // 终端渲染时刻 = 静默窗口与强制刷新中先到者；egui 重绘计划
+        // （动画等）独立成项，与终端计划取 min 定下次唤醒。
+        let term_due = state
+            .redraw_at
+            .map(|soft| state.redraw_hard_at.map_or(soft, |h| soft.min(h)));
+        let due = match (term_due, state.egui_repaint_at) {
+            // 没有任何待渲染计划时必须显式回到 Wait：ControlFlow 是粘性的，
             // 残留的 WaitUntil(过去时刻) 会让事件循环全速空转（曾导致
             // ESU 直渲后单核拉满、键盘处理抖动、conhost 被抢 CPU）。
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
+            (None, None) => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+                return;
+            }
+            (Some(t), None) => t,
+            (None, Some(e)) => e,
+            (Some(t), Some(e)) => t.min(e),
         };
-        // 渲染时刻 = 静默窗口与强制刷新中先到者。
-        let due = state.redraw_hard_at.map_or(soft, |h| soft.min(h));
         let now = Instant::now();
         if now < due {
             event_loop.set_control_flow(ControlFlow::WaitUntil(due));
             return;
         }
-        // 到点若正处于同步区间，小步顺延等帧完成（ESU 通常随下一批
-        // 数据立刻到达），但不超过绝对兜底时刻。
-        if state.term.is_synchronized() && state.redraw_abs_at.is_some_and(|a| now < a) {
+        // 终端计划到点但正处于同步区间：小步顺延等帧完成（ESU 通常随
+        // 下一批数据立刻到达），但不超过绝对兜底时刻。egui 计划即使
+        // 到点也跟着顺延（2ms 粒度，对 UI 动画无感），避免把半成品
+        // 终端帧画上屏。
+        if term_due.is_some_and(|t| now >= t)
+            && state.term.is_synchronized()
+            && state.redraw_abs_at.is_some_and(|a| now < a)
+        {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(2)));
             return;
         }
-        state.redraw_at = None;
-        state.redraw_hard_at = None;
-        state.redraw_abs_at = None;
+        // 只清掉已到点的计划：egui 提前到点不应连带提前终端的静默合
+        // 帧计划（半成品 TUI 帧会闪烁），反之亦然。
+        if term_due.is_some_and(|t| now >= t) {
+            state.redraw_at = None;
+            state.redraw_hard_at = None;
+            state.redraw_abs_at = None;
+        }
+        if state.egui_repaint_at.is_some_and(|e| now >= e) {
+            state.egui_repaint_at = None;
+        }
         event_loop.set_control_flow(ControlFlow::Wait);
         state.window.request_redraw();
     }
@@ -476,21 +566,49 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+
+        // —— egui 先行消化事件 ——
+        // 终端聚焦时键盘与 IME 整体绕过 egui：Tab/方向键不被 egui 的
+        // 焦点导航偷走、IME 提交不被双投。其余事件先喂 egui（面板悬停
+        // 高亮、按钮交互都靠它），Resized/CloseRequested 等窗口级事件
+        // egui 看过后仍由我们自行处理。
+        // RedrawRequested 绝不喂 egui：egui-winit 对它一律返回
+        // repaint:true，照做 request_redraw 会形成「重绘请求自循环」，
+        // 事件循环全速空转单核拉满（实测踩过，性质同 main.rs 历史上的
+        // ControlFlow 粘性空转事故）。
+        // 注：resp.consumed 在本布局下对鼠标无判别力（终端区被
+        // CentralPanel 覆盖，悬停即视为「在 egui 区域上」）——鼠标按
+        // 终端区矩形路由（mouse_in_term），键盘/IME 按 terminal_focused
+        // 路由，不依赖 consumed。
+        let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
+            || (state.terminal_focused
+                && matches!(
+                    event,
+                    WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+                ));
+        if !bypass_egui {
+            let resp = state.egui_state.on_window_event(&state.window, &event);
+            if resp.repaint {
+                state.window.request_redraw();
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::Resized(size) => {
                 state.renderer.resize_surface(size.width, size.height);
-                state.renderer.ensure_offscreen(size.width, size.height);
-                let (rows, cols) = state.renderer.grid_size_for(size.width, size.height);
-                state.term.resize(rows, cols);
-                let _ = state.pty.resize(rows as u16, cols as u16);
-                // 尺寸变化会夹紧光标位置，立即同步绘制态。
-                let g = state.term.grid();
-                state.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                // 终端行列数跟随 egui 布局出的终端区矩形，统一在
+                // RedrawRequested 里检测变化并 resize（离屏纹理同步重建）。
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // 终端聚焦时键盘绕过 egui 直通此处；非聚焦时按键归
+                // egui，无论它是否消费都不再写 PTY（点了侧栏还往
+                // shell 灌字节是事故）。
+                if !state.terminal_focused {
+                    return;
+                }
                 use winit::keyboard::{Key, NamedKey};
                 let pressed = event.state == ElementState::Pressed;
                 // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
@@ -622,6 +740,13 @@ impl ApplicationHandler<PtyWake> for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // 焦点仲裁：点击终端区聚焦终端，点击 egui 面板交出
+                    // 焦点（键盘/IME 路由随之切换）。
+                    if !state.mouse_in_term() {
+                        state.terminal_focused = false;
+                        return;
+                    }
+                    state.terminal_focused = true;
                     let p = state.sel_point_at_mouse();
                     state.selecting = true;
                     // 单击先建立空选区（不高亮），拖动后才有内容。
@@ -629,6 +754,10 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    // 本次按下不在终端区（点的是 egui 面板）则与终端无关。
+                    if !state.selecting {
+                        return;
+                    }
                     state.selecting = false;
                     if state.selection.is_some_and(|s| s.is_empty()) {
                         // 单击（未拖动）：选中/清除所在命令块。
@@ -647,6 +776,9 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
+                    if !state.mouse_in_term() {
+                        return;
+                    }
                     // 右键：有选区则复制，否则粘贴（Windows Terminal 惯例）。
                     if state.copy_selection() {
                         state.selection = None;
@@ -658,12 +790,20 @@ impl ApplicationHandler<PtyWake> for App {
                 _ => {}
             },
             WindowEvent::Ime(Ime::Commit(text)) => {
-                // 中文等 IME 提交的文本直接写入 shell。
+                // 仅终端聚焦时把 IME 提交文本写入 shell；egui 输入框
+                // 聚焦时事件已喂给 egui 消化，再写 PTY 就是双投。
+                if !state.terminal_focused {
+                    return;
+                }
                 if let Err(e) = state.pty.write(text.as_bytes()) {
                     error!("写入 PTY 失败: {e:#}");
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // 终端区内滚轮归终端，区外（侧栏等）归 egui。
+                if !state.mouse_in_term() {
+                    return;
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as isize,
                     MouseScrollDelta::PixelDelta(p) => {
@@ -676,6 +816,14 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // surface 帧先行取得：失败（Lost/Outdated 已就地重配）则
+                // 本帧整体跳过——egui 输入与 textures_delta 都未消费，
+                // 状态不丢，等下一次重绘。
+                let Some(frame) = state.renderer.acquire_frame() else {
+                    return;
+                };
+                let render_t0 = Instant::now();
+
                 state.term.grid_mut().take_dirty();
                 // 光标跟随策略：正常情况下零延迟跟随终端光标；处于
                 // 「帧尾未归位」窗口（ESU 后还没重新显示光标）时冻结
@@ -703,11 +851,57 @@ impl ApplicationHandler<PtyWake> for App {
                         state.redraw_at = Some(state.redraw_at.map_or(at, |x| x.min(at)));
                     }
                 }
+
+                // —— egui 帧：跑 UI 布局，产出本帧终端区矩形 ——
+                let raw_input = state.egui_state.take_egui_input(&state.window);
+                let title = state.term.title().to_owned();
+                let tex_id = state.term_tex_id;
+                let mut shell_out = None;
+                let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
+                    shell_out = Some(shell::show(ui, tex_id, &title));
+                });
+                let Some(shell_out) = shell_out else {
+                    return; // run_ui 必然执行闭包，防御分支
+                };
+                if shell_out.term_clicked {
+                    state.terminal_focused = true;
+                }
+
+                // —— 终端区矩形（物理像素）变化 → 重建离屏 + resize ——
+                let ppp = full_output.pixels_per_point;
+                let r = shell_out.term_rect;
+                state.term_rect_px = (
+                    r.min.x * ppp,
+                    r.min.y * ppp,
+                    r.width() * ppp,
+                    r.height() * ppp,
+                );
+                let tw = (r.width() * ppp).round().max(1.0) as u32;
+                let th = (r.height() * ppp).round().max(1.0) as u32;
+                if state.renderer.ensure_offscreen(tw, th) {
+                    // 原地换绑：TextureId 不变，本帧 egui pass 即采样新视图。
+                    state.egui_renderer.update_egui_texture_from_wgpu_texture(
+                        state.renderer.device(),
+                        state.renderer.offscreen_view(),
+                        wgpu::FilterMode::Nearest,
+                        state.term_tex_id,
+                    );
+                    let (rows, cols) = state.renderer.grid_size_for(tw, th);
+                    let g = state.term.grid();
+                    if (rows, cols) != (g.rows(), g.cols()) {
+                        state.term.resize(rows, cols);
+                        let _ = state.pty.resize(rows as u16, cols as u16);
+                        // 尺寸变化会夹紧光标位置，立即同步绘制态。
+                        let g = state.term.grid();
+                        state.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
+                    }
+                }
                 let cursor = state
                     .cursor_displayed
                     .2
                     .then_some((state.cursor_displayed.0, state.cursor_displayed.1));
-                let render_t0 = Instant::now();
+
+                // —— 终端管线渲染到离屏纹理（damage/行缓存机制原样）——
                 if let Err(e) = state.renderer.render(
                     &state.term,
                     state.selection.as_ref(),
@@ -716,8 +910,109 @@ impl ApplicationHandler<PtyWake> for App {
                 ) {
                     error!("渲染失败: {e:#}");
                 }
-                // 过渡期直呈桥：离屏纹理拷到 surface（egui 接入后移除）。
-                state.renderer.present_offscreen();
+
+                // —— egui 平台输出 + IME 强制复位（IME 最大坑对策）——
+                // egui 会按自己的文本焦点开关整窗 IME / 挪动候选框；终端
+                // 聚焦时必须在 handle_platform_output **之后**强制复位，
+                // 并把候选框钉在终端光标所在格子（终端区原点 + cell×行列）。
+                state
+                    .egui_state
+                    .handle_platform_output(&state.window, full_output.platform_output);
+                if state.terminal_focused {
+                    state.window.set_ime_allowed(true);
+                    let g = state.term.grid();
+                    let view_row = (g.display_offset() + state.cursor_displayed.0)
+                        .min(g.rows().saturating_sub(1));
+                    let (cx, cy) = state
+                        .renderer
+                        .cell_origin(view_row, state.cursor_displayed.1);
+                    let (cw, ch) = state.renderer.cell_size();
+                    state.window.set_ime_cursor_area(
+                        winit::dpi::PhysicalPosition::new(
+                            (state.term_rect_px.0 + cx) as f64,
+                            (state.term_rect_px.1 + cy) as f64,
+                        ),
+                        winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
+                    );
+                }
+
+                // —— egui 渲染到 surface（单 pass，Clear 装载）——
+                let clipped = state.egui_ctx.tessellate(full_output.shapes, ppp);
+                let (sw, sh) = state.renderer.surface_size();
+                let screen = egui_wgpu::ScreenDescriptor {
+                    size_in_pixels: [sw, sh],
+                    pixels_per_point: ppp,
+                };
+                let device = state.renderer.device();
+                let queue = state.renderer.queue();
+                for (id, delta) in &full_output.textures_delta.set {
+                    state
+                        .egui_renderer
+                        .update_texture(device, queue, *id, delta);
+                }
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("lumen egui frame"),
+                });
+                let user_cmds = state.egui_renderer.update_buffers(
+                    device,
+                    queue,
+                    &mut encoder,
+                    &clipped,
+                    &screen,
+                );
+                let surface_view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                {
+                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("lumen egui pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &surface_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(
+                                    state.renderer.theme().background.to_wgpu(),
+                                ),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    // egui 的 render() 要求 'static 生命周期 pass；
+                    // forget_lifetime 之后不得再操作父 encoder。
+                    let mut pass = pass.forget_lifetime();
+                    state.egui_renderer.render(&mut pass, &clipped, &screen);
+                }
+                queue.submit(user_cmds.into_iter().chain([encoder.finish()]));
+                frame.present();
+                for id in &full_output.textures_delta.free {
+                    state.egui_renderer.free_texture(id);
+                }
+
+                // —— egui 重绘计划：与终端节拍在 about_to_wait 合流 ——
+                let repaint_delay = full_output
+                    .viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .map_or(Duration::MAX, |v| v.repaint_delay);
+                // 仅记录异常值（动画/立即重绘请求），用于空转监控。
+                if repaint_delay < Duration::from_secs(3600) {
+                    state.perf_log(format_args!("egui repaint_delay {repaint_delay:?}"));
+                }
+                state.egui_repaint_at = if repaint_delay == Duration::ZERO {
+                    // 动画进行中要求立即重绘；request_redraw 自带合并。
+                    state.window.request_redraw();
+                    None
+                } else if repaint_delay < Duration::from_secs(3600) {
+                    Some(render_t0 + repaint_delay)
+                } else {
+                    None // 「无限远」：无需主动重绘
+                };
+
+                // —— 埋点（沿用 M2 字段，便于打字延迟基线对比）——
                 let gap = state
                     .last_render_at
                     .map(|t| render_t0.duration_since(t))

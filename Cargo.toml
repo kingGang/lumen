@@ -33,6 +33,10 @@ winit = "0.30"
 wgpu = "29"
 glyphon = "0.11"
 pollster = "0.4"
+# egui 三件套版本必须一致（0.34 → wgpu 29 / winit 0.30，与现有渲染栈同源）。
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。

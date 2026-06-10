@@ -68,9 +68,7 @@ impl Offscreen {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats,
         });
         let render_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -158,9 +156,7 @@ impl Renderer {
             wgpu::PresentMode::AutoVsync
         };
         let config = wgpu::SurfaceConfiguration {
-            // COPY_DST 为过渡期直呈桥（present_offscreen）所需，
-            // egui 接入后恢复为仅 RENDER_ATTACHMENT。
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
             height: height.max(1),
@@ -318,30 +314,6 @@ impl Renderer {
             // Timeout/Occluded/校验错误：跳过本帧。
             _ => None,
         }
-    }
-
-    /// 【过渡期直呈桥】把离屏纹理拷贝到 surface 并呈现。
-    /// 仅供 egui 接入前的中间状态使用，egui 合流后移除。
-    pub fn present_offscreen(&mut self) {
-        let Some(frame) = self.acquire_frame() else {
-            return;
-        };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("lumen blit"),
-            });
-        encoder.copy_texture_to_texture(
-            self.offscreen.texture.as_image_copy(),
-            frame.texture.as_image_copy(),
-            wgpu::Extent3d {
-                width: self.offscreen.width.min(self.config.width),
-                height: self.offscreen.height.min(self.config.height),
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
     }
 
     /// 渲染一帧终端内容到离屏纹理（不触碰 surface，呈现由 app 层的
