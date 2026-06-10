@@ -3,6 +3,7 @@
 
 mod input;
 mod session;
+mod settings;
 mod shell;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -266,6 +267,27 @@ impl App {
         let scale = window.scale_factor() as f32;
         let mut renderer = Renderer::new(window.clone(), size.width, size.height, scale)
             .context("初始化渲染器失败")?;
+
+        // —— 设置加载与应用（settings.json；缺失/损坏降级默认值）——
+        let app_settings = settings::Settings::load();
+        let ap = &app_settings.appearance;
+        let actual_family = renderer.reconfigure_font(&ap.font_family, ap.font_size);
+        renderer.set_theme(ap.theme.terminal_theme());
+        info!(
+            "设置加载：主题 {} 字号 {} 字体「{}」→ 实际生效「{actual_family}」",
+            ap.theme.display_name(),
+            ap.font_size,
+            if ap.font_family.is_empty() {
+                "自动"
+            } else {
+                &ap.font_family
+            }
+        );
+        // 首次启动（无设置文件）落盘默认值，方便用户直接手改；
+        // 文件存在但损坏时不在此覆盖（保留现场，变更时才写）。
+        if settings::Settings::path().is_some_and(|p| !p.exists()) {
+            app_settings.save();
+        }
 
         // —— egui 三件套 ——
         let egui_ctx = egui::Context::default();

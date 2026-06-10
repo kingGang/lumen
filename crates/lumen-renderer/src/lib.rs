@@ -111,6 +111,8 @@ pub struct Renderer {
     /// 渲染与测量必须用同一字号：行高经过取整，从行高反推
     /// 字号会放大 advance，长行下光标与文字逐字漂移。
     font_size: f32,
+    /// DPI 缩放因子（运行时重配置字体把逻辑字号换算成物理字号用）。
+    scale_factor: f32,
     cell_w: f32,
     cell_h: f32,
     /// 内边距（物理像素）。
@@ -205,10 +207,53 @@ impl Renderer {
             theme: Theme::default(),
             font_family,
             font_size,
+            scale_factor,
             cell_w,
             cell_h,
             padding: PADDING * scale_factor,
         })
+    }
+
+    /// 运行时重配置字体（设置页「即时生效」链路的渲染器侧入口）。
+    ///
+    /// `family` 为字体家族名（空串 = 自动挑选默认等宽字体）；系统中
+    /// 不存在该字体时回退默认，不 panic。`font_size_logical` 为逻辑
+    /// 像素字号（内部乘 DPI 缩放）。重新测量单元格尺寸并使全部行排版
+    /// 缓存失效；调用方随后须按新 cell 尺寸重算行列数并对全部会话
+    /// resize（终端 + PTY）。
+    ///
+    /// 返回实际生效的家族名——与请求不同即发生了回退，调用方据此在
+    /// 设置页提示用户。
+    pub fn reconfigure_font(&mut self, family: &str, font_size_logical: f32) -> String {
+        let resolved = resolve_family(&self.font_system, family);
+        self.font_size = (font_size_logical * self.scale_factor).max(1.0);
+        self.font_family = resolved.clone();
+        let (w, h) = measure_cell(&mut self.font_system, &self.font_family, self.font_size);
+        self.cell_w = w;
+        self.cell_h = h;
+        self.invalidate_row_cache();
+        log::info!(
+            "字体重配置: 「{}」{font_size_logical}（物理 {}）单元格 {w}x{h}",
+            self.font_family,
+            self.font_size
+        );
+        resolved
+    }
+
+    /// 切换终端主题，并使行排版缓存整体失效——行哈希只包含单元格
+    /// 自身的颜色编码（Indexed/Rgb），不含主题解析出的实际 RGB，
+    /// 换主题后必须强制全量重排一次，否则旧配色的行会因哈希命中
+    /// 而保持旧颜色。
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.invalidate_row_cache();
+    }
+
+    /// 行级排版缓存整体失效（字体/字号/主题变更后调用）。
+    fn invalidate_row_cache(&mut self) {
+        for r in &mut self.row_segs {
+            r.hash = None;
+        }
     }
 
     /// 单元格物理像素尺寸（app 用它换算终端区尺寸 ↔ 行列数）。
@@ -679,6 +724,24 @@ fn hash_row(row: &lumen_term::Row, cols: usize) -> u64 {
         }
     }
     h
+}
+
+/// 解析请求的字体家族名：非空且系统中存在则用之，否则回退
+/// [`pick_mono_family`] 的默认选择（设置页字体名无效不崩）。
+fn resolve_family(font_system: &FontSystem, wanted: &str) -> String {
+    let wanted = wanted.trim();
+    if !wanted.is_empty() {
+        let found = font_system.db().faces().any(|f| {
+            f.families
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(wanted))
+        });
+        if found {
+            return wanted.to_owned();
+        }
+        log::warn!("系统中未找到字体「{wanted}」，回退默认等宽字体");
+    }
+    pick_mono_family(font_system)
 }
 
 /// 在系统字体库中挑选等宽字体：Cascadia Mono → Consolas → 任意 Monospace。

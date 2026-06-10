@@ -44,7 +44,8 @@ impl Rgb {
     }
 }
 
-/// 终端主题（M1 硬编码 Tokyo Night 风格深色）。
+/// 终端主题（M3.4 起可在设置页切换，预设见 [`Theme::tokyo_night`] /
+/// [`Theme::tokyo_night_light`]）。
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub background: Rgb,
@@ -86,6 +87,40 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// Tokyo Night（默认深色主题）。
+    pub fn tokyo_night() -> Self {
+        Self::default()
+    }
+
+    /// Tokyo Night Light（浅色备选；色板取自 tokyonight 的 day 风格
+    /// 终端色，黑/亮黑在浅底上取浅灰保证可读）。
+    pub fn tokyo_night_light() -> Self {
+        Self {
+            background: Rgb(0xe1, 0xe2, 0xe7),
+            foreground: Rgb(0x37, 0x60, 0xbf),
+            cursor: Rgb(0x37, 0x60, 0xbf),
+            selection: Rgb(0xb7, 0xc1, 0xe3),
+            ansi: [
+                Rgb(0xb4, 0xb5, 0xb9), // 黑（浅底上的浅灰）
+                Rgb(0xf5, 0x2a, 0x65), // 红
+                Rgb(0x58, 0x75, 0x39), // 绿
+                Rgb(0x8c, 0x6c, 0x3e), // 黄
+                Rgb(0x2e, 0x7d, 0xe9), // 蓝
+                Rgb(0x98, 0x54, 0xf1), // 品红
+                Rgb(0x00, 0x71, 0x97), // 青
+                Rgb(0x61, 0x72, 0xb0), // 白
+                Rgb(0xa1, 0xa6, 0xc5), // 亮黑
+                Rgb(0xf5, 0x2a, 0x65),
+                Rgb(0x58, 0x75, 0x39),
+                Rgb(0x8c, 0x6c, 0x3e),
+                Rgb(0x2e, 0x7d, 0xe9),
+                Rgb(0x98, 0x54, 0xf1),
+                Rgb(0x00, 0x71, 0x97),
+                Rgb(0x37, 0x60, 0xbf), // 亮白
+            ],
+        }
+    }
+
     /// 解析单元格颜色到 RGB。`is_fg` 决定 Default 落到前景还是背景。
     pub fn resolve(&self, color: Color, is_fg: bool) -> Rgb {
         match color {

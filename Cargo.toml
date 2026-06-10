@@ -31,6 +31,8 @@ vte = "0.15"
 unicode-width = "0.2"
 winit = "0.30"
 wgpu = "29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 glyphon = "0.11"
 pollster = "0.4"
 # egui 三件套版本必须一致（0.34 → wgpu 29 / winit 0.30，与现有渲染栈同源）。
