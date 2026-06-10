@@ -7,7 +7,7 @@
 use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 /// PTY 输出事件，由读线程推送。
@@ -25,7 +25,9 @@ pub enum PtyEvent {
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
+    /// 写入走独立线程：ConPTY 输入管道在 conhost 繁忙时会反压，
+    /// 主线程（UI 事件循环）绝不能阻塞在管道写上。
+    write_tx: Sender<Vec<u8>>,
 }
 
 impl PtySession {
@@ -61,7 +63,20 @@ impl PtySession {
             .master
             .try_clone_reader()
             .context("克隆 PTY 读端失败")?;
-        let writer = pair.master.take_writer().context("获取 PTY 写端失败")?;
+        let mut writer = pair.master.take_writer().context("获取 PTY 写端失败")?;
+
+        // 写线程：键盘输入量小，无界通道安全；发送端 drop 后线程退出。
+        let (write_tx, write_rx) = unbounded::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name("lumen-pty-writer".into())
+            .spawn(move || {
+                for data in write_rx {
+                    if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("启动 PTY 写线程失败")?;
 
         // 有界通道形成背压：渲染端消费不过来时读线程会阻塞，
         // 避免 `yes` 这类高速输出把内存撑爆。
@@ -90,16 +105,18 @@ impl PtySession {
             Self {
                 master: pair.master,
                 child,
-                writer,
+                write_tx,
             },
             rx,
         ))
     }
 
     /// 向 shell 写入用户输入（已编码为 VT 序列的字节）。
-    pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data).context("写入 PTY 失败")?;
-        self.writer.flush().context("刷新 PTY 写端失败")
+    /// 实际写入由独立线程完成，本方法不阻塞。
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        self.write_tx
+            .send(data.to_vec())
+            .map_err(|_| anyhow::anyhow!("PTY 写线程已退出"))
     }
 
     /// 通知 PTY 窗口尺寸变化（行/列）。

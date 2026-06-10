@@ -310,10 +310,23 @@ impl ApplicationHandler<PtyWake> for App {
             if frame_completed {
                 // 本批完成了 DEC 2026 同步帧：协议语义就是「立即原子
                 // 呈现」，零等待直接渲染（codex 打字回显走这条快路）。
-                state.redraw_at = None;
-                state.redraw_hard_at = None;
-                state.redraw_abs_at = None;
-                state.window.request_redraw();
+                // 但渲染频率以 ~8ms 为下限：极速输入（百帧每秒级回显）
+                // 时把积压帧合并，避免渲染请求超出显示能力拖垮主线程。
+                let now = Instant::now();
+                let recent = state
+                    .last_render_at
+                    .is_some_and(|t| now.duration_since(t) < Duration::from_millis(8));
+                if recent {
+                    let at = state.last_render_at.unwrap() + Duration::from_millis(8);
+                    state.redraw_at = Some(at);
+                    state.redraw_hard_at = None;
+                    state.redraw_abs_at = Some(at + Duration::from_millis(50));
+                } else {
+                    state.redraw_at = None;
+                    state.redraw_hard_at = None;
+                    state.redraw_abs_at = None;
+                    state.window.request_redraw();
+                }
             } else {
                 // 无同步协议的流（普通 shell/claude）：静默合帧，每批
                 // 数据推后渲染时刻，流停了才画（见 about_to_wait）；
@@ -385,8 +398,22 @@ impl ApplicationHandler<PtyWake> for App {
                 state.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
                 state.window.request_redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 use winit::keyboard::{Key, NamedKey};
+                let pressed = event.state == ElementState::Pressed;
+                // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
+                if !pressed {
+                    if state.term.win32_input() {
+                        if let Some(bytes) =
+                            input::encode_key_win32(&event, state.modifiers, false)
+                        {
+                            if let Err(e) = state.pty.write(&bytes) {
+                                error!("写入 PTY 失败: {e:#}");
+                            }
+                        }
+                    }
+                    return;
+                }
                 // Shift+PgUp/PgDn 本地翻屏，不发给 shell。
                 if state.modifiers.shift_key() {
                     let rows = state.term.grid().rows() as isize;
@@ -437,7 +464,14 @@ impl ApplicationHandler<PtyWake> for App {
                         _ => {}
                     }
                 }
-                if let Some(bytes) = input::encode_key(&event, state.modifiers) {
+                // win32-input-mode 优先：按键结构化直达 conhost 输入
+                // 队列，绕开 VT 字符流的兼容解析（高频输入的瓶颈）。
+                let bytes = if state.term.win32_input() {
+                    input::encode_key_win32(&event, state.modifiers, true)
+                } else {
+                    input::encode_key(&event, state.modifiers)
+                };
+                if let Some(bytes) = bytes {
                     state.term.grid_mut().scroll_to_bottom();
                     let write_t0 = Instant::now();
                     if let Err(e) = state.pty.write(&bytes) {

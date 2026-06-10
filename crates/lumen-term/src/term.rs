@@ -81,6 +81,11 @@ impl Terminal {
         self.inner.bracketed_paste
     }
 
+    /// 是否开启 ConPTY win32-input-mode（DEC 9001）。
+    pub fn win32_input(&self) -> bool {
+        self.inner.win32_input
+    }
+
     /// ESU（同步帧结束）单调标记：每次 ESU 后递增。
     /// 上层对比两次取值即可知道期间是否完成过同步帧——完成的帧
     /// 应立即渲染（DEC 2026 的本意），无需再等静默合帧。
@@ -155,6 +160,9 @@ struct TermInner {
     sync_output: bool,
     /// DEC 2004 bracketed paste 已开启。
     bracketed_paste: bool,
+    /// ConPTY win32-input-mode（DEC 9001）已开启：键盘输入应编码为
+    /// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` 直达 conhost 输入队列。
+    win32_input: bool,
     /// 事件序号，用于判断「显示光标」与「ESU」的先后。
     event_seq: u64,
     last_cursor_show_seq: u64,
@@ -176,6 +184,7 @@ impl TermInner {
             bell: false,
             sync_output: false,
             bracketed_paste: false,
+            win32_input: false,
             event_seq: 0,
             last_cursor_show_seq: 0,
             last_esu_seq: 0,
@@ -567,6 +576,7 @@ impl Perform for TermInner {
                             }
                             1049 | 1047 => self.set_alt_screen(on),
                             2004 => self.bracketed_paste = on,
+                            9001 => self.win32_input = on,
                             2026 => {
                                 self.sync_output = on;
                                 if !on {
