@@ -185,12 +185,14 @@ impl Renderer {
     ///
     /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为要绘制的
     /// 光标屏幕坐标（None 不画）——由上层做位置防抖后传入，不直接读
-    /// grid 光标，避免把 TUI 重绘期间的临时停留位画上屏。
+    /// grid 光标，避免把 TUI 重绘期间的临时停留位画上屏；
+    /// `selected_block` 为选中命令块的 id（块背景高亮）。
     pub fn render(
         &mut self,
         term: &Terminal,
         selection: Option<&Selection>,
         cursor: Option<(usize, usize)>,
+        selected_block: Option<u64>,
     ) -> Result<()> {
         use wgpu::CurrentSurfaceTexture;
         let frame = match self.surface.get_current_texture() {
@@ -212,9 +214,52 @@ impl Renderer {
         let (cw, ch) = (self.cell_w, self.cell_h);
         let pad = self.padding;
 
-        // ---- 收集矩形：背景色块、选区高亮、下划线/删除线、光标 ----
+        // ---- 收集矩形：块标识、背景色块、选区高亮、下划线/删除线、光标 ----
         let view_top_abs = grid.view_top_abs_line();
         let mut instances: Vec<rect::RectInstance> = Vec::new();
+
+        // 命令块视觉：左缘状态色条（运行中蓝/成功绿/失败红）、块首行
+        // 顶部细分隔线。选中块的半透明高亮收集到单独列表，在所有
+        // 单元格背景之后绘制（先画会被不透明 cell 背景盖成花斑）。
+        // 不在备用屏幕（vim 等全屏程序）时才绘制。
+        let mut block_tints: Vec<rect::RectInstance> = Vec::new();
+        if !term.is_alt_screen() {
+            let bar_x = pad * 0.2;
+            let bar_w = (pad * 0.3).max(2.0);
+            for vr in 0..rows {
+                let abs_line = view_top_abs + vr as u64;
+                let Some(block) = term.block_at_line(abs_line) else {
+                    continue;
+                };
+                let y = pad + vr as f32 * ch;
+                if selected_block == Some(block.id) {
+                    block_tints.push(rect::RectInstance {
+                        pos: [pad, y],
+                        size: [cols as f32 * cw, ch],
+                        color: self.theme.selection.to_linear_f32(0.35),
+                    });
+                }
+                let bar_color = match block.exit_code {
+                    None if !block.is_closed() => self.theme.ansi[4], // 运行中：蓝
+                    Some(0) | None => self.theme.ansi[2],             // 成功：绿
+                    Some(_) => self.theme.ansi[1],                    // 失败：红
+                };
+                instances.push(rect::RectInstance {
+                    pos: [bar_x, y],
+                    size: [bar_w, ch],
+                    color: bar_color.to_linear_f32(0.85),
+                });
+                if abs_line == block.prompt_line && vr > 0 {
+                    // 块首行顶部分隔线。
+                    instances.push(rect::RectInstance {
+                        pos: [pad, y],
+                        size: [cols as f32 * cw, 1.0],
+                        color: self.theme.foreground.to_linear_f32(0.12),
+                    });
+                }
+            }
+        }
+
         for (vr, row) in grid.visible_rows().enumerate() {
             let abs_line = view_top_abs + vr as u64;
             for (c, cell) in row.cells().iter().enumerate().take(cols) {
@@ -259,6 +304,8 @@ impl Renderer {
                 }
             }
         }
+        // 选中块高亮叠在全部单元格背景之上（半透明 tint）。
+        instances.extend(block_tints);
         // 光标：跟随底部时绘制在可视区对应行（半透明块，文字仍可见）；
         // 落在宽字符上时画两格宽。
         if let Some((cur_row, cur_col)) = cursor {

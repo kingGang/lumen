@@ -60,6 +60,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// 把 shell integration 脚本写到临时目录，返回注入用的启动参数。
+/// 写入失败时返回空参数（shell 照常可用，只是没有命令块标记）。
+fn shell_integration_args() -> Vec<String> {
+    let script = include_str!("../assets/integration.ps1");
+    let path = std::env::temp_dir().join("lumen_integration.ps1");
+    match std::fs::write(&path, script) {
+        Ok(()) => vec![
+            "-NoLogo".into(),
+            // 进程级放行：Windows PowerShell 5.1 默认 Restricted 策略
+            // 会拒绝加载任何 .ps1，注入会在终端顶部报红错。
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            format!(". '{}'", path.display()),
+        ],
+        Err(e) => {
+            error!("写出 shell integration 脚本失败: {e}");
+            Vec::new()
+        }
+    }
+}
+
 struct App {
     proxy: EventLoopProxy<PtyWake>,
     state: Option<AppState>,
@@ -99,6 +122,8 @@ struct AppState {
     /// 左键按住拖选中。
     selecting: bool,
     selection: Option<Selection>,
+    /// 选中的命令块 id。
+    selected_block: Option<u64>,
 }
 
 impl AppState {
@@ -118,6 +143,62 @@ impl AppState {
             line: self.term.grid().view_top_abs_line() + row as u64,
             col,
         }
+    }
+
+    /// 复制选中命令块的输出到剪贴板，返回是否复制了内容。
+    fn copy_selected_block(&mut self) -> bool {
+        let Some(id) = self.selected_block else {
+            return false;
+        };
+        let Some(block) = self.term.block_by_id(id) else {
+            return false;
+        };
+        let text = self.term.block_output_text(block);
+        if text.is_empty() {
+            return false;
+        }
+        match self.clipboard.as_mut().map(|c| c.set_text(text)) {
+            Some(Ok(())) => true,
+            other => {
+                if let Some(Err(e)) = other {
+                    error!("写剪贴板失败: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// 块间跳转：dir 为 -1（上一块）或 1（下一块），滚动到块首。
+    fn jump_block(&mut self, dir: i64) {
+        // 选中的块可能已被上限淘汰：先清掉失效 id，按未选中逻辑走。
+        if self
+            .selected_block
+            .is_some_and(|id| self.term.block_by_id(id).is_none())
+        {
+            self.selected_block = None;
+        }
+        let blocks = self.term.blocks();
+        if blocks.is_empty() {
+            return;
+        }
+        let idx = match self
+            .selected_block
+            .and_then(|id| blocks.iter().position(|b| b.id == id))
+        {
+            Some(i) => (i as i64 + dir).clamp(0, blocks.len() as i64 - 1) as usize,
+            // 未选中时：↑ 从最后一块开始，↓ 选最后一块。
+            None => {
+                if dir < 0 {
+                    blocks.len().saturating_sub(2)
+                } else {
+                    blocks.len() - 1
+                }
+            }
+        };
+        let (id, line) = (blocks[idx].id, blocks[idx].prompt_line);
+        self.selected_block = Some(id);
+        self.term.grid_mut().scroll_to_abs_line(line);
+        self.window.request_redraw();
     }
 
     /// 复制选区文本到剪贴板，返回是否真的复制了内容。
@@ -181,7 +262,12 @@ impl App {
         info!("终端尺寸: {rows} 行 x {cols} 列");
 
         let term = Terminal::new(rows, cols, SCROLLBACK);
-        let (pty, rx) = PtySession::spawn(None, rows as u16, cols as u16)?;
+        let (pty, rx) = PtySession::spawn(
+            None,
+            &shell_integration_args(),
+            rows as u16,
+            cols as u16,
+        )?;
 
         // 转发线程：把事件搬进主循环可 drain 的通道，并以去重信号唤醒
         // 事件循环（信号挂起期间不重复发，避免事件风暴）。
@@ -239,6 +325,7 @@ impl App {
             mouse_pos: (0.0, 0.0),
             selecting: false,
             selection: None,
+            selected_block: None,
         })
     }
 }
@@ -295,8 +382,11 @@ impl ApplicationHandler<PtyWake> for App {
             if !resp.is_empty() {
                 let _ = state.pty.write(&resp);
             }
-            // 有新输出时跟随到底部。
-            state.term.grid_mut().scroll_to_bottom();
+            // 进入备用屏幕（vim/codex 全屏）时块交互无意义且不可见，
+            // 清掉选中态，避免 Ctrl+C 被残留选中块吞成「复制」。
+            if state.term.is_alt_screen() && state.selected_block.is_some() {
+                state.selected_block = None;
+            }
             if !state.term.title().is_empty() {
                 state
                     .window
@@ -441,16 +531,40 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 if state.modifiers.control_key() {
+                    // Ctrl+↑/↓：命令块间跳转。备用屏幕（vim/codex）里
+                    // 块不可见也无意义，按键放行给应用。
+                    if !state.term.is_alt_screen() {
+                        match event.logical_key {
+                            Key::Named(NamedKey::ArrowUp) => {
+                                state.jump_block(-1);
+                                return;
+                            }
+                            Key::Named(NamedKey::ArrowDown) => {
+                                state.jump_block(1);
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
                     let ch = match &event.logical_key {
                         Key::Character(s) => s.chars().next().map(|c| c.to_ascii_lowercase()),
                         _ => None,
                     };
                     match ch {
-                        // 有选区时 Ctrl+C 复制（Windows Terminal 惯例），
-                        // 无选区时按正常路径发送中断（0x03）。
+                        // Ctrl+C 优先级：文本选区复制 → 选中块复制输出 →
+                        // 发送中断（Windows Terminal 惯例扩展）。
                         Some('c') => {
                             if state.copy_selection() {
                                 state.selection = None;
+                                state.window.request_redraw();
+                                return;
+                            }
+                            // 块处于选中态（用户可见高亮）就必须消费按键：
+                            // 复制失败（空输出/块已淘汰）也只清选中、绝不
+                            // 下穿成中断——误发 ^C 会取消用户输入的命令行。
+                            if state.selected_block.is_some() {
+                                state.copy_selected_block();
+                                state.selected_block = None;
                                 state.window.request_redraw();
                                 return;
                             }
@@ -515,7 +629,18 @@ impl ApplicationHandler<PtyWake> for App {
                 (MouseButton::Left, ElementState::Released) => {
                     state.selecting = false;
                     if state.selection.is_some_and(|s| s.is_empty()) {
+                        // 单击（未拖动）：选中/清除所在命令块。
+                        // 备用屏幕下块行号坐标系不可用，不做块选中。
                         state.selection = None;
+                        if !state.term.is_alt_screen() {
+                            let p = state.sel_point_at_mouse();
+                            let hit = state.term.block_at_line(p.line).map(|b| b.id);
+                            state.selected_block = if hit == state.selected_block {
+                                None
+                            } else {
+                                hit
+                            };
+                        }
                         state.window.request_redraw();
                     }
                 }
@@ -581,11 +706,12 @@ impl ApplicationHandler<PtyWake> for App {
                     .2
                     .then_some((state.cursor_displayed.0, state.cursor_displayed.1));
                 let render_t0 = Instant::now();
-                if let Err(e) =
-                    state
-                        .renderer
-                        .render(&state.term, state.selection.as_ref(), cursor)
-                {
+                if let Err(e) = state.renderer.render(
+                    &state.term,
+                    state.selection.as_ref(),
+                    cursor,
+                    state.selected_block,
+                ) {
                     error!("渲染失败: {e:#}");
                 }
                 let gap = state

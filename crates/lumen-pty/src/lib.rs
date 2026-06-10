@@ -35,7 +35,13 @@ impl PtySession {
     ///
     /// `shell` 为 None 时按平台选默认：Windows 优先 `pwsh.exe`，
     /// 找不到则回退 `powershell.exe`；unix 用 `$SHELL` 或 `/bin/bash`。
-    pub fn spawn(shell: Option<&str>, rows: u16, cols: u16) -> Result<(Self, Receiver<PtyEvent>)> {
+    /// `args` 为附加启动参数（如 shell integration 注入）。
+    pub fn spawn(
+        shell: Option<&str>,
+        args: &[String],
+        rows: u16,
+        cols: u16,
+    ) -> Result<(Self, Receiver<PtyEvent>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -48,6 +54,7 @@ impl PtySession {
 
         let shell = shell.map(str::to_owned).unwrap_or_else(default_shell);
         let mut cmd = CommandBuilder::new(&shell);
+        cmd.args(args);
         // 终端能力声明：上层实现了 256 色与真彩 SGR。
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");

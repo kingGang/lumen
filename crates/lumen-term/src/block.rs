@@ -8,6 +8,8 @@
 /// 一个命令块。各阶段行号在对应 OSC 133 标记到达时填充。
 #[derive(Debug, Clone, Default)]
 pub struct Block {
+    /// 稳定标识（自增，跨块丢弃不变）。
+    pub id: u64,
     /// 提示符首行（OSC 133;A）。
     pub prompt_line: u64,
     /// 命令输入首行（OSC 133;B）。
@@ -16,6 +18,9 @@ pub struct Block {
     pub output_line: Option<u64>,
     /// 块结束行（OSC 133;D）。
     pub end_line: Option<u64>,
+    /// D 标记时刻的光标列：>0 说明最后一行输出无结尾换行（新提示符
+    /// 接在它后面），提取输出时该行 [0, end_col) 前缀属于本块。
+    pub end_col: usize,
     /// 命令退出码（OSC 133;D;<code>）。
     pub exit_code: Option<i32>,
 }

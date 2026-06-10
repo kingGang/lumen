@@ -53,6 +53,85 @@ impl Terminal {
         &self.inner.blocks
     }
 
+    /// 主屏网格：块行号永远以主屏坐标记录，alt screen 激活期间
+    /// 块查询/提取必须用它而不是当前（alt）网格。
+    fn main_grid(&self) -> &Grid {
+        self.inner.saved_main.as_ref().unwrap_or(&self.inner.grid)
+    }
+
+    /// 查找覆盖指定绝对行的块。块范围为 `[prompt_line, end_line)`，
+    /// 未闭合块只延伸到主屏光标行（不向下方空白区无限延伸）。
+    pub fn block_at_line(&self, abs: u64) -> Option<&Block> {
+        let blocks = &self.inner.blocks;
+        // prompt_line 单调递增：找最后一个 prompt_line <= abs 的块。
+        let idx = blocks.partition_point(|b| b.prompt_line <= abs);
+        let b = blocks.get(idx.checked_sub(1)?)?;
+        match b.end_line {
+            Some(end) if abs >= end => None,
+            Some(_) => Some(b),
+            None if abs <= self.main_grid().absolute_cursor_line() => Some(b),
+            None => None,
+        }
+    }
+
+    /// 按 id 查块。
+    pub fn block_by_id(&self, id: u64) -> Option<&Block> {
+        self.inner.blocks.iter().find(|b| b.id == id)
+    }
+
+    /// 提取块的输出文本（不含提示符与命令行）。
+    /// 输出范围：`output_line ..= end_line-1`，外加 end_line 行的
+    /// [0, end_col) 前缀（无结尾换行的输出，新提示符接在其后）；
+    /// 无 C 标记时从命令行下一行起；未闭合块取到主屏内容末尾。
+    pub fn block_output_text(&self, block: &Block) -> String {
+        let grid = self.main_grid();
+        let row_text = |line: u64, limit: Option<usize>| -> Option<String> {
+            let row = grid.line_by_abs(line)?;
+            let cells = row.cells();
+            let take = limit.unwrap_or(cells.len()).min(cells.len());
+            Some(
+                cells[..take]
+                    .iter()
+                    .filter(|c| !c.flags.contains(CellFlags::WIDE_SPACER))
+                    .map(|c| c.ch)
+                    .collect(),
+            )
+        };
+        let start = block
+            .output_line
+            .or(block.cmd_line.map(|l| l + 1))
+            .unwrap_or(block.prompt_line + 1);
+        let end = block
+            .end_line
+            .unwrap_or_else(|| grid.absolute_cursor_line() + 1);
+        let mut out = String::new();
+        for line in start..end {
+            let Some(text) = row_text(line, None) else {
+                continue;
+            };
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text.trim_end());
+        }
+        // 无结尾换行的最后一行输出：D 标记落在该行 end_col 列。
+        if block.end_col > 0 {
+            if let Some(end_line) = block.end_line {
+                if let Some(text) = row_text(end_line, Some(block.end_col)) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(text.trim_end());
+                }
+            }
+        }
+        // 去掉尾部空行。
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
     /// 取走终端要求回写给 PTY 的应答（DSR/DA 等）。
     pub fn take_responses(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.inner.responses)
@@ -142,6 +221,8 @@ impl Terminal {
 /// 实际的 Perform 实现，与 Parser 分离以满足借用规则。
 struct TermInner {
     grid: Grid,
+    /// scrollback 容量（RIS 重建时需要原值，不可硬编码）。
+    scrollback_limit: usize,
     /// alt screen 激活时保存的主屏（网格 + 待恢复光标）。
     saved_main: Option<Grid>,
     /// 当前书写属性（fg/bg/flags 生效，ch 无意义）。
@@ -153,6 +234,7 @@ struct TermInner {
     scroll_bottom: usize,
     title: String,
     blocks: Vec<Block>,
+    next_block_id: u64,
     /// 需回写 PTY 的应答字节（DSR 等）。
     responses: Vec<u8>,
     bell: bool,
@@ -173,6 +255,7 @@ impl TermInner {
     fn new(rows: usize, cols: usize, scrollback_limit: usize) -> Self {
         Self {
             grid: Grid::new(rows, cols, scrollback_limit),
+            scrollback_limit,
             saved_main: None,
             pen: Cell::default(),
             saved_cursor: None,
@@ -180,6 +263,7 @@ impl TermInner {
             scroll_bottom: rows - 1,
             title: String::new(),
             blocks: Vec::new(),
+            next_block_id: 0,
             responses: Vec::new(),
             bell: false,
             sync_output: false,
@@ -385,10 +469,27 @@ impl TermInner {
         let marker = params.get(1).and_then(|p| p.first()).copied();
         let line = self.grid.absolute_cursor_line();
         match marker {
-            Some(b'A') => self.blocks.push(Block {
-                prompt_line: line,
-                ..Block::default()
-            }),
+            Some(b'A') => {
+                // 行号回退（cls/clear 清屏后光标归零）：旧块指向的内容
+                // 已被擦除且会破坏 prompt_line 的单调性，全部失效。
+                if self
+                    .blocks
+                    .last()
+                    .is_some_and(|last| line < last.prompt_line)
+                {
+                    self.blocks.clear();
+                }
+                // 上限保护：批量丢弃最旧块，避免长会话无限增长。
+                if self.blocks.len() >= 1200 {
+                    self.blocks.drain(..200);
+                }
+                self.next_block_id += 1;
+                self.blocks.push(Block {
+                    id: self.next_block_id,
+                    prompt_line: line,
+                    ..Block::default()
+                });
+            }
             Some(b'B') => {
                 if let Some(b) = self.blocks.last_mut() {
                     b.cmd_line = Some(line);
@@ -400,8 +501,13 @@ impl TermInner {
                 }
             }
             Some(b'D') => {
-                if let Some(b) = self.blocks.last_mut() {
+                // 只闭合未结束的块：会话首个提示符也会发 D（无前置命令），
+                // 不能改写已闭合的历史块。
+                let end_col = self.grid.cursor.col;
+                if let Some(b) = self.blocks.last_mut().filter(|b| !b.is_closed()) {
                     b.end_line = Some(line);
+                    // 光标列 >0 = 最后一行输出无结尾换行，记录前缀边界。
+                    b.end_col = end_col;
                     b.exit_code = params
                         .get(2)
                         .and_then(|p| std::str::from_utf8(p).ok())
@@ -692,9 +798,13 @@ impl Perform for TermInner {
             }
             b'M' => self.reverse_linefeed(),
             b'c' => {
-                // RIS：全终端重置。
+                // RIS：全终端重置。块 id 序列必须延续——上层可能持有
+                // 旧块 id，归零会让新块复用旧 id 被误选中。
                 let (rows, cols) = (self.grid.rows(), self.grid.cols());
-                *self = TermInner::new(rows, cols, 10_000);
+                let limit = self.scrollback_limit;
+                let next_id = self.next_block_id;
+                *self = TermInner::new(rows, cols, limit);
+                self.next_block_id = next_id;
             }
             _ => trace!("未实现的 ESC: {byte:#04x}"),
         }
@@ -826,6 +936,108 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].is_closed());
         assert_eq!(blocks[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc133_d不改写已闭合块() {
+        let mut t = term();
+        // 完整块（exit=0）之后游离的 D;5 不应改写它。
+        t.advance(b"\x1b]133;A\x07$ ok\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07\x1b]133;D;5\x07");
+        assert_eq!(t.blocks().len(), 1);
+        assert_eq!(t.blocks()[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn 按绝对行查块与块文本提取() {
+        let mut t = Terminal::new(8, 20, 100);
+        // 块1：prompt 行0，命令行0，输出行1-2，D 在行3。
+        t.advance(b"\x1b]133;A\x07$ ");
+        t.advance(b"\x1b]133;B\x07cmd\r\n");
+        t.advance(b"\x1b]133;C\x07line1\r\nline2\r\n");
+        t.advance(b"\x1b]133;D;3\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        let blocks = t.blocks();
+        assert_eq!(blocks.len(), 2);
+        let b1 = &blocks[0];
+        assert_eq!(b1.exit_code, Some(3));
+        // 行 0-2 属于块1；行 3（新提示符行）属于块2。
+        assert_eq!(t.block_at_line(0).map(|b| b.id), Some(b1.id));
+        assert_eq!(t.block_at_line(2).map(|b| b.id), Some(b1.id));
+        assert_eq!(t.block_at_line(3).map(|b| b.id), Some(blocks[1].id));
+        // 输出文本 = 行1..行2。
+        assert_eq!(t.block_output_text(b1), "line1\nline2");
+    }
+
+    #[test]
+    fn 未闭合块不向光标下方空白区延伸() {
+        let mut t = Terminal::new(10, 20, 100);
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        // 光标在行 0；行 0 命中、行 5（空白区）不命中。
+        assert!(t.block_at_line(0).is_some());
+        assert!(t.block_at_line(5).is_none());
+    }
+
+    #[test]
+    fn cls后行号回退使旧块失效() {
+        let mut t = Terminal::new(5, 20, 100);
+        t.advance(b"a\r\nb\r\nc\r\n\x1b]133;A\x07$ \x1b]133;D;0\x07");
+        assert_eq!(t.blocks().len(), 1);
+        // cls：ED2 + CUP home，光标绝对行回退到 0。
+        t.advance(b"\x1b[2J\x1b[H\x1b]133;A\x07$ ");
+        assert_eq!(t.blocks().len(), 1, "旧块应被清除，仅剩新块");
+        assert_eq!(t.blocks()[0].prompt_line, 0);
+    }
+
+    #[test]
+    fn 无结尾换行的输出不丢最后一行() {
+        let mut t = Terminal::new(8, 30, 100);
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n");
+        t.advance(b"\x1b]133;C\x07partial"); // 无结尾换行
+        t.advance(b"\x1b]133;D;0\x07\x1b]133;A\x07PS> ");
+        let b = &t.blocks()[0];
+        assert_eq!(b.end_col, 7); // "partial".len()
+        assert_eq!(t.block_output_text(b), "partial");
+    }
+
+    #[test]
+    fn ris后块id不复用() {
+        let mut t = term();
+        t.advance(b"\x1b]133;A\x07$ ");
+        let first_id = t.blocks()[0].id;
+        t.advance(b"\x1bc"); // RIS
+        assert!(t.blocks().is_empty());
+        t.advance(b"\x1b]133;A\x07$ ");
+        assert!(t.blocks()[0].id > first_id, "重置后 id 必须延续不复用");
+    }
+
+    #[test]
+    fn alt_screen下块查询用主屏坐标() {
+        let mut t = Terminal::new(5, 20, 100);
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        let id = t.blocks()[0].id;
+        let text_before = t.block_output_text(t.block_by_id(id).unwrap());
+        // 进入备用屏幕并写满不同内容。
+        t.advance(b"\x1b[?1049h\x1b[HALT-CONTENT");
+        assert!(t.is_alt_screen());
+        let text_during = t.block_output_text(t.block_by_id(id).unwrap());
+        assert_eq!(text_before, text_during, "alt screen 期间块文本必须取自主屏");
+    }
+
+    #[test]
+    fn 滚动到绝对行() {
+        let mut t = Terminal::new(3, 10, 100);
+        for i in 0..10u32 {
+            t.advance(format!("{i}\r\n").as_bytes());
+        }
+        // 10 行内容 + 光标行：scrollback 应有 8 行（行0-7 滚出）。
+        let sb = t.grid().scrollback_len();
+        assert_eq!(sb, 8);
+        t.grid_mut().scroll_to_abs_line(0);
+        assert_eq!(t.grid().display_offset(), 8);
+        t.grid_mut().scroll_to_abs_line(5);
+        assert_eq!(t.grid().display_offset(), 3);
+        // 已在可视区内的行：回到底部。
+        t.grid_mut().scroll_to_abs_line(9);
+        assert_eq!(t.grid().display_offset(), 0);
     }
 
     #[test]

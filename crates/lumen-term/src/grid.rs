@@ -150,6 +150,18 @@ impl Grid {
         }
     }
 
+    /// 滚动视图使指定绝对行位于视口顶部（块跳转用）。
+    /// 目标行已被丢弃时滚到最旧历史；在可视区内或以下时回到底部。
+    pub fn scroll_to_abs_line(&mut self, line: u64) {
+        let top_of_screen = self.dropped_lines + self.scrollback.len() as u64;
+        let offset = top_of_screen.saturating_sub(line) as usize;
+        let new = offset.min(self.scrollback.len());
+        if new != self.display_offset {
+            self.display_offset = new;
+            self.dirty = true;
+        }
+    }
+
     /// 渲染用：按当前滚动偏移返回应显示的 rows 行。
     ///
     /// 偏移 N 表示视口顶部往上 N 行历史，视口由
@@ -183,6 +195,11 @@ impl Grid {
                 if self.scrollback.len() > self.scrollback_limit {
                     self.scrollback.pop_front();
                     self.dropped_lines += 1;
+                }
+                // 用户正在回看历史时锚定内容：偏移随历史增长同步
+                // +1，视图不会被新输出推着走。
+                if self.display_offset > 0 {
+                    self.display_offset = (self.display_offset + 1).min(self.scrollback.len());
                 }
             } else {
                 self.dropped_lines += 1;
