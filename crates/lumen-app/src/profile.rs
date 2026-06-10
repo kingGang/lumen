@@ -66,7 +66,9 @@ impl Profile {
                 return None;
             }
         };
-        match serde_json::from_str::<Self>(&text) {
+        // PowerShell 5.1 写文件默认带 UTF-8 BOM，serde 不认 BOM 会把
+        // 好文件误判损坏（误降级未登录），解析前剥掉（M3 审查追加项）。
+        match serde_json::from_str::<Self>(text.trim_start_matches('\u{feff}')) {
             Ok(mut p) => {
                 p.sanitize();
                 if p.email.is_empty() {
@@ -221,6 +223,19 @@ mod tests {
         let loaded = Profile::load_from(&path);
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn bom前缀_正常解析() {
+        // PowerShell 5.1 写文件默认带 UTF-8 BOM，不剥会误降级未登录。
+        let path = temp_path("bom");
+        std::fs::write(&path, "\u{feff}{ \"email\": \"jimhy@example.com\" }")
+            .expect("写测试文件失败");
+        let loaded = Profile::load_from(&path);
+        let _ = std::fs::remove_file(&path);
+        let p = loaded.expect("带 BOM 的合法 profile 应加载成功");
+        assert_eq!(p.email, "jimhy@example.com");
+        assert_eq!(p.display_name, "jimhy");
     }
 
     #[test]

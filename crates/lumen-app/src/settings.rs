@@ -6,6 +6,11 @@
 //! 覆盖」：Windows 的 `fs::rename` 带 MOVEFILE_REPLACE_EXISTING 语义，
 //! 进程在写一半被杀也不会留下半截 JSON。
 //!
+//! 加载是字段级容错的（M3 审查项）：模块本就邀请用户手改文件，单个
+//! 字段值非法（如 theme 拼错）只降级该字段并记日志指明字段名，不
+//! 连坐整份配置；UTF-8 BOM 前缀（PowerShell 5.1 写文件的默认行为）
+//! 在解析前剥掉。
+//!
 //! 结构按节扩展：后续 account / keyboard 等加新字段即可，
 //! `#[serde(default)]` 保证旧文件平滑升级（缺字段补默认值）。
 
@@ -13,6 +18,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// 终端字号下限（设置页滑块范围；加载时同样夹紧）。
@@ -118,19 +124,48 @@ impl Settings {
                 return Self::default();
             }
         };
-        match serde_json::from_str::<Self>(&text) {
-            Ok(mut s) => {
-                s.sanitize();
-                s
-            }
+        // PowerShell 5.1 的 Set-Content/重定向默认写 UTF-8 BOM，serde
+        // 不认 BOM 会令解析失败，先剥掉（M3 审查追加项）。
+        let text = text.trim_start_matches('\u{feff}');
+        // 整文件 JSON 语法错误才整体降级；语法合法时逐字段宽松解析，
+        // 单字段非法只降级该字段（M3 审查项：theme 拼错不连坐字号字体）。
+        let root = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(v) => v,
             Err(e) => {
                 log::warn!(
                     "设置文件解析失败，使用默认设置（原文件保留，下次变更写盘时才覆盖）{}: {e}",
                     path.display()
                 );
-                Self::default()
+                return Self::default();
             }
+        };
+        let mut s = Self::from_value_lenient(&root, path);
+        s.sanitize();
+        s
+    }
+
+    /// 字段级宽松解析：缺字段静默用默认值（旧版本升级路径），字段
+    /// 存在但值非法记 warn 指明字段名后单独降级。
+    fn from_value_lenient(root: &serde_json::Value, path: &Path) -> Self {
+        let mut s = Self::default();
+        if !root.is_object() {
+            log::warn!("设置文件顶层不是 JSON 对象，使用默认设置: {}", path.display());
+            return s;
         }
+        let Some(ap) = root.get("appearance") else {
+            return s;
+        };
+        if !ap.is_object() {
+            log::warn!("设置节 appearance 不是对象，整节降级默认值: {}", path.display());
+            return s;
+        }
+        let d = AppearanceSettings::default();
+        s.appearance.theme = lenient_field(ap, "theme", "appearance.theme", d.theme, path);
+        s.appearance.font_family =
+            lenient_field(ap, "font_family", "appearance.font_family", d.font_family, path);
+        s.appearance.font_size =
+            lenient_field(ap, "font_size", "appearance.font_size", d.font_size, path);
+        s
     }
 
     /// 写盘（设置变更即调用）。失败仅记日志——写不进盘不应影响终端使用。
@@ -170,6 +205,31 @@ impl Settings {
         if trimmed.len() != self.appearance.font_family.len() {
             self.appearance.font_family = trimmed.to_owned();
         }
+    }
+}
+
+/// 单字段宽松取值：缺失 → 静默用 `fallback`（与 `#[serde(default)]`
+/// 行为一致）；存在但反序列化失败 → 记 warn 指明字段路径后用
+/// `fallback`（M3 审查项：坏字段单独降级，不连坐整份配置）。
+fn lenient_field<T: DeserializeOwned>(
+    section: &serde_json::Value,
+    key: &str,
+    field_path: &str,
+    fallback: T,
+    file: &Path,
+) -> T {
+    match section.get(key) {
+        None => fallback,
+        Some(v) => match T::deserialize(v) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "设置字段 {field_path} 值非法，仅该字段降级为默认值 {}: {e}",
+                    file.display()
+                );
+                fallback
+            }
+        },
     }
 }
 
@@ -247,5 +307,60 @@ mod tests {
             .expect("写测试文件失败");
         assert_eq!(Settings::load_from(&p).appearance.font_size, FONT_SIZE_MIN);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn 字段级容错_theme非法不连坐() {
+        // theme 拼错（缺连字符）只降级 theme 自己，字体与字号保留。
+        let p = temp_path("lenient_theme");
+        std::fs::write(
+            &p,
+            r#"{ "appearance": { "theme": "tokyonight", "font_family": "JetBrains Mono", "font_size": 18.0 } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNight, "坏字段降级默认");
+        assert_eq!(loaded.appearance.font_family, "JetBrains Mono", "好字段应保留");
+        assert_eq!(loaded.appearance.font_size, 18.0, "好字段应保留");
+    }
+
+    #[test]
+    fn 字段级容错_字号类型非法不连坐() {
+        // font_size 写成字符串：仅字号降级默认，theme 保留。
+        let p = temp_path("lenient_size");
+        std::fs::write(
+            &p,
+            r#"{ "appearance": { "theme": "tokyo-night-light", "font_size": "big" } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNightLight, "好字段应保留");
+        assert_eq!(loaded.appearance.font_size, FONT_SIZE_DEFAULT, "坏字段降级默认");
+    }
+
+    #[test]
+    fn 字段级容错_appearance非对象整节降级() {
+        let p = temp_path("lenient_section");
+        std::fs::write(&p, r#"{ "appearance": 42 }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded, Settings::default());
+    }
+
+    #[test]
+    fn bom前缀_正常解析() {
+        // PowerShell 5.1 写文件默认带 UTF-8 BOM，加载时应剥掉再解析。
+        let p = temp_path("bom");
+        std::fs::write(
+            &p,
+            "\u{feff}{ \"appearance\": { \"theme\": \"tokyo-night-light\", \"font_size\": 20.0 } }",
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNightLight);
+        assert_eq!(loaded.appearance.font_size, 20.0);
     }
 }

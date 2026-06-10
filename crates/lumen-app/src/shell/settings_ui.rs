@@ -83,6 +83,10 @@ pub struct SettingsUiState {
     custom_font_mode: bool,
     /// 自定义字体输入框的编辑缓冲（按「应用」才写入 settings）。
     custom_font_buf: String,
+    /// 字号滑块拖动中的预览值：拖动期间只更新它（不写 settings、不
+    /// 触发重配置/写盘），松手才提交——防抖（M3 审查项：每步进都
+    /// 写盘 + 全会话 resize）。
+    font_size_drag: Option<f32>,
     /// 字体回退提示：main 在 reconfigure 后写入实际生效信息，
     /// None 表示请求的字体已生效（无回退）。
     pub font_hint: Option<String>,
@@ -95,6 +99,8 @@ impl SettingsUiState {
         let fam = settings.appearance.font_family.as_str();
         self.custom_font_mode = !fam.is_empty() && !FONT_PRESETS.contains(&fam);
         self.custom_font_buf = fam.to_owned();
+        // 上次会话可能在拖动中途关页，残留预览值作废。
+        self.font_size_drag = None;
     }
 
     /// 打开设置页并定位到 Keyboard shortcuts 分类（头像菜单入口）。
@@ -386,15 +392,28 @@ fn appearance(
     ui.add_space(16.0);
 
     // —— 终端字号 ——
+    // 滑块绑定预览值而非 settings：拖动中只更新数字显示，松手
+    // （drag_stopped）才提交真实字号——否则每跨一个步进就触发一次
+    // 「全会话 term/PTY resize + 同步写盘」风暴（M3 审查项）。
     ui.label(egui::RichText::new("终端字号").color(pal.fg));
-    let slider = egui::Slider::new(
-        &mut settings.appearance.font_size,
-        settings::FONT_SIZE_MIN..=settings::FONT_SIZE_MAX,
-    )
-    .step_by(1.0)
-    .fixed_decimals(0);
-    if ui.add(slider).changed() {
-        out.font_changed = true;
+    let mut preview = st.font_size_drag.unwrap_or(settings.appearance.font_size);
+    let resp = ui.add(
+        egui::Slider::new(&mut preview, settings::FONT_SIZE_MIN..=settings::FONT_SIZE_MAX)
+            .step_by(1.0)
+            .fixed_decimals(0),
+    );
+    if resp.dragged() {
+        // 拖动进行中：暂存预览值（下一帧滑块继续显示它）。
+        st.font_size_drag = Some(preview);
+    }
+    // 提交时机：拖动结束，或非拖动的离散修改（数值框键入/方向键）。
+    if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+        st.font_size_drag = None;
+        // 拖一圈回到原值不算变更：不重配置、不写盘。
+        if settings.appearance.font_size != preview {
+            settings.appearance.font_size = preview;
+            out.font_changed = true;
+        }
     }
 }
 
