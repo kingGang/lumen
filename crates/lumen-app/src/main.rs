@@ -403,7 +403,9 @@ impl ApplicationHandler<PtyWake> for App {
                 let pressed = event.state == ElementState::Pressed;
                 // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
                 if !pressed {
-                    if state.term.win32_input() {
+                    if state.term.win32_input()
+                        && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
+                    {
                         if let Some(bytes) =
                             input::encode_key_win32(&event, state.modifiers, false)
                         {
@@ -464,9 +466,11 @@ impl ApplicationHandler<PtyWake> for App {
                         _ => {}
                     }
                 }
-                // win32-input-mode 优先：按键结构化直达 conhost 输入
-                // 队列，绕开 VT 字符流的兼容解析（高频输入的瓶颈）。
-                let bytes = if state.term.win32_input() {
+                // win32-input-mode 实验性开关（LUMEN_WIN32_INPUT=1 启用）：
+                // 实测当前编码实现反而更卡，默认关闭待核对协议规范。
+                let use_win32 = state.term.win32_input()
+                    && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
+                let bytes = if use_win32 {
                     input::encode_key_win32(&event, state.modifiers, true)
                 } else {
                     input::encode_key(&event, state.modifiers)
