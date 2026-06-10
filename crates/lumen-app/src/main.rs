@@ -11,9 +11,9 @@ use crossbeam_channel::Receiver;
 use log::{error, info};
 use lumen_pty::{PtyEvent, PtySession};
 use lumen_renderer::Renderer;
-use lumen_term::Terminal;
+use lumen_term::{SelPoint, Selection, Terminal};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, Ime, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
@@ -54,6 +54,67 @@ struct AppState {
     /// 与转发线程共享的「wake 已挂起」标志，用于事件去重。
     wake_pending: Arc<AtomicBool>,
     modifiers: ModifiersState,
+    clipboard: Option<arboard::Clipboard>,
+    /// 鼠标最近一次的窗口内像素位置。
+    mouse_pos: (f64, f64),
+    /// 左键按住拖选中。
+    selecting: bool,
+    selection: Option<Selection>,
+}
+
+impl AppState {
+    /// 把当前鼠标像素位置换算成选区端点（绝对行号）。
+    fn sel_point_at_mouse(&self) -> SelPoint {
+        let (row, col) = self.renderer.cell_at(self.mouse_pos.0, self.mouse_pos.1);
+        SelPoint {
+            line: self.term.grid().view_top_abs_line() + row as u64,
+            col,
+        }
+    }
+
+    /// 复制选区文本到剪贴板，返回是否真的复制了内容。
+    fn copy_selection(&mut self) -> bool {
+        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        let text = self.term.selection_text(&sel);
+        if text.is_empty() {
+            return false;
+        }
+        match self.clipboard.as_mut().map(|c| c.set_text(text)) {
+            Some(Ok(())) => true,
+            other => {
+                if let Some(Err(e)) = other {
+                    error!("写剪贴板失败: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// 粘贴剪贴板文本：换行规整为 CR，按需包 bracketed paste 标记。
+    fn paste_clipboard(&mut self) {
+        let Some(Ok(text)) = self.clipboard.as_mut().map(|c| c.get_text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        let payload = if self.term.bracketed_paste() {
+            let mut p = Vec::with_capacity(normalized.len() + 12);
+            p.extend_from_slice(b"\x1b[200~");
+            p.extend_from_slice(normalized.as_bytes());
+            p.extend_from_slice(b"\x1b[201~");
+            p
+        } else {
+            normalized.into_bytes()
+        };
+        self.term.grid_mut().scroll_to_bottom();
+        if let Err(e) = self.pty.write(&payload) {
+            error!("粘贴写入 PTY 失败: {e:#}");
+        }
+    }
 }
 
 impl App {
@@ -96,6 +157,14 @@ impl App {
             })
             .context("启动 PTY 转发线程失败")?;
 
+        let clipboard = match arboard::Clipboard::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                error!("剪贴板不可用: {e}");
+                None
+            }
+        };
+
         Ok(AppState {
             window,
             renderer,
@@ -104,6 +173,10 @@ impl App {
             pty_rx: rx2,
             wake_pending,
             modifiers: ModifiersState::default(),
+            clipboard,
+            mouse_pos: (0.0, 0.0),
+            selecting: false,
+            selection: None,
         })
     }
 }
@@ -191,8 +264,8 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Shift+PgUp/PgDn 本地翻屏，不发给 shell。
                 use winit::keyboard::{Key, NamedKey};
+                // Shift+PgUp/PgDn 本地翻屏，不发给 shell。
                 if state.modifiers.shift_key() {
                     let rows = state.term.grid().rows() as isize;
                     let scrolled = match event.logical_key {
@@ -210,6 +283,37 @@ impl ApplicationHandler<PtyWake> for App {
                         state.window.request_redraw();
                         return;
                     }
+                    // Shift+Insert 粘贴。
+                    if matches!(event.logical_key, Key::Named(NamedKey::Insert)) {
+                        state.paste_clipboard();
+                        return;
+                    }
+                }
+                if state.modifiers.control_key() {
+                    let ch = match &event.logical_key {
+                        Key::Character(s) => s.chars().next().map(|c| c.to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    match ch {
+                        // 有选区时 Ctrl+C 复制（Windows Terminal 惯例），
+                        // 无选区时按正常路径发送中断（0x03）。
+                        Some('c') => {
+                            if state.copy_selection() {
+                                state.selection = None;
+                                state.window.request_redraw();
+                                return;
+                            }
+                            if state.modifiers.shift_key() {
+                                return; // Ctrl+Shift+C 无选区时不下发
+                            }
+                        }
+                        // Ctrl+V / Ctrl+Shift+V 粘贴。
+                        Some('v') => {
+                            state.paste_clipboard();
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 if let Some(bytes) = input::encode_key(&event, state.modifiers) {
                     state.term.grid_mut().scroll_to_bottom();
@@ -218,6 +322,48 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                state.mouse_pos = (position.x, position.y);
+                if state.selecting {
+                    let head = state.sel_point_at_mouse();
+                    if let Some(sel) = state.selection.as_mut() {
+                        if sel.head != head {
+                            sel.head = head;
+                            state.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: btn_state,
+                button,
+                ..
+            } => match (button, btn_state) {
+                (MouseButton::Left, ElementState::Pressed) => {
+                    let p = state.sel_point_at_mouse();
+                    state.selecting = true;
+                    // 单击先建立空选区（不高亮），拖动后才有内容。
+                    state.selection = Some(Selection { anchor: p, head: p });
+                    state.window.request_redraw();
+                }
+                (MouseButton::Left, ElementState::Released) => {
+                    state.selecting = false;
+                    if state.selection.is_some_and(|s| s.is_empty()) {
+                        state.selection = None;
+                        state.window.request_redraw();
+                    }
+                }
+                (MouseButton::Right, ElementState::Pressed) => {
+                    // 右键：有选区则复制，否则粘贴（Windows Terminal 惯例）。
+                    if state.copy_selection() {
+                        state.selection = None;
+                        state.window.request_redraw();
+                    } else {
+                        state.paste_clipboard();
+                    }
+                }
+                _ => {}
+            },
             WindowEvent::Ime(Ime::Commit(text)) => {
                 // 中文等 IME 提交的文本直接写入 shell。
                 if let Err(e) = state.pty.write(text.as_bytes()) {
@@ -238,7 +384,7 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::RedrawRequested => {
                 state.term.grid_mut().take_dirty();
-                if let Err(e) = state.renderer.render(&state.term) {
+                if let Err(e) = state.renderer.render(&state.term, state.selection.as_ref()) {
                     error!("渲染失败: {e:#}");
                 }
             }

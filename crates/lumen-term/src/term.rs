@@ -75,6 +75,46 @@ impl Terminal {
     pub fn is_synchronized(&self) -> bool {
         self.inner.sync_output
     }
+
+    /// 是否开启 bracketed paste（DEC 2004）：粘贴需包 `ESC[200~`/`ESC[201~`。
+    pub fn bracketed_paste(&self) -> bool {
+        self.inner.bracketed_paste
+    }
+
+    /// 提取选区覆盖的文本：行尾去空白、行间以 `\n` 连接、跳过宽字符占位格。
+    pub fn selection_text(&self, sel: &crate::Selection) -> String {
+        let (s, e) = sel.normalized();
+        let grid = &self.inner.grid;
+        let mut out = String::new();
+        for line in s.line..=e.line {
+            let Some(row) = grid.line_by_abs(line) else {
+                continue;
+            };
+            let cells = row.cells();
+            let from = if line == s.line { s.col } else { 0 };
+            let to = if line == e.line {
+                e.col.min(cells.len().saturating_sub(1))
+            } else {
+                cells.len().saturating_sub(1)
+            };
+            let mut text = String::new();
+            for cell in cells.iter().take(to + 1).skip(from) {
+                if !cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    text.push(cell.ch);
+                }
+            }
+            if line != s.line {
+                out.push('\n');
+            }
+            // 非选区末行去掉行尾填充空白。
+            if line != e.line {
+                out.push_str(text.trim_end());
+            } else {
+                out.push_str(&text);
+            }
+        }
+        out
+    }
 }
 
 /// 实际的 Perform 实现，与 Parser 分离以满足借用规则。
@@ -96,6 +136,8 @@ struct TermInner {
     bell: bool,
     /// DEC 2026 同步更新进行中。
     sync_output: bool,
+    /// DEC 2004 bracketed paste 已开启。
+    bracketed_paste: bool,
 }
 
 impl TermInner {
@@ -112,6 +154,7 @@ impl TermInner {
             responses: Vec::new(),
             bell: false,
             sync_output: false,
+            bracketed_paste: false,
         }
     }
 
@@ -493,6 +536,7 @@ impl Perform for TermInner {
                         match g.first().copied().unwrap_or(0) {
                             25 => self.grid.cursor.visible = on,
                             1049 | 1047 => self.set_alt_screen(on),
+                            2004 => self.bracketed_paste = on,
                             2026 => self.sync_output = on,
                             1048 => {
                                 if on {
@@ -538,6 +582,13 @@ impl Perform for TermInner {
                     }
                     1049 | 1047 => {
                         if self.saved_main.is_some() {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2004 => {
+                        if self.bracketed_paste {
                             1
                         } else {
                             2
@@ -729,6 +780,35 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert!(blocks[0].is_closed());
         assert_eq!(blocks[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn 选区文本提取_跨行与宽字符() {
+        use crate::{SelPoint, Selection};
+        let mut t = Terminal::new(5, 10, 100);
+        t.advance("ab中\r\ncdef".as_bytes());
+        // 从 (0,0) 选到 (1,2)：应得 "ab中\ncde"。
+        let sel = Selection {
+            anchor: SelPoint { line: 0, col: 0 },
+            head: SelPoint { line: 1, col: 2 },
+        };
+        assert_eq!(t.selection_text(&sel), "ab中\ncde");
+        // 反向拖动结果一致。
+        let rev = Selection {
+            anchor: sel.head,
+            head: sel.anchor,
+        };
+        assert_eq!(t.selection_text(&rev), "ab中\ncde");
+    }
+
+    #[test]
+    fn bracketed_paste_模式记录() {
+        let mut t = term();
+        assert!(!t.bracketed_paste());
+        t.advance(b"\x1b[?2004h");
+        assert!(t.bracketed_paste());
+        t.advance(b"\x1b[?2004l");
+        assert!(!t.bracketed_paste());
     }
 
     #[test]

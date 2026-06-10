@@ -10,7 +10,7 @@ use glyphon::{
     Attrs, Buffer as TextBuffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, Style,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
-use lumen_term::{CellFlags, Terminal};
+use lumen_term::{CellFlags, Selection, Terminal};
 
 pub use theme::{Rgb, Theme};
 pub use wgpu;
@@ -144,6 +144,17 @@ impl Renderer {
         (rows.max(1), cols.max(1))
     }
 
+    /// 像素坐标 → 视图格子坐标（行, 列），自动夹紧到网格范围。
+    pub fn cell_at(&self, px: f64, py: f64) -> (usize, usize) {
+        let (rows, cols) = self.grid_size();
+        let col = ((px as f32 - self.padding) / self.cell_w).floor() as isize;
+        let row = ((py as f32 - self.padding) / self.cell_h).floor() as isize;
+        (
+            row.clamp(0, rows as isize - 1) as usize,
+            col.clamp(0, cols as isize - 1) as usize,
+        )
+    }
+
     /// 窗口物理尺寸变化。
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
@@ -154,8 +165,8 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// 渲染一帧。
-    pub fn render(&mut self, term: &Terminal) -> Result<()> {
+    /// 渲染一帧。`selection` 为当前鼠标选区（绝对行号定位）。
+    pub fn render(&mut self, term: &Terminal, selection: Option<&Selection>) -> Result<()> {
         use wgpu::CurrentSurfaceTexture;
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(f) | CurrentSurfaceTexture::Suboptimal(f) => f,
@@ -176,9 +187,11 @@ impl Renderer {
         let (cw, ch) = (self.cell_w, self.cell_h);
         let pad = self.padding;
 
-        // ---- 收集矩形：背景色块、下划线/删除线、光标 ----
+        // ---- 收集矩形：背景色块、选区高亮、下划线/删除线、光标 ----
+        let view_top_abs = grid.view_top_abs_line();
         let mut instances: Vec<rect::RectInstance> = Vec::new();
         for (vr, row) in grid.visible_rows().enumerate() {
+            let abs_line = view_top_abs + vr as u64;
             for (c, cell) in row.cells().iter().enumerate().take(cols) {
                 if cell.flags.contains(CellFlags::WIDE_SPACER) {
                     continue;
@@ -190,7 +203,15 @@ impl Renderer {
                     cw
                 };
                 let (x, y) = (pad + c as f32 * cw, pad + vr as f32 * ch);
-                if bg != self.theme.background {
+                let selected = selection
+                    .is_some_and(|s| !s.is_empty() && s.contains(abs_line, c));
+                if selected {
+                    instances.push(rect::RectInstance {
+                        pos: [x, y],
+                        size: [w, ch],
+                        color: self.theme.selection.to_linear_f32(1.0),
+                    });
+                } else if bg != self.theme.background {
                     instances.push(rect::RectInstance {
                         pos: [x, y],
                         size: [w, ch],

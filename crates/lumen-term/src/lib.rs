@@ -6,9 +6,11 @@
 mod block;
 mod cell;
 mod grid;
+mod selection;
 mod term;
 
 pub use block::Block;
 pub use cell::{Cell, CellFlags, Color};
 pub use grid::{Cursor, Grid, Row};
+pub use selection::{SelPoint, Selection};
 pub use term::Terminal;

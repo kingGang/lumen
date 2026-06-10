@@ -50,6 +50,8 @@ pub struct Theme {
     pub background: Rgb,
     pub foreground: Rgb,
     pub cursor: Rgb,
+    /// 选区高亮背景。
+    pub selection: Rgb,
     /// ANSI 16 色（0-7 常规，8-15 高亮）。
     pub ansi: [Rgb; 16],
 }
@@ -60,6 +62,7 @@ impl Default for Theme {
             background: Rgb(0x1a, 0x1b, 0x26),
             foreground: Rgb(0xc0, 0xca, 0xf5),
             cursor: Rgb(0xc0, 0xca, 0xf5),
+            selection: Rgb(0x2e, 0x3c, 0x64),
             ansi: [
                 Rgb(0x15, 0x16, 0x1e), // 黑
                 Rgb(0xf7, 0x76, 0x8e), // 红

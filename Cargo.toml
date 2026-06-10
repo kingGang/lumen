@@ -19,6 +19,7 @@ lumen-term = { path = "crates/lumen-term" }
 lumen-renderer = { path = "crates/lumen-renderer" }
 
 anyhow = "1"
+arboard = "3"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"

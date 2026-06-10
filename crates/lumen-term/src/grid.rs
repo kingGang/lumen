@@ -100,6 +100,22 @@ impl Grid {
         self.dropped_lines + self.scrollback.len() as u64 + self.cursor.row as u64
     }
 
+    /// 当前视图首行的绝对行号（选区渲染用）。
+    pub fn view_top_abs_line(&self) -> u64 {
+        let n = self.display_offset.min(self.scrollback.len());
+        self.dropped_lines + (self.scrollback.len() - n) as u64
+    }
+
+    /// 按绝对行号取行（历史或可视区）；已被丢弃或越界返回 None。
+    pub fn line_by_abs(&self, abs: u64) -> Option<&Row> {
+        let idx = abs.checked_sub(self.dropped_lines)? as usize;
+        if idx < self.scrollback.len() {
+            self.scrollback.get(idx)
+        } else {
+            self.screen.get(idx - self.scrollback.len())
+        }
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
