@@ -84,6 +84,8 @@ struct AppState {
     redraw_hard_at: Option<Instant>,
     /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
     redraw_abs_at: Option<Instant>,
+    /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
+    last_esu_mark: u64,
     /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
     /// 状态（见 Terminal::cursor_unsettled）时冻结不跟随。
     cursor_displayed: (usize, usize, bool),
@@ -227,6 +229,7 @@ impl App {
             redraw_at: None,
             redraw_hard_at: None,
             redraw_abs_at: None,
+            last_esu_mark: 0,
             cursor_displayed: (0, 0, true),
             cursor_frozen_at: None,
             mouse_pos: (0.0, 0.0),
@@ -295,18 +298,32 @@ impl ApplicationHandler<PtyWake> for App {
                     .window
                     .set_title(&format!("Lumen — {}", state.term.title()));
             }
-            // 静默合帧：每批数据都把渲染时刻往后推，数据流停了才画
-            // （见 about_to_wait）；硬上限自首批起算，保障刷新率。
-            let now = Instant::now();
-            state.redraw_at = Some(now + REDRAW_DEBOUNCE);
-            if state.redraw_hard_at.is_none() {
-                state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
-                state.redraw_abs_at = Some(now + REDRAW_ABS_CAP);
-            }
             let sync = state.term.is_synchronized();
+            let esu_mark = state.term.esu_mark();
+            let frame_completed = esu_mark != state.last_esu_mark && !sync;
+            state.last_esu_mark = esu_mark;
+
+            if frame_completed {
+                // 本批完成了 DEC 2026 同步帧：协议语义就是「立即原子
+                // 呈现」，零等待直接渲染（codex 打字回显走这条快路）。
+                state.redraw_at = None;
+                state.redraw_hard_at = None;
+                state.redraw_abs_at = None;
+                state.window.request_redraw();
+            } else {
+                // 无同步协议的流（普通 shell/claude）：静默合帧，每批
+                // 数据推后渲染时刻，流停了才画（见 about_to_wait）；
+                // 硬上限自首批起算，保障刷新率。
+                let now = Instant::now();
+                state.redraw_at = Some(now + REDRAW_DEBOUNCE);
+                if state.redraw_hard_at.is_none() {
+                    state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
+                    state.redraw_abs_at = Some(now + REDRAW_ABS_CAP);
+                }
+            }
             let unsettled = state.term.cursor_unsettled();
             state.perf_log(format_args!(
-                "drain {drained_bytes}B 耗时 {:?} sync={sync} unsettled={unsettled}",
+                "drain {drained_bytes}B 耗时 {:?} sync={sync} esu帧={frame_completed} unsettled={unsettled}",
                 drain_t0.elapsed()
             ));
         }

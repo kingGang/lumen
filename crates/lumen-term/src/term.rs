@@ -81,6 +81,13 @@ impl Terminal {
         self.inner.bracketed_paste
     }
 
+    /// ESU（同步帧结束）单调标记：每次 ESU 后递增。
+    /// 上层对比两次取值即可知道期间是否完成过同步帧——完成的帧
+    /// 应立即渲染（DEC 2026 的本意），无需再等静默合帧。
+    pub fn esu_mark(&self) -> u64 {
+        self.inner.last_esu_seq
+    }
+
     /// 光标是否处于「帧尾未归位」状态：最近一次 ESU（同步帧结束）
     /// 发生在最近一次「显示光标」之后。
     ///
