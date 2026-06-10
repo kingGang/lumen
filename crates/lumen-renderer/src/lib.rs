@@ -297,8 +297,12 @@ impl Renderer {
                     attrs
                 };
 
-                if cell.flags.contains(CellFlags::WIDE) {
-                    // 宽字符单独成段，独立定位。
+                // 宽字符（CJK 占 2 列）以及一切非 ASCII 字符都单独成段、
+                // 独立钉在自己的网格列上：spinner 符号（✛ ✻ …）这类字符
+                // 主字体没有、回退字形 advance != cell_w，若与后续文字连段
+                // 排版，会把整段推偏——spinner 每帧换符号时偏移量不同，
+                // 表现为整行文字抖动。
+                if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
                     let mut tmp = [0u8; 4];
                     let s: &str = cell.ch.encode_utf8(&mut tmp);
                     let attrs = cell_attrs(cell);
@@ -318,11 +322,13 @@ impl Renderer {
                     );
                     placed.push((used, pad + c as f32 * cw, y));
                     used += 1;
-                    c += 2; // 跳过右半占位格
+                    // 宽字符跳过右半占位格。
+                    c += if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 };
                     continue;
                 }
 
-                // 窄字符 run：收集到下一个宽字符或行尾，段内按属性切 span。
+                // ASCII 窄字符 run：主等宽字体保证 advance == cell_w，
+                // 可以安全连段；遇宽字符或非 ASCII 字符断段。
                 let start_col = c;
                 let mut line = String::new();
                 let mut spans: Vec<(usize, usize, Attrs)> = Vec::new();
@@ -333,6 +339,7 @@ impl Renderer {
                     if cell
                         .flags
                         .intersects(CellFlags::WIDE | CellFlags::WIDE_SPACER)
+                        || !cell.ch.is_ascii()
                     {
                         break;
                     }

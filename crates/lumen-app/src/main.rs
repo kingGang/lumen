@@ -26,6 +26,10 @@ const SCROLLBACK: usize = 10_000;
 /// 切开的碎块攒齐再渲染，避免把 TUI 重绘中间态（光标停在临时
 /// 位置、半成品行）画上屏。对打字回显是无感的延迟。
 const REDRAW_DEBOUNCE: Duration = Duration::from_millis(5);
+/// 同步更新顺延的硬上限：高帧率 TUI 下合帧到点时常处于下一帧的
+/// BSU/ESU 区间内，需要顺延等帧完成；但应用若卡死在 BSU 不放，
+/// 超过该时长就强制渲染，避免画面冻结。
+const REDRAW_HARD_CAP: Duration = Duration::from_millis(100);
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
@@ -63,6 +67,8 @@ struct AppState {
     clipboard: Option<arboard::Clipboard>,
     /// 合帧渲染的截止时刻（最早一批未渲染数据的到达时间 + 窗口）。
     redraw_at: Option<Instant>,
+    /// 本轮合帧的强制渲染时刻（同步区间顺延的硬上限）。
+    redraw_hard_at: Option<Instant>,
     /// 鼠标最近一次的窗口内像素位置。
     mouse_pos: (f64, f64),
     /// 左键按住拖选中。
@@ -183,6 +189,7 @@ impl App {
             modifiers: ModifiersState::default(),
             clipboard,
             redraw_at: None,
+            redraw_hard_at: None,
             mouse_pos: (0.0, 0.0),
             selecting: false,
             selection: None,
@@ -250,10 +257,10 @@ impl ApplicationHandler<PtyWake> for App {
             // 否则会把 TUI 重绘中间态（光标游走）上屏。
             // 渲染本身经合帧窗口延迟（见 about_to_wait），吸收 ConPTY
             // 对同一逻辑帧的切块。
-            if !state.term.is_synchronized() {
-                state
-                    .redraw_at
-                    .get_or_insert_with(|| Instant::now() + REDRAW_DEBOUNCE);
+            if !state.term.is_synchronized() && state.redraw_at.is_none() {
+                let now = Instant::now();
+                state.redraw_at = Some(now + REDRAW_DEBOUNCE);
+                state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
             }
         }
         if exited {
@@ -266,15 +273,26 @@ impl ApplicationHandler<PtyWake> for App {
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        match state.redraw_at {
-            Some(at) if Instant::now() >= at => {
-                state.redraw_at = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
-                state.window.request_redraw();
-            }
-            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None => {}
+        let Some(at) = state.redraw_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < at {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            return;
         }
+        // 到点时若已进入下一帧的同步区间，顺延等帧完成（高帧率 TUI
+        // 下两帧间隔可小于合帧窗口），但不超过硬上限。
+        if state.term.is_synchronized() && state.redraw_hard_at.is_some_and(|h| now < h) {
+            let next = now + REDRAW_DEBOUNCE;
+            state.redraw_at = Some(next);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(next));
+            return;
+        }
+        state.redraw_at = None;
+        state.redraw_hard_at = None;
+        event_loop.set_control_flow(ControlFlow::Wait);
+        state.window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
