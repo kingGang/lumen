@@ -1,0 +1,20 @@
+[package]
+name = "lumen-app"
+description = "Lumen 主程序：winit 事件循环，组装 PTY/终端状态机/渲染器"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+env_logger.workspace = true
+log.workspace = true
+lumen-pty.workspace = true
+lumen-renderer.workspace = true
+lumen-term.workspace = true
+winit.workspace = true

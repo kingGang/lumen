@@ -1,0 +1,12 @@
+[package]
+name = "lumen-pty"
+description = "Lumen 的 PTY 抽象层（Windows ConPTY / unix pty）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+portable-pty.workspace = true

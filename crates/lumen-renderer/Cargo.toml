@@ -1,0 +1,15 @@
+[package]
+name = "lumen-renderer"
+description = "Lumen 的 wgpu + glyphon 渲染层"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+glyphon.workspace = true
+log.workspace = true
+lumen-term.workspace = true
+pollster.workspace = true
+wgpu.workspace = true

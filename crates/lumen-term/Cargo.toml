@@ -1,0 +1,12 @@
+[package]
+name = "lumen-term"
+description = "Lumen 的终端状态机：VT 解析、Grid、scrollback、Block 边界采集（无图形依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitflags.workspace = true
+log.workspace = true
+unicode-width.workspace = true
+vte.workspace = true
