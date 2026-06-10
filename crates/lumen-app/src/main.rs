@@ -87,6 +87,8 @@ struct AppState {
     redraw_abs_at: Option<Instant>,
     /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
     last_esu_mark: u64,
+    /// 最近一次按键时刻（端到端延迟埋点用）。
+    last_key_at: Option<Instant>,
     /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
     /// 状态（见 Terminal::cursor_unsettled）时冻结不跟随。
     cursor_displayed: (usize, usize, bool),
@@ -231,6 +233,7 @@ impl App {
             redraw_hard_at: None,
             redraw_abs_at: None,
             last_esu_mark: 0,
+            last_key_at: None,
             cursor_displayed: (0, 0, true),
             cursor_frozen_at: None,
             mouse_pos: (0.0, 0.0),
@@ -339,6 +342,10 @@ impl ApplicationHandler<PtyWake> for App {
             return;
         };
         let Some(soft) = state.redraw_at else {
+            // 没有待渲染计划时必须显式回到 Wait：ControlFlow 是粘性的，
+            // 残留的 WaitUntil(过去时刻) 会让事件循环全速空转（曾导致
+            // ESU 直渲后单核拉满、键盘处理抖动、conhost 被抢 CPU）。
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
         // 渲染时刻 = 静默窗口与强制刷新中先到者。
@@ -432,9 +439,15 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if let Some(bytes) = input::encode_key(&event, state.modifiers) {
                     state.term.grid_mut().scroll_to_bottom();
+                    let write_t0 = Instant::now();
                     if let Err(e) = state.pty.write(&bytes) {
                         error!("写入 PTY 失败: {e:#}");
                     }
+                    state.last_key_at = Some(write_t0);
+                    state.perf_log(format_args!(
+                        "key 写入耗时 {:?}",
+                        write_t0.elapsed()
+                    ));
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -542,8 +555,13 @@ impl ApplicationHandler<PtyWake> for App {
                     .map(|t| render_t0.duration_since(t))
                     .unwrap_or_default();
                 state.last_render_at = Some(render_t0);
+                let key_to_screen = state
+                    .last_key_at
+                    .take()
+                    .map(|t| format!(" 键→上屏 {:?}", t.elapsed()))
+                    .unwrap_or_default();
                 state.perf_log(format_args!(
-                    "render 耗时 {:?} 距上帧 {gap:?}",
+                    "render 耗时 {:?} 距上帧 {gap:?}{key_to_screen}",
                     render_t0.elapsed()
                 ));
             }
