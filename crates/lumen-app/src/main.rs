@@ -35,8 +35,10 @@ const REDRAW_HARD_CAP: Duration = Duration::from_millis(33);
 /// 帧完成，但等待不超过该时长（防应用卡死在 BSU 画面冻结）。
 const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// 光标「帧尾未归位」冻结的超时：ESU 后应用迟迟不发「显示光标」
-/// 归位序列时，超过该时长就信任当前位置（防异常应用光标永久冻结）。
-const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
+/// 归位序列时，超过该时长就信任当前位置。实测 codex 的归位批与
+/// 帧尾批毫秒级相继到达，10ms 足够；打字回显帧同样以 ESU 结尾，
+/// 该值过大会让光标每键滞后（曾设 50ms 导致快速输入光标追着跑）。
+const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(10);
 
 /// 自定义事件：PTY 有新输出待处理（去重信号，数据在 channel 里）。
 ///
@@ -63,6 +65,10 @@ struct App {
 }
 
 struct AppState {
+    /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
+    perf: Option<std::fs::File>,
+    perf_t0: Instant,
+    last_render_at: Option<Instant>,
     window: Arc<Window>,
     renderer: Renderer,
     term: Terminal,
@@ -91,6 +97,15 @@ struct AppState {
 }
 
 impl AppState {
+    /// 性能埋点：LUMEN_PERF 启用时写一行带时间戳的记录。
+    fn perf_log(&mut self, msg: std::fmt::Arguments<'_>) {
+        if let Some(f) = self.perf.as_mut() {
+            use std::io::Write;
+            let t = self.perf_t0.elapsed().as_millis();
+            let _ = writeln!(f, "[{t:>7}ms] {msg}");
+        }
+    }
+
     /// 把当前鼠标像素位置换算成选区端点（绝对行号）。
     fn sel_point_at_mouse(&self) -> SelPoint {
         let (row, col) = self.renderer.cell_at(self.mouse_pos.0, self.mouse_pos.1);
@@ -193,7 +208,14 @@ impl App {
             }
         };
 
+        let perf = std::env::var("LUMEN_PERF")
+            .ok()
+            .and_then(|p| std::fs::File::create(p).ok());
+
         Ok(AppState {
+            perf,
+            perf_t0: Instant::now(),
+            last_render_at: None,
             window,
             renderer,
             term,
@@ -234,11 +256,14 @@ impl ApplicationHandler<PtyWake> for App {
         // 先清挂起标志再 drain：drain 期间新到的数据会触发下一个 wake，不丢。
         state.wake_pending.store(false, Ordering::Release);
 
+        let drain_t0 = Instant::now();
+        let mut drained_bytes = 0usize;
         let mut got_data = false;
         let mut exited = false;
         while let Ok(ev) = state.pty_rx.try_recv() {
             match ev {
                 PtyEvent::Data(bytes) => {
+                    drained_bytes += bytes.len();
                     // 调试辅助：LUMEN_VT_LOG=<路径> 时把 PTY 原始字节追加到文件。
                     if let Ok(path) = std::env::var("LUMEN_VT_LOG") {
                         use std::io::Write;
@@ -278,6 +303,12 @@ impl ApplicationHandler<PtyWake> for App {
                 state.redraw_hard_at = Some(now + REDRAW_HARD_CAP);
                 state.redraw_abs_at = Some(now + REDRAW_ABS_CAP);
             }
+            let sync = state.term.is_synchronized();
+            let unsettled = state.term.cursor_unsettled();
+            state.perf_log(format_args!(
+                "drain {drained_bytes}B 耗时 {:?} sync={sync} unsettled={unsettled}",
+                drain_t0.elapsed()
+            ));
         }
         if exited {
             info!("shell 已退出，关闭窗口");
@@ -456,23 +487,31 @@ impl ApplicationHandler<PtyWake> for App {
                 let now = Instant::now();
                 let g = state.term.grid();
                 let seen = (g.cursor.row, g.cursor.col, g.cursor.visible);
-                if state.term.cursor_unsettled() {
+                // 同行近距移动是打字/退格的特征，即时跟随不冻结；
+                // 动画残留位的特征是跨行大跳，才需要等归位确认。
+                let typing_move = seen.2
+                    && state.cursor_displayed.2
+                    && seen.0 == state.cursor_displayed.0
+                    && seen.1.abs_diff(state.cursor_displayed.1) <= 4;
+                if !state.term.cursor_unsettled() || typing_move {
+                    state.cursor_frozen_at = None;
+                    state.cursor_displayed = seen;
+                } else {
                     let frozen = *state.cursor_frozen_at.get_or_insert(now);
                     if now.duration_since(frozen) >= CURSOR_FREEZE_CAP {
                         state.cursor_displayed = seen;
+                        state.cursor_frozen_at = None;
                     } else if state.cursor_displayed != seen {
                         // 安排超时时刻补画一帧，防止光标停滞在旧位。
                         let at = frozen + CURSOR_FREEZE_CAP;
                         state.redraw_at = Some(state.redraw_at.map_or(at, |x| x.min(at)));
                     }
-                } else {
-                    state.cursor_frozen_at = None;
-                    state.cursor_displayed = seen;
                 }
                 let cursor = state
                     .cursor_displayed
                     .2
                     .then_some((state.cursor_displayed.0, state.cursor_displayed.1));
+                let render_t0 = Instant::now();
                 if let Err(e) =
                     state
                         .renderer
@@ -480,6 +519,15 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     error!("渲染失败: {e:#}");
                 }
+                let gap = state
+                    .last_render_at
+                    .map(|t| render_t0.duration_since(t))
+                    .unwrap_or_default();
+                state.last_render_at = Some(render_t0);
+                state.perf_log(format_args!(
+                    "render 耗时 {:?} 距上帧 {gap:?}",
+                    render_t0.elapsed()
+                ));
             }
             _ => {}
         }
