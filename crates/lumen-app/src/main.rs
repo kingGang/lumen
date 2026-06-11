@@ -10,6 +10,9 @@ mod sessions_store;
 mod settings;
 mod shell;
 mod single_instance;
+// M3.8 批2 Snap Layouts 子类化（仅 Windows）。
+#[cfg(target_os = "windows")]
+mod snap_layouts;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1376,6 +1379,38 @@ impl App {
         }
         // 窗口标题对齐激活会话（恢复多会话时 active 可能非 0）。
         state.update_window_title();
+
+        // M3.8 批2 Snap Layouts 子类化：窗口创建后安装子类过程。
+        // 失败时记 warn 日志并继续（Snap 是增强功能，不影响应用主体逻辑）。
+        // 取 HWND：winit 使用 rwh_06，HasWindowHandle trait 提供 window_handle()。
+        // Win32WindowHandle.hwnd 字段类型为 NonNull<core::ffi::c_void>，
+        // 转为 isize 传入 install。
+        #[cfg(target_os = "windows")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match state.window.window_handle() {
+                Ok(handle) => {
+                    if let RawWindowHandle::Win32(wh) = handle.as_raw() {
+                        // SAFETY: hwnd 来自 winit 刚创建的有效窗口（本函数内），
+                        // 在 init 返回前窗口不会被销毁，时序成立。
+                        let hwnd = wh.hwnd.get(); // NonZeroIsize::get() → isize，即 Win32 HWND 值
+                        if unsafe { snap_layouts::install(hwnd) } {
+                            log::info!("Snap Layouts 子类过程安装成功（hwnd={hwnd:#x}）");
+                        } else {
+                            log::warn!(
+                                "Snap Layouts 子类过程安装失败，SetWindowSubclass 返回 FALSE"
+                            );
+                        }
+                    } else {
+                        log::warn!("Snap Layouts 子类化跳过：非 Win32 窗口句柄");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Snap Layouts 子类化跳过：获取 window_handle 失败（{e}）");
+                }
+            }
+        }
+
         Ok(state)
     }
 }
@@ -2533,6 +2568,31 @@ impl ApplicationHandler<PtyWake> for App {
                         (ly as f64 * scale).round() as i32,
                     );
                     state.window.show_window_menu(px);
+                }
+
+                // —— M3.8 批2 Snap Layouts：最大化按钮矩形换算为屏幕物理像素 ——
+                // egui 逻辑坐标矩形 × pixels_per_point + 窗口客户区屏幕原点
+                // = 屏幕物理像素矩形，写入 snap_layouts 原子供子类过程使用。
+                //
+                // 坐标系说明：
+                //   - egui 坐标原点 = 窗口客户区左上角（逻辑像素）。
+                //   - 屏幕坐标原点 = 主显示器左上角（物理像素，可为负值）。
+                //   - inner_position() 返回客户区左上角的屏幕物理坐标（PhysicalPosition）。
+                //   - 无边框窗口：inner_position == outer_position（系统阴影在客户区外，
+                //     DWM 层处理，不占客户区坐标空间）。
+                //     选用 inner_position 而非 outer_position，是因为 egui 坐标
+                //     原点确实对应客户区——无论有无边框都正确。
+                #[cfg(target_os = "windows")]
+                if let Some(rect) = shell_out.maximize_btn_rect {
+                    // inner_position 可能在 Resumed 前失败，用 ok() 静默跳过。
+                    if let Ok(origin) = state.window.inner_position() {
+                        let ppp = full_output.pixels_per_point;
+                        let l = (rect.min.x * ppp).round() as i32 + origin.x;
+                        let t = (rect.min.y * ppp).round() as i32 + origin.y;
+                        let r = (rect.max.x * ppp).round() as i32 + origin.x;
+                        let b = (rect.max.y * ppp).round() as i32 + origin.y;
+                        snap_layouts::update_button_rect(l, t, r, b);
+                    }
                 }
 
                 // —— 窗格级动作（F5 批2）：顶栏「＋」新增 / 窗格 ✕ 关闭

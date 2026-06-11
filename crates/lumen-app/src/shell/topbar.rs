@@ -58,6 +58,10 @@ pub struct TopbarOutput {
     pub close_window: bool,
     /// 右键空白区弹系统窗口菜单，坐标为 egui 逻辑点。
     pub show_window_menu_at: Option<(f32, f32)>,
+    /// 最大化/还原按钮本帧的 egui 逻辑坐标矩形（M3.8 批2 Snap Layouts
+    /// 子类化用）：main 换算为屏幕物理像素后写入 snap_layouts 原子。
+    /// 按钮不可见（极端情况）时为 None，main 跳过本帧更新。
+    pub maximize_btn_rect: Option<egui::Rect>,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -202,6 +206,9 @@ pub fn show(
                 if maxrst_resp.on_hover_text(tip).clicked() {
                     out.toggle_maximize_window = true;
                 }
+                // M3.8 批2：记录最大化按钮的逻辑矩形，供 main 换算为
+                // 屏幕物理像素后写入 snap_layouts 原子（WM_NCHITTEST 命中用）。
+                out.maximize_btn_rect = Some(maxrst_rect.rect);
 
                 // 最小化按钮
                 let min_rect = ui.allocate_rect(

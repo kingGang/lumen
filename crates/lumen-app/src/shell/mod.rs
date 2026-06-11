@@ -150,6 +150,11 @@ pub struct ShellOutput {
     /// 顶栏窗控：显示系统窗口菜单（右键标题栏空白区，M3.8）；
     /// 坐标为 egui 逻辑点（调用方换算为物理像素后传 show_window_menu）。
     pub show_window_menu_at: Option<(f32, f32)>,
+    /// 顶栏最大化/还原按钮本帧的 egui 逻辑坐标矩形（M3.8 批2 Snap
+    /// Layouts 子类化）：main 换算为屏幕物理像素后写入 snap_layouts
+    /// 原子，子类过程据此在 WM_NCHITTEST 时返回 HTMAXBUTTON。
+    /// None 表示本帧按钮不可见，main 跳过更新（保留上一帧的矩形）。
+    pub maximize_btn_rect: Option<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
     /// 顶栏「▦」（P15）：当前 tab 全部窗格比例恢复均分（最大化态
@@ -255,6 +260,7 @@ pub fn show(
         toggle_maximize_window: false,
         close_window: false,
         show_window_menu_at: None,
+        maximize_btn_rect: None,
         new_pane: false,
         layout_reset: false,
         divider_drag: None,
@@ -356,6 +362,10 @@ pub fn show(
     }
     if tb.show_window_menu_at.is_some() {
         out.show_window_menu_at = tb.show_window_menu_at;
+    }
+    // M3.8 批2：最大化按钮逻辑矩形（Snap Layouts 热区，main 换算为屏幕坐标）。
+    if tb.maximize_btn_rect.is_some() {
+        out.maximize_btn_rect = tb.maximize_btn_rect;
     }
 
     // 左侧会话栏：可拖宽（P10）。default_size 只在 egui 无面板记忆
