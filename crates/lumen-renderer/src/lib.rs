@@ -375,15 +375,17 @@ impl Renderer {
     /// 渲染一帧终端内容到离屏纹理（不触碰 surface，呈现由 app 层的
     /// egui pass 完成）。
     ///
-    /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为要绘制的
-    /// 光标屏幕坐标（None 不画）——由上层做位置防抖后传入，不直接读
-    /// grid 光标，避免把 TUI 重绘期间的临时停留位画上屏；
-    /// `selected_block` 为选中命令块的 id（块背景高亮）。
+    /// `selection` 为当前鼠标选区（绝对行号定位）；`cursor` 为绘制中
+    /// 的光标态 (行, 列, 可见)——由上层做位置防抖后传入，不直接读
+    /// grid 光标，避免把 TUI 重绘期间的临时停留位画上屏；不可见时
+    /// 行号仍有效，充当未闭合命令块状态条的下边界（与光标同源防抖，
+    /// 块条几何才能帧间连续，见下方注释）；`selected_block` 为选中
+    /// 命令块的 id（块背景高亮）。
     pub fn render(
         &mut self,
         term: &Terminal,
         selection: Option<&Selection>,
-        cursor: Option<(usize, usize)>,
+        cursor: (usize, usize, bool),
         selected_block: Option<u64>,
     ) -> Result<()> {
         // 离屏视图按值克隆（Arc 浅拷贝），避免长借用 self 卡住后续字段访问。
@@ -405,12 +407,21 @@ impl Renderer {
         // 单元格背景之后绘制（先画会被不透明 cell 背景盖成花斑）。
         // 不在备用屏幕（vim 等全屏程序）时才绘制。
         let mut block_tints: Vec<rect::RectInstance> = Vec::new();
+        let (cur_row, cur_col, cursor_visible) = cursor;
         if !term.is_alt_screen() {
             let bar_x = pad * 0.2;
             let bar_w = (pad * 0.3).max(2.0);
+            // 未闭合（运行中）块的下边界用「防抖光标行」而非 live 光标
+            // 行：codex 等 TUI 在同步帧尾常把光标停在重绘残留位，live
+            // 行帧间跨行大跳，蓝色状态条跟着伸缩就是左缘闪烁（需求池
+            // P1）。防抖行与光标块同源（上层 cursor_displayed），随归
+            // 位序列/超时才更新，块条几何因此与光标一样帧间连续。
+            // 绝对行号换算与光标绘制同式：视图首行 + display_offset +
+            // 防抖行 = dropped + scrollback + 行，不随用户回滚漂移。
+            let bar_cap_abs = view_top_abs + grid.display_offset() as u64 + cur_row as u64;
             for vr in 0..rows {
                 let abs_line = view_top_abs + vr as u64;
-                let Some(block) = term.block_at_line(abs_line) else {
+                let Some(block) = term.block_at_line_capped(abs_line, bar_cap_abs) else {
                     continue;
                 };
                 let y = pad + vr as f32 * ch;
@@ -490,7 +501,7 @@ impl Renderer {
         instances.extend(block_tints);
         // 光标：跟随底部时绘制在可视区对应行（半透明块，文字仍可见）；
         // 落在宽字符上时画两格宽。
-        if let Some((cur_row, cur_col)) = cursor {
+        if cursor_visible {
             let cursor_view_row = grid.display_offset() + cur_row;
             if cur_row < rows && cur_col < cols && cursor_view_row < rows {
                 let on_wide = grid

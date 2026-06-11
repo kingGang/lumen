@@ -205,7 +205,14 @@ impl AppState {
         s.redraw_abs_at = None;
         // 离屏纹理里还是换出会话的画面：下一帧必须渲染本会话的终端，
         // 即使它正处于 DEC 2026 同步区间（画半成品也好过画错会话）。
-        s.term_frame_due = true;
+        // 欠帧起点回拨 REDRAW_ABS_CAP 让它直接「超龄」：若新数据赶在
+        // 重绘执行前重新武装了渲染计划，门控也不许把错误会话的旧画面
+        // 多留哪怕一帧（checked_sub 仅防进程启动极早期的理论下溢）。
+        s.term_frame_due_since = Some(
+            Instant::now()
+                .checked_sub(REDRAW_ABS_CAP)
+                .unwrap_or_else(Instant::now),
+        );
         s.has_unseen_output = false;
         // 焦点归属按覆盖层/重命名状态计算，不无条件抢回：后台 shell
         // 自行退出触发的 activate 可能发生在用户正往设置页/登录表单/
@@ -571,8 +578,11 @@ impl ApplicationHandler<PtyWake> for App {
                     s.redraw_hard_at = None;
                     s.redraw_abs_at = None;
                     // 直渲请求是「欠帧」：到 RedrawRequested 执行前若有
-                    // 新 BSU 批到达重新拉起同步区间，门控不得跳过这帧。
-                    s.term_frame_due = true;
+                    // 新 BSU 批到达重新拉起同步区间，门控可暂缓这帧、
+                    // 交给重新武装的渲染计划在 ESU 后补画完整帧（直接
+                    // 放行会把半成品画上屏——蓝条闪烁，需求池 P1）；
+                    // 暂缓以欠帧起点 + REDRAW_ABS_CAP 为限，见门控注释。
+                    s.term_frame_due_since.get_or_insert(now);
                     state.window.request_redraw();
                 }
             } else {
@@ -659,10 +669,15 @@ impl ApplicationHandler<PtyWake> for App {
         // 终端计划到点但正处于同步区间：小步顺延等帧完成（ESU 通常随
         // 下一批数据立刻到达），但不超过绝对兜底时刻。egui 计划即使
         // 到点也跟着顺延（2ms 粒度，对 UI 动画无感），避免把半成品
-        // 终端帧画上屏。
+        // 终端帧画上屏。欠帧已超龄（上轮被门控暂缓、又熬过了一个
+        // REDRAW_ABS_CAP）则不再顺延——落到下方清计划 + 请求重绘，
+        // 门控同样按超龄放行，保证强制渲染真的发生。
         if term_due.is_some_and(|t| now >= t)
             && s.term.is_synchronized()
             && s.redraw_abs_at.is_some_and(|a| now < a)
+            && s
+                .term_frame_due_since
+                .is_none_or(|d| now.duration_since(d) < REDRAW_ABS_CAP)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(2)));
             return;
@@ -675,9 +690,9 @@ impl ApplicationHandler<PtyWake> for App {
             s.redraw_abs_at = None;
             // 终端计划到点 = 欠一帧终端渲染。计划已清空，若执行重绘
             // 前新数据又拉起同步区间（abs 重新武装到未来），同步门控
-            // 会误判「计划在途」而跳过——欠帧标志保证这帧必画（绝对
-            // 兜底到点的强制渲染正是走这里，不许被门控吃掉）。
-            s.term_frame_due = true;
+            // 可暂缓这帧等 ESU 补画，但暂缓以本起点 + REDRAW_ABS_CAP
+            // 为限（绝对兜底到点的强制渲染不许被无限顺延吃掉）。
+            s.term_frame_due_since.get_or_insert(now);
         }
         if state.egui_repaint_at.is_some_and(|e| now >= e) {
             state.egui_repaint_at = None;
@@ -1077,18 +1092,29 @@ impl ApplicationHandler<PtyWake> for App {
                 // 而 BSU..ESU 之间 grid 是边收边改的半成品（光标游走、
                 // 未画完的行）——静默合帧/小步顺延只管**定时调度**路径，
                 // 管不住事件驱动的 request_redraw。此处兜底：同步区间内
-                // 且渲染计划在途（abs 兜底未到点）且不欠帧时，跳过终端
-                // 离屏渲染——egui 照常布局合成（悬停高亮不受影响），
-                // 离屏纹理保留上一完整帧，ESU 到达后由快路/计划补画。
-                // 跳过时也不动 take_dirty 与光标冻结状态（属于「真渲染」
-                // 的配套动作，提前执行会吃掉 damage、错推冻结时间轴）。
-                // term_frame_due（欠帧）必须放行：计划到点已被清空，若
-                // 新数据又拉起同步区间，没有它绝对兜底会被无限顺延。
+                // 且渲染计划在途（abs 兜底未到点）时，跳过终端离屏渲染
+                // ——egui 照常布局合成（悬停高亮不受影响），离屏纹理
+                // 保留上一完整帧，ESU 到达后由快路/计划补画。跳过时也
+                // 不动 take_dirty 与光标冻结状态（属于「真渲染」的配套
+                // 动作，提前执行会吃掉 damage、错推冻结时间轴）。
+                // 欠帧（term_frame_due_since）不再无条件放行：ESU 快路
+                // 的 request_redraw 与 WM_PAINT 之间若有新 BSU 批被
+                // drain（流式输出下的常见竞态），旧逻辑会把半成品 grid
+                // 画上屏——蓝条随未归位的光标行伸缩、内容闪烁（需求池
+                // P1 的来源之一）。改为：同步区间内欠帧也暂缓，交给该
+                // 批 drain 时重新武装的渲染计划（abs 在途是跳过的前提，
+                // 且 abs 必伴随 redraw_at，补画一定会被调度）在 ESU 后
+                // 补画完整帧；但暂缓以欠帧起点 + REDRAW_ABS_CAP 为限，
+                // 超龄后无论是否同步一律放行——保住「应用不会卡死在
+                // BSU 画面冻结」的绝对兜底语义（worst case 与原 abs
+                // 兜底同量级，普通流量根本到不了）。
                 let mut skip_term_render = {
                     let s = &state.sessions[state.active];
-                    !s.term_frame_due
-                        && s.term.is_synchronized()
+                    s.term.is_synchronized()
                         && s.redraw_abs_at.is_some_and(|a| render_t0 < a)
+                        && s
+                            .term_frame_due_since
+                            .is_none_or(|d| render_t0.duration_since(d) < REDRAW_ABS_CAP)
                 };
 
                 if !skip_term_render {
@@ -1371,16 +1397,14 @@ impl ApplicationHandler<PtyWake> for App {
                 // egui pass 照常采样合成（渲染计划在途，ESU 后补画）。
                 if !skip_term_render {
                     let s = &mut state.sessions[state.active];
-                    s.term_frame_due = false;
+                    s.term_frame_due_since = None;
                     let s = &state.sessions[state.active];
-                    let cursor = s
-                        .cursor_displayed
-                        .2
-                        .then_some((s.cursor_displayed.0, s.cursor_displayed.1));
+                    // 防抖光标态整组传入：不可见时行号仍是运行中块状态
+                    // 条的下边界（与光标同源防抖，块条几何帧间连续）。
                     if let Err(e) = state.renderer.render(
                         &s.term,
                         s.selection.as_ref(),
-                        cursor,
+                        s.cursor_displayed,
                         s.selected_block,
                     ) {
                         error!("渲染失败: {e:#}");

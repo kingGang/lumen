@@ -52,12 +52,16 @@ pub struct Session {
     pub redraw_hard_at: Option<Instant>,
     /// 绝对兜底时刻：超过后即使在同步区间内也渲染。
     pub redraw_abs_at: Option<Instant>,
-    /// 「欠一帧终端渲染」：渲染计划到点（about_to_wait 清计划并请求
-    /// 重绘）或 ESU 快路直渲时置位。RedrawRequested 的同步区间门控
-    /// 见此标志必须渲染终端（不许跳过）——否则计划被清后若新数据又
-    /// 重新武装了同步区间，欠下的帧会被门控反复推迟（兜底失效）。
-    /// 终端离屏真正渲染过即清零。
-    pub term_frame_due: bool,
+    /// 「欠一帧终端渲染」的起点时刻：渲染计划到点（about_to_wait 清
+    /// 计划并请求重绘）或 ESU 快路直渲时置位（已置位保留更早起点）。
+    /// RedrawRequested 的同步区间门控对欠帧**可以暂缓**——新 BSU 批
+    /// 赶在重绘执行前重新拉起同步区间时，交给重新武装的渲染计划在
+    /// ESU 后补画完整帧，不把半成品 grid 画上屏（蓝条闪烁来源之一，
+    /// 需求池 P1）；但暂缓不超过 REDRAW_ABS_CAP：欠帧超龄后无论是否
+    /// 同步一律放行渲染，保住「不会卡死在 BSU 画面冻结」的绝对兜底
+    /// （否则计划被反复重新武装会让欠帧无限顺延）。终端离屏真正渲染
+    /// 过即清 None。
+    pub term_frame_due_since: Option<Instant>,
     /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
     pub has_unseen_output: bool,
 }
@@ -112,7 +116,7 @@ impl Session {
             redraw_at: None,
             redraw_hard_at: None,
             redraw_abs_at: None,
-            term_frame_due: false,
+            term_frame_due_since: None,
             has_unseen_output: false,
         })
     }

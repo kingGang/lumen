@@ -90,6 +90,17 @@ impl Terminal {
     /// 查找覆盖指定绝对行的块。块范围为 `[prompt_line, end_line)`，
     /// 未闭合块只延伸到主屏光标行（不向下方空白区无限延伸）。
     pub fn block_at_line(&self, abs: u64) -> Option<&Block> {
+        self.block_at_line_capped(abs, self.main_grid().absolute_cursor_line())
+    }
+
+    /// 同 [`Self::block_at_line`]，但未闭合块的下边界绝对行号（含）
+    /// 由调用方给定，不读 live 光标行。
+    ///
+    /// 渲染侧用「防抖后的光标行」做下边界：codex 等 TUI 在 DEC 2026
+    /// 同步帧尾常把光标停在重绘残留位（见 [`Self::cursor_unsettled`]），
+    /// live 光标行帧间跨行大跳——运行中块的左缘状态条若跟着 live 行
+    /// 伸缩，就是「蓝条闪烁」的直接来源（需求池 P1）。
+    pub fn block_at_line_capped(&self, abs: u64, unclosed_end: u64) -> Option<&Block> {
         let blocks = &self.inner.blocks;
         // prompt_line 单调递增：找最后一个 prompt_line <= abs 的块。
         let idx = blocks.partition_point(|b| b.prompt_line <= abs);
@@ -97,7 +108,7 @@ impl Terminal {
         match b.end_line {
             Some(end) if abs >= end => None,
             Some(_) => Some(b),
-            None if abs <= self.main_grid().absolute_cursor_line() => Some(b),
+            None if abs <= unclosed_end => Some(b),
             None => None,
         }
     }
@@ -1029,6 +1040,26 @@ mod tests {
         // 光标在行 0；行 0 命中、行 5（空白区）不命中。
         assert!(t.block_at_line(0).is_some());
         assert!(t.block_at_line(5).is_none());
+    }
+
+    #[test]
+    fn 未闭合块下边界按调用方上限截断() {
+        let mut t = Terminal::new(10, 20, 100);
+        // 未闭合块：prompt 行0，输出 a(行1) b(行2)，光标 live 在行3。
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07a\r\nb\r\n");
+        assert_eq!(t.grid().cursor.row, 3);
+        // 渲染侧给「防抖光标行」做上限：行1 命中，行2/3 截掉。
+        assert!(t.block_at_line_capped(1, 1).is_some());
+        assert!(t.block_at_line_capped(2, 1).is_none());
+        assert!(t.block_at_line_capped(3, 1).is_none());
+        // 上限取 live 光标行时与 block_at_line 等价。
+        assert_eq!(
+            t.block_at_line(3).map(|b| b.id),
+            t.block_at_line_capped(3, 3).map(|b| b.id)
+        );
+        // 已闭合块不受上限影响（上限只约束未闭合块的下边界）。
+        t.advance(b"\x1b]133;D;0\x07");
+        assert!(t.block_at_line_capped(1, 0).is_some());
     }
 
     #[test]
