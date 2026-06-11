@@ -51,9 +51,8 @@ use egui_ltreeview::{Action, NodeBuilder, TreeView, TreeViewBuilder, TreeViewSta
 use super::theme;
 use super::toast::ToastKind;
 
-/// 文件树栏宽度（逻辑像素）。
-pub const PANEL_WIDTH: f32 = 220.0;
-/// 收起后保留的窄条宽度（容纳展开按钮，保证可发现性）。
+/// 收起后保留的窄条宽度（容纳展开按钮，保证可发现性）。展开态宽度
+/// 可拖动调整（P10），默认值与范围见 crate::settings。
 const STRIP_WIDTH: f32 = 22.0;
 /// 单层最多展示的条目数。
 const MAX_ENTRIES_PER_DIR: usize = 1000;
@@ -548,16 +547,22 @@ pub struct FileTreeOutput {
     pub toasts: Vec<(ToastKind, String)>,
     /// 对话框本帧关闭（main 把键盘焦点交还终端）。
     pub dialog_closed: bool,
+    /// 展开面板本帧的实际宽度（逻辑点；P10 持久化用）。收起窄条时
+    /// 为 None——不覆盖已存的展开宽度。
+    pub panel_width: Option<f32>,
 }
 
 /// 绘制文件树栏（位于 tab 侧栏右侧、终端区左侧）。
-/// 收起时画一条窄条（仅展开按钮），展开时画完整面板。
+/// 收起时画一条窄条（仅展开按钮），展开时画完整面板（可拖宽，
+/// P10：`width` 为持久化的宽度，仅 egui 无面板记忆的首帧生效；
+/// 实际宽度经 [`FileTreeOutput::panel_width`] 报回，松手时落盘）。
 pub fn show(
     root: &mut egui::Ui,
     st: &mut FileTreeState,
     cwd: Option<&Path>,
     shell_idle: bool,
     pal: &theme::Palette,
+    width: f32,
 ) -> FileTreeOutput {
     let mut out = FileTreeOutput::default();
     st.sync_root(cwd);
@@ -573,9 +578,10 @@ pub fn show(
     }
 
     if st.visible {
-        egui::Panel::left("lumen_filetree")
-            .exact_size(PANEL_WIDTH)
-            .resizable(false)
+        let resp = egui::Panel::left("lumen_filetree")
+            .default_size(width)
+            .size_range(crate::settings::FILETREE_WIDTH_MIN..=crate::settings::FILETREE_WIDTH_MAX)
+            .resizable(true)
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
@@ -583,6 +589,7 @@ pub fn show(
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
             .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, &mut out));
+        out.panel_width = Some(resp.response.rect.width());
     } else {
         egui::Panel::left("lumen_filetree_strip")
             .exact_size(STRIP_WIDTH)

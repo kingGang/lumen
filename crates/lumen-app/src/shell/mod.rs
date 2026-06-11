@@ -16,9 +16,6 @@ pub mod theme;
 pub mod toast;
 pub mod topbar;
 
-/// 左侧会话栏宽度（逻辑像素）。
-pub const SIDEBAR_WIDTH: f32 = 180.0;
-
 /// 窗格标题栏里关闭按钮的边长（逻辑像素，F5 批2 引入、F7① 迁入
 /// 标题栏常驻）。
 const PANE_CLOSE_SIZE: f32 = 16.0;
@@ -127,6 +124,18 @@ pub struct ShellOutput {
     /// 各分隔条命中矩形（egui 逻辑坐标）。main 据此让 raw 鼠标路由
     /// 让位：按下不聚焦/不建选区/不交出终端焦点（拖动由 egui 处理）。
     pub divider_rects: Vec<egui::Rect>,
+    /// 左侧会话栏本帧实际宽度（逻辑点；P10）。main 在指针松开且与
+    /// 已存值有差时写入 settings.json（拖动中不写盘）。
+    pub sidebar_width: f32,
+    /// 文件树栏本帧实际宽度（逻辑点；P10）。收起（窄条）时为 None
+    /// ——不覆盖已存的展开宽度。
+    pub filetree_width: Option<f32>,
+    /// 侧栏/文件树栏右缘的面板拖宽手柄命中矩形（egui 逻辑坐标，
+    /// P10）。egui 的 resize 手柄以面板边线为中心向两侧各探入
+    /// resize_grab_radius_side 像素，文件树右缘的手柄会盖住终端区
+    /// 左缘——main 据此让 raw 鼠标路由让位（按下不聚焦/不建选区/
+    /// 不交出终端焦点，拖宽本身由 egui 处理）。
+    pub panel_resize_rects: Vec<egui::Rect>,
     /// 点击了某 tab 条目（切换激活）。
     pub activate: Option<u64>,
     /// 请求关闭某 tab（右键菜单）。
@@ -194,6 +203,9 @@ pub fn show(
         divider_drag_ended: false,
         divider_reset: None,
         divider_rects: Vec::new(),
+        sidebar_width: app_settings.layout.sidebar_width,
+        filetree_width: None,
+        panel_resize_rects: Vec::new(),
         activate: None,
         close: None,
         rename: None,
@@ -255,9 +267,14 @@ pub fn show(
         out.logged_out = true;
     }
 
-    egui::Panel::left("lumen_sidebar")
-        .exact_size(SIDEBAR_WIDTH)
-        .resizable(false)
+    // 左侧会话栏：可拖宽（P10）。default_size 只在 egui 无面板记忆
+    // （首帧）时生效 = 还原持久化宽度；此后宽度由 egui 面板自管，
+    // 实际值经 sidebar_width 报回 main，松手时写盘。拖动改变终端区
+    // 宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
+    let sb_resp = egui::Panel::left("lumen_sidebar")
+        .default_size(app_settings.layout.sidebar_width)
+        .size_range(crate::settings::SIDEBAR_WIDTH_MIN..=crate::settings::SIDEBAR_WIDTH_MAX)
+        .resizable(true)
         .show_separator_line(false)
         .frame(
             egui::Frame::new()
@@ -265,10 +282,35 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(8, 10)),
         )
         .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
+    out.sidebar_width = sb_resp.response.rect.width();
+    // 侧栏右缘的拖宽手柄命中区（与面板边线同心、向两侧各探
+    // resize_grab_radius_side）：报给 main 让 raw 鼠标按下让位——
+    // 拖宽期间不交出终端焦点，调完宽度接着打字不断流。
+    let grab = root.style().interaction.resize_grab_radius_side;
+    let edge_rect = |edge_x: f32, root: &egui::Ui| {
+        let y = root.available_rect_before_wrap().y_range();
+        egui::Rect::from_x_y_ranges(edge_x - grab..=edge_x + grab, y)
+    };
+    out.panel_resize_rects
+        .push(edge_rect(sb_resp.response.rect.max.x, root));
 
-    // 中间一栏：文件树（可折叠；树根跟随激活会话 cwd）。开合改变
-    // 终端区宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
-    let ft = filetree::show(root, &mut st.filetree, input.cwd, input.shell_idle, pal);
+    // 中间一栏：文件树（可折叠 + 可拖宽 P10；树根跟随激活会话 cwd）。
+    // 开合/拖宽改变终端区宽度，沿用同一条矩形变化链路。
+    let ft = filetree::show(
+        root,
+        &mut st.filetree,
+        input.cwd,
+        input.shell_idle,
+        pal,
+        app_settings.layout.filetree_width,
+    );
+    out.filetree_width = ft.panel_width;
+    if ft.panel_width.is_some() {
+        // 文件树右缘手柄探入终端区左缘数像素，必须让位（收起窄条不
+        // 可拖宽，无手柄不让位）。
+        out.panel_resize_rects
+            .push(edge_rect(root.available_rect_before_wrap().min.x, root));
+    }
     out.cd_dir = ft.cd_dir;
     out.open_file = ft.open_file;
     out.copy_text = ft.copy_text;

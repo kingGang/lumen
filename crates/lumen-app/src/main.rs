@@ -165,6 +165,11 @@ struct AppState {
     /// 终端焦点（调完比例接着打字不该断流），拖动与双击由 egui 侧
     /// 处理（divider_drag / divider_reset）。
     divider_rects_px: Vec<(f32, f32, f32, f32)>,
+    /// 侧栏/文件树栏拖宽手柄的命中矩形（物理像素 x/y/w/h；P10），
+    /// 来自最近一帧 egui 布局。文件树右缘的手柄向终端区探入数像素，
+    /// raw 鼠标路由对它让位（与分隔条同款：按下不聚焦/不建选区/不
+    /// 交出终端焦点，拖宽由 egui 面板处理）。
+    panel_resize_rects_px: Vec<(f32, f32, f32, f32)>,
     /// 终端是否持有键盘/IME 焦点：点击终端区 true、点击 egui 面板
     /// false。egui 不会为非控件区域持焦点，键盘与 IME 路由全靠它。
     terminal_focused: bool,
@@ -230,6 +235,11 @@ impl AppState {
         if self.mouse_on_pane_divider() {
             return None;
         }
+        // 面板拖宽手柄让位（P10）：文件树右缘的手柄盖住终端区左缘
+        // 数像素，按下是拖宽的开始，不算「在窗格上」。
+        if self.mouse_on_panel_resize() {
+            return None;
+        }
         let (mx, my) = self.mouse_pos;
         let (sid, _) = self.pane_rects_px.iter().find(|(_, (x, y, w, h))| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
@@ -262,6 +272,15 @@ impl AppState {
     fn mouse_on_pane_divider(&self) -> bool {
         let (mx, my) = self.mouse_pos;
         self.divider_rects_px.iter().any(|(x, y, w, h)| {
+            mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
+        })
+    }
+
+    /// 鼠标当前位置是否落在侧栏/文件树栏的拖宽手柄上（上一帧布局，
+    /// P10）。
+    fn mouse_on_panel_resize(&self) -> bool {
+        let (mx, my) = self.mouse_pos;
+        self.panel_resize_rects_px.iter().any(|(x, y, w, h)| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
         })
     }
@@ -618,9 +637,11 @@ impl App {
         let actual_family = renderer.reconfigure_font(&ap.font_family, ap.font_size);
         renderer.set_theme(ap.theme.terminal_theme());
         info!(
-            "设置加载：主题 {} 字号 {} 字体「{}」→ 实际生效「{actual_family}」",
+            "设置加载：主题 {} 字号 {} 侧栏宽 {}/{} 字体「{}」→ 实际生效「{actual_family}」",
             ap.theme.display_name(),
             ap.font_size,
+            app_settings.layout.sidebar_width,
+            app_settings.layout.filetree_width,
             if ap.font_family.is_empty() {
                 "自动"
             } else {
@@ -674,7 +695,7 @@ impl App {
         // 终端区初值：窗口减去侧栏宽度与顶栏高度（首帧 egui 布局后
         // 按实际窗格矩形校正，文件树栏宽度即在首帧补扣）。窗格离屏
         // 纹理在首帧 RedrawRequested 懒创建（布局前不知道各窗格尺寸）。
-        let sidebar_px = (shell::SIDEBAR_WIDTH * scale).round();
+        let sidebar_px = (app_settings.layout.sidebar_width * scale).round();
         let topbar_px = (shell::topbar::HEIGHT * scale).round();
         let term_w = ((size.width as f32 - sidebar_px).max(1.0)) as u32;
         let term_h = ((size.height as f32 - topbar_px).max(1.0)) as u32;
@@ -830,6 +851,7 @@ impl App {
             pane_rects_px: Vec::new(),
             pane_close_rects_px: Vec::new(),
             divider_rects_px: Vec::new(),
+            panel_resize_rects_px: Vec::new(),
             terminal_focused: true,
             egui_repaint_at: None,
             was_popup_open: false,
@@ -1498,6 +1520,12 @@ impl ApplicationHandler<PtyWake> for App {
                     if state.mouse_on_pane_divider() {
                         return;
                     }
+                    // 按在侧栏/文件树栏的拖宽手柄上（P10）：拖宽由
+                    // egui 面板处理，这里同样不聚焦/不建选区/不交出
+                    // 终端焦点——调完宽度接着打字不该断流。
+                    if state.mouse_on_panel_resize() {
+                        return;
+                    }
                     // 焦点仲裁（F5）：点击窗格聚焦该窗格 + 终端拿键盘/
                     // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
                     let Some(pi) = state.pane_under_mouse() else {
@@ -2076,6 +2104,55 @@ impl ApplicationHandler<PtyWake> for App {
                 // 矩形应用与终端渲染（egui 呈现旧画面一帧，与 activate
                 // 的「先切再补帧」同款瞬态），请求下一帧按新结构重来。
                 let ppp = full_output.pixels_per_point;
+                // 面板拖宽手柄命中区（P10）：raw 鼠标让位判定用
+                // （mouse_on_panel_resize）。与窗格结构无关，无条件
+                // 按本帧布局更新（文件树收起时本帧为空 = 不让位）。
+                state.panel_resize_rects_px.clear();
+                for r in &shell_out.panel_resize_rects {
+                    state.panel_resize_rects_px.push((
+                        r.min.x * ppp,
+                        r.min.y * ppp,
+                        r.width() * ppp,
+                        r.height() * ppp,
+                    ));
+                }
+                // —— 侧栏宽度持久化（P10）：egui 面板自管宽度（本帧
+                // 实际值经 shell_out 报回），这里只负责落盘——指针
+                // 松开（拖动结束）且与已存值差 ≥1px 才写；窗口过窄被
+                // 临时压缩到范围之外的瞬态宽度不写（重启还原用户最后
+                // 一次主动调整的值）。
+                if !state.egui_ctx.input(|i| i.pointer.any_down()) {
+                    let lay = &mut state.settings.layout;
+                    let mut width_changed = false;
+                    let sw = shell_out.sidebar_width;
+                    if (settings::SIDEBAR_WIDTH_MIN - 1.0..=settings::SIDEBAR_WIDTH_MAX + 1.0)
+                        .contains(&sw)
+                        && (sw - lay.sidebar_width).abs() >= 1.0
+                    {
+                        lay.sidebar_width = sw;
+                        width_changed = true;
+                    }
+                    if let Some(fw) = shell_out.filetree_width {
+                        if (settings::FILETREE_WIDTH_MIN - 1.0..=settings::FILETREE_WIDTH_MAX + 1.0)
+                            .contains(&fw)
+                            && (fw - lay.filetree_width).abs() >= 1.0
+                        {
+                            lay.filetree_width = fw;
+                            width_changed = true;
+                        }
+                    }
+                    if width_changed {
+                        // 失败弹 toast（与字体/主题写盘同款）：用户以为
+                        // 拖完即存，静默丢失重启才发现。
+                        if let Some(err) = state.settings.save() {
+                            state.shell_state.toast.push(
+                                shell::toast::ToastKind::Error,
+                                format!("设置保存失败：{err}"),
+                            );
+                            state.window.request_redraw();
+                        }
+                    }
+                }
                 let structure_unchanged = state.tabs.get(state.active_tab).is_some_and(|t| {
                     t.panes.len() == layout_pane_ids.len()
                         && t.panes

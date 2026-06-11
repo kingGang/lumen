@@ -28,6 +28,19 @@ pub const FONT_SIZE_MAX: f32 = 32.0;
 /// 默认终端字号（与 lumen-renderer 的初始值一致）。
 pub const FONT_SIZE_DEFAULT: f32 = 15.0;
 
+/// 左侧会话 tab 栏宽度下限（逻辑像素；P10 拖宽范围与加载夹紧共用）。
+pub const SIDEBAR_WIDTH_MIN: f32 = 140.0;
+/// 左侧会话 tab 栏宽度上限。
+pub const SIDEBAR_WIDTH_MAX: f32 = 320.0;
+/// 左侧会话 tab 栏默认宽度。
+pub const SIDEBAR_WIDTH_DEFAULT: f32 = 180.0;
+/// 中间文件树栏宽度下限（逻辑像素；展开态，收起窄条不在此列）。
+pub const FILETREE_WIDTH_MIN: f32 = 160.0;
+/// 中间文件树栏宽度上限。
+pub const FILETREE_WIDTH_MAX: f32 = 480.0;
+/// 中间文件树栏默认宽度。
+pub const FILETREE_WIDTH_DEFAULT: f32 = 220.0;
+
 /// 主题选择（设置页下拉项；新增主题在此扩展枚举）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -85,11 +98,32 @@ impl Default for AppearanceSettings {
     }
 }
 
+/// 外壳布局设置（Layout 节，P10）：侧栏宽度由拖动调整、松手落盘，
+/// 重启还原。旧文件无此节时 `#[serde(default)]` 补默认值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutSettings {
+    /// 左侧会话 tab 栏宽度（逻辑像素）。
+    pub sidebar_width: f32,
+    /// 中间文件树栏宽度（逻辑像素，展开态；收起窄条宽度固定不存）。
+    pub filetree_width: f32,
+}
+
+impl Default for LayoutSettings {
+    fn default() -> Self {
+        Self {
+            sidebar_width: SIDEBAR_WIDTH_DEFAULT,
+            filetree_width: FILETREE_WIDTH_DEFAULT,
+        }
+    }
+}
+
 /// 应用设置根结构。
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: AppearanceSettings,
+    pub layout: LayoutSettings,
 }
 
 impl Settings {
@@ -154,27 +188,47 @@ impl Settings {
             );
             return s;
         }
-        let Some(ap) = root.get("appearance") else {
-            return s;
-        };
-        if !ap.is_object() {
-            log::warn!(
-                "设置节 appearance 不是对象，整节降级默认值: {}",
-                path.display()
-            );
-            return s;
+        if let Some(ap) = root.get("appearance") {
+            if ap.is_object() {
+                let d = AppearanceSettings::default();
+                s.appearance.theme = lenient_field(ap, "theme", "appearance.theme", d.theme, path);
+                s.appearance.font_family = lenient_field(
+                    ap,
+                    "font_family",
+                    "appearance.font_family",
+                    d.font_family,
+                    path,
+                );
+                s.appearance.font_size =
+                    lenient_field(ap, "font_size", "appearance.font_size", d.font_size, path);
+            } else {
+                log::warn!(
+                    "设置节 appearance 不是对象，整节降级默认值: {}",
+                    path.display()
+                );
+            }
         }
-        let d = AppearanceSettings::default();
-        s.appearance.theme = lenient_field(ap, "theme", "appearance.theme", d.theme, path);
-        s.appearance.font_family = lenient_field(
-            ap,
-            "font_family",
-            "appearance.font_family",
-            d.font_family,
-            path,
-        );
-        s.appearance.font_size =
-            lenient_field(ap, "font_size", "appearance.font_size", d.font_size, path);
+        if let Some(ly) = root.get("layout") {
+            if ly.is_object() {
+                let d = LayoutSettings::default();
+                s.layout.sidebar_width = lenient_field(
+                    ly,
+                    "sidebar_width",
+                    "layout.sidebar_width",
+                    d.sidebar_width,
+                    path,
+                );
+                s.layout.filetree_width = lenient_field(
+                    ly,
+                    "filetree_width",
+                    "layout.filetree_width",
+                    d.filetree_width,
+                    path,
+                );
+            } else {
+                log::warn!("设置节 layout 不是对象，整节降级默认值: {}", path.display());
+            }
+        }
         s
     }
 
@@ -206,19 +260,39 @@ impl Settings {
         Ok(())
     }
 
-    /// 加载后规整：字号夹紧到合法范围、字体名去首尾空白
+    /// 加载后规整：字号/侧栏宽度夹紧到合法范围、字体名去首尾空白
     /// （越界/NaN/空白来自用户手改文件）。
     fn sanitize(&mut self) {
-        let s = self.appearance.font_size;
-        self.appearance.font_size = if s.is_finite() {
-            s.clamp(FONT_SIZE_MIN, FONT_SIZE_MAX)
-        } else {
-            FONT_SIZE_DEFAULT
-        };
+        /// 有限值夹紧到 [min, max]，非有限（NaN/Inf）回默认值。
+        fn clamp_or(v: f32, min: f32, max: f32, default: f32) -> f32 {
+            if v.is_finite() {
+                v.clamp(min, max)
+            } else {
+                default
+            }
+        }
+        self.appearance.font_size = clamp_or(
+            self.appearance.font_size,
+            FONT_SIZE_MIN,
+            FONT_SIZE_MAX,
+            FONT_SIZE_DEFAULT,
+        );
         let trimmed = self.appearance.font_family.trim();
         if trimmed.len() != self.appearance.font_family.len() {
             self.appearance.font_family = trimmed.to_owned();
         }
+        self.layout.sidebar_width = clamp_or(
+            self.layout.sidebar_width,
+            SIDEBAR_WIDTH_MIN,
+            SIDEBAR_WIDTH_MAX,
+            SIDEBAR_WIDTH_DEFAULT,
+        );
+        self.layout.filetree_width = clamp_or(
+            self.layout.filetree_width,
+            FILETREE_WIDTH_MIN,
+            FILETREE_WIDTH_MAX,
+            FILETREE_WIDTH_DEFAULT,
+        );
     }
 }
 
@@ -265,6 +339,8 @@ mod tests {
         assert_eq!(s.appearance.theme, ThemeChoice::TokyoNight);
         assert!(s.appearance.font_family.is_empty());
         assert_eq!(s.appearance.font_size, FONT_SIZE_DEFAULT);
+        assert_eq!(s.layout.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(s.layout.filetree_width, FILETREE_WIDTH_DEFAULT);
     }
 
     #[test]
@@ -274,6 +350,10 @@ mod tests {
                 theme: ThemeChoice::TokyoNightLight,
                 font_family: "JetBrains Mono".to_owned(),
                 font_size: 18.0,
+            },
+            layout: LayoutSettings {
+                sidebar_width: 260.0,
+                filetree_width: 320.0,
             },
         };
         let p = temp_path("roundtrip");
@@ -372,6 +452,41 @@ mod tests {
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, Settings::default());
+    }
+
+    #[test]
+    fn 侧栏宽度_旧文件缺节补默认() {
+        // P10 之前的旧 settings.json 没有 layout 节：平滑升级补默认值。
+        let p = temp_path("layout_missing");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 20.0 } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.appearance.font_size, 20.0);
+        assert_eq!(loaded.layout, LayoutSettings::default());
+    }
+
+    #[test]
+    fn 侧栏宽度_越界与非法夹紧() {
+        let p = temp_path("layout_clamp");
+        // 越界夹紧到范围端点。
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "sidebar_width": 9999.0, "filetree_width": 10.0 } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        assert_eq!(loaded.layout.sidebar_width, SIDEBAR_WIDTH_MAX);
+        assert_eq!(loaded.layout.filetree_width, FILETREE_WIDTH_MIN);
+        // 字段级容错：类型非法只降级该字段，另一字段保留。
+        std::fs::write(
+            &p,
+            r#"{ "layout": { "sidebar_width": "wide", "filetree_width": 300.0 } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.layout.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
+        assert_eq!(loaded.layout.filetree_width, 300.0);
     }
 
     #[test]
