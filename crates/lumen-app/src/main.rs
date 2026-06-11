@@ -1046,9 +1046,11 @@ impl AppState {
 
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<AppState> {
+        // 启动默认最大化（P17）：inner_size 保留为「取消最大化」后的还原尺寸。
         let attrs = Window::default_attributes()
             .with_title("Lumen")
-            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
+            .with_maximized(true);
         let window = Arc::new(event_loop.create_window(attrs).context("创建窗口失败")?);
         window.set_ime_allowed(true);
         // 告知输入法处于终端语境（egui-winit 内部有同等映射）。
