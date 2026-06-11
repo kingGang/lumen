@@ -1056,8 +1056,9 @@ fn dialog_ui(
                     }
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
+                        // 主操作按钮：accent 实底 + 反相文字（M3.7b 黑白 CTA）。
                         let create_btn =
-                            egui::Button::new(egui::RichText::new("创建").color(pal.bg_dark))
+                            egui::Button::new(egui::RichText::new("创建").color(pal.accent_fg))
                                 .fill(pal.accent);
                         if ui.add(create_btn).clicked() || submitted {
                             confirmed = true;
@@ -1112,9 +1113,12 @@ fn dialog_ui(
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        let del_btn =
-                            egui::Button::new(egui::RichText::new("移入回收站").color(pal.bg_dark))
-                                .fill(pal.error);
+                        // 危险操作按钮：语义红实底（保留彩色）+ 反相文字
+                        // （accent_fg 对深/浅两套红底均 ≥4.5:1，M3.7b）。
+                        let del_btn = egui::Button::new(
+                            egui::RichText::new("移入回收站").color(pal.accent_fg),
+                        )
+                        .fill(pal.error);
                         if ui.add(del_btn).clicked() {
                             confirmed = true;
                         }

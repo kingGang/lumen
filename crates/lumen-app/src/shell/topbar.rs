@@ -101,13 +101,15 @@ fn avatar_button(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette) ->
     let radius = AVATAR_SIZE / 2.0;
     match profile {
         Some(p) => {
+            // 已登录头像：accent 实底 + 反相首字母（深色主题白底黑字，
+            // 浅色主题近黑底白字——M3.7b 去蓝，与 CTA 按钮同形态）。
             ui.painter().circle_filled(center, radius, pal.accent);
             ui.painter().text(
                 center,
                 egui::Align2::CENTER_CENTER,
                 p.avatar_letter(),
                 egui::FontId::proportional(13.0),
-                pal.bg_dark,
+                pal.accent_fg,
             );
         }
         None => {

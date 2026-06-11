@@ -26,7 +26,7 @@ const MAX_WIDTH: f32 = 320.0;
 /// 提示分级（决定配色与展示时长）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
-    /// 一般信息（青，3 秒）。
+    /// 一般信息（中性白灰/深灰，3 秒；M3.7b 黑白化前为青色）。
     Info,
     /// 警告（黄，5 秒）。
     Warn,
@@ -44,7 +44,8 @@ impl ToastKind {
         }
     }
 
-    /// 分级配色（图标与描边用；色板与终端主题同源，见 shell/theme.rs）。
+    /// 分级配色（图标与描边用；Info 为中性灰阶、Warn/Error 保留
+    /// 语义黄/红，见 shell/theme.rs）。
     fn color(self, pal: &theme::Palette) -> egui::Color32 {
         match self {
             Self::Info => pal.info,

@@ -213,8 +213,9 @@ fn nav(ui: &mut egui::Ui, st: &mut SettingsUiState, pal: &Palette) {
         } else {
             pal.fg_dim
         }))
+        // 选中分类用 selection 档：与 hover 拉开一档（M3.7b 高对比）。
         .fill(if selected {
-            pal.bg_highlight
+            pal.selection
         } else {
             egui::Color32::TRANSPARENT
         })
@@ -241,14 +242,15 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
         let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
         match profile {
             Some(p) => {
-                // 已登录头像：强调色圆底 + 展示名首字母（与顶栏一致）。
+                // 已登录头像：accent 实底 + 反相首字母（与顶栏一致，
+                // M3.7b 黑白化：深色白底黑字 / 浅色近黑底白字）。
                 ui.painter().circle_filled(rect.center(), 22.0, pal.accent);
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     p.avatar_letter(),
                     egui::FontId::proportional(20.0),
-                    pal.bg_dark,
+                    pal.accent_fg,
                 );
             }
             None => {

@@ -51,7 +51,12 @@ pub struct Theme {
     pub background: Rgb,
     pub foreground: Rgb,
     pub cursor: Rgb,
-    /// 选区高亮背景。
+    /// 选区高亮背景（兼作选中命令块的 0.35α 整块淡蒙层，见 lib.rs）。
+    ///
+    /// M3.7b 黑白化：与外壳同向改为中性灰（深 #404040 / 浅 #c6c6c6），
+    /// 原 Tokyo Night 蓝灰是终端画面里最大的蓝色来源。**回退方式**：
+    /// 把两处预设还原为 `Rgb(0x2e, 0x3c, 0x64)`（深）/
+    /// `Rgb(0xb7, 0xc1, 0xe3)`（浅，day bg_visual）即可，无其他联动。
     pub selection: Rgb,
     /// ANSI 16 色（0-7 常规，8-15 高亮）。
     pub ansi: [Rgb; 16],
@@ -63,7 +68,9 @@ impl Default for Theme {
             background: Rgb(0x1a, 0x1b, 0x26),
             foreground: Rgb(0xc0, 0xca, 0xf5),
             cursor: Rgb(0xc0, 0xca, 0xf5),
-            selection: Rgb(0x2e, 0x3c, 0x64),
+            // M3.7b：中性灰选区（原 Tokyo Night 蓝灰 0x2e,0x3c,0x64，
+            // 回退见 selection 字段文档）。
+            selection: Rgb(0x40, 0x40, 0x40),
             ansi: [
                 Rgb(0x15, 0x16, 0x1e), // 黑
                 Rgb(0xf7, 0x76, 0x8e), // 红
@@ -97,15 +104,17 @@ impl Theme {
     /// 色值对齐 folke/tokyonight.nvim 官方 **day** 风格的终端色板
     /// （extras/lua/tokyonight_day.lua 的 `terminal` 表，与
     /// extras/alacritty/tokyonight_day.toml 一致，2026-06 校对）：
-    /// bg = `bg`，fg/cursor = `fg`，selection = `bg_visual`，
-    /// ANSI 0-7 = normal、8-15 = bright（官方亮色为独立调亮值，
-    /// 非 normal 复用）。
+    /// bg = `bg`，fg/cursor = `fg`，ANSI 0-7 = normal、8-15 =
+    /// bright（官方亮色为独立调亮值，非 normal 复用）。selection
+    /// 自 M3.7b 起为黑白化覆盖值（非官方 bg_visual），见字段文档。
     pub fn tokyo_night_light() -> Self {
         Self {
             background: Rgb(0xe1, 0xe2, 0xe7),
             foreground: Rgb(0x37, 0x60, 0xbf),
             cursor: Rgb(0x37, 0x60, 0xbf),
-            selection: Rgb(0xb7, 0xc1, 0xe3),
+            // M3.7b：中性灰选区（原 day bg_visual 0xb7,0xc1,0xe3，
+            // 回退见 selection 字段文档）。
+            selection: Rgb(0xc6, 0xc6, 0xc6),
             ansi: [
                 Rgb(0xb4, 0xb5, 0xb9), // 黑 terminal.black
                 Rgb(0xf5, 0x2a, 0x65), // 红 terminal.red

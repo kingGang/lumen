@@ -280,8 +280,9 @@ pub fn show(
                     out.pane_clicked = Some(i);
                     out.term_clicked = true;
                 }
-                // 焦点窗格指示：多窗格时画 1px accent 边框（单窗格
-                // 不画，满屏边框只是视觉噪音）。
+                // 焦点窗格指示：多窗格时画 1px accent 边框（M3.7b
+                // 起 accent = 纯白/近黑；单窗格不画，满屏边框只是
+                // 视觉噪音）。
                 if pane.focused && input.panes.len() > 1 {
                     ui.painter().rect_stroke(
                         rect,
@@ -438,8 +439,10 @@ fn sidebar_ui(
             continue;
         }
 
+        // 激活条目用 selection 档（控件梯度最高档）：与悬停的
+        // bg_highlight 拉开一档，激活态一眼可辨（M3.7b 高对比）。
         let fill = if entry.active {
-            pal.bg_highlight
+            pal.selection
         } else {
             egui::Color32::TRANSPARENT
         };

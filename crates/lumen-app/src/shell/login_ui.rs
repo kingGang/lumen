@@ -109,8 +109,10 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
             // 任一输入框内按 Enter 等同点击登录按钮。
             let submitted = (email_edit.lost_focus() || pwd_edit.lost_focus())
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // 主操作按钮 = Warp CTA 形态：accent 实底 + 反相文字
+            // （深色主题白底黑字，浅色主题近黑底白字，M3.7b）。
             let login_btn =
-                egui::Button::new(egui::RichText::new("登录").size(13.0).color(pal.bg_dark))
+                egui::Button::new(egui::RichText::new("登录").size(13.0).color(pal.accent_fg))
                     .fill(pal.accent)
                     .min_size(egui::vec2(ui.available_width(), 32.0));
             if ui.add(login_btn).clicked() || submitted {
