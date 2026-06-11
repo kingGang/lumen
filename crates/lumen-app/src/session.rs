@@ -57,6 +57,12 @@ pub struct Tab {
     /// 窗格数推导）。增删窗格时由 main 重置均分（简单正确优先）；
     /// 拖动分隔条调整，随 sessions.json 持久化、重启还原。
     pub layout: PaneLayout,
+    /// 最大化的窗格下标（P14）：Some 时该窗格占满整个终端工作区，
+    /// 其余窗格隐藏（照常后台消化输出、不渲染，同「非激活 tab」
+    /// 闸门）；焦点强制为该窗格。增删窗格自动退出；随 sessions.json
+    /// 持久化、重启保持。不变量：Some(m) 时 m < panes.len()（toggle/
+    /// 增删/恢复路径维护）。
+    pub maximized: Option<usize>,
 }
 
 impl Tab {

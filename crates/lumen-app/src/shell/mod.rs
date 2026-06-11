@@ -78,6 +78,10 @@ pub struct ShellInput<'a> {
     pub panes: &'a [PaneView],
     /// 激活 tab 的窗格比例布局（F7③；本帧快照，main 持有真身）。
     pub layout: layout::PaneLayout,
+    /// 最大化的窗格下标（P14）：Some 时该窗格独占终端工作区，其余
+    /// 窗格本帧不画（矩形占位 NOTHING）；分隔条不显示、拖动换位
+    /// 禁用。main 维护下标合法性，shell 侧仍做防御过滤。
+    pub maximized: Option<usize>,
     /// tab 条目（侧栏列表；顶栏标题取自其中的激活条目）。
     pub tabs: &'a [TabItem],
     /// 登录态（顶栏头像、头像菜单、设置页 Account 三处同源展示）。
@@ -103,14 +107,17 @@ pub struct ShellOutput {
     /// 点击了某窗格标题栏的 ✕（关闭该窗格；F7① 起常驻标题栏，
     /// 单窗格时关闭 = 关整个 tab）。
     pub pane_close: Option<usize>,
+    /// 点击了某窗格标题栏的最大化/还原按钮（P14；多窗格时 ✕ 左侧）：
+    /// main 对该窗格 toggle 最大化（与 Ctrl+Shift+Enter 同语义）。
+    pub pane_maximize: Option<usize>,
     /// 拖动窗格标题栏松手落在另一窗格上：(源窗格, 目标窗格)，请求
     /// 交换两窗格的**内容**（panes 下标互换、布局权重不动——位置
     /// 换、比例格不变；焦点跟随被拖窗格落位。F7②）。落在源格自身
     /// 或所有窗格之外为 None（取消，无副作用）。
     pub pane_swap: Option<(usize, usize)>,
-    /// 各窗格关闭按钮的命中矩形（egui 逻辑坐标，与窗格同序）。
-    /// main.rs 据此让 raw 鼠标路由对 ✕ 让位（不聚焦/不建选区/不交
-    /// 出终端焦点，点击由 egui 侧处理）。
+    /// 各窗格标题栏按钮（✕ 与最大化/还原）的命中矩形（egui 逻辑
+    /// 坐标，仅可见窗格、不保序）。main.rs 据此让 raw 鼠标路由让位
+    /// （不聚焦/不建选区/不交出终端焦点，点击由 egui 侧处理）。
     pub pane_close_rects: Vec<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
@@ -196,6 +203,7 @@ pub fn show(
         term_clicked: false,
         pane_clicked: None,
         pane_close: None,
+        pane_maximize: None,
         pane_swap: None,
         pane_close_rects: Vec::new(),
         new_pane: false,
@@ -349,7 +357,18 @@ pub fn show(
                 uniform_fallback = layout::PaneLayout::uniform(input.panes.len());
                 &uniform_fallback
             };
-            let rects = lay.pane_rects(area);
+            // 最大化（P14）：该窗格独占整个终端工作区，其余窗格矩形
+            // 置 NOTHING 占位（与 panes 保持同序对位，main 按下标跳过
+            // 隐藏窗格的矩形应用/渲染/鼠标路由）。下标防御过滤。
+            let maximized = input.maximized.filter(|&m| m < input.panes.len());
+            let rects = match maximized {
+                Some(m) => {
+                    let mut v = vec![egui::Rect::NOTHING; input.panes.len()];
+                    v[m] = area;
+                    v
+                }
+                None => lay.pane_rects(area),
+            };
             // 标题栏拖动换位的本帧状态（F7②）：拖动中 (源下标, 指针
             // 位置) 驱动视觉反馈；松手 (源下标, 落点) 做换位判定。
             // 在窗格循环里采集、循环后统一处理（落点判定需要全部
@@ -357,6 +376,13 @@ pub fn show(
             let mut title_drag: Option<(usize, egui::Pos2)> = None;
             let mut title_drop: Option<(usize, egui::Pos2)> = None;
             for (i, (pane, rect)) in input.panes.iter().zip(&rects).enumerate() {
+                // 最大化期间的隐藏窗格（P14）：不画、矩形 NOTHING 占位
+                // 保持与 panes 的下标对位（main 据此跳过其矩形应用与
+                // 渲染——后台照常消化输出，同「非激活 tab」闸门）。
+                if maximized.is_some_and(|m| m != i) {
+                    out.pane_rects.push(egui::Rect::NOTHING);
+                    continue;
+                }
                 let rect = rect.round_to_pixels(ppp);
                 // —— 窗格标题栏（F7①）：顶部窄条，左标题右 ✕，占高从
                 // 终端内容区扣除（行数相应减少，沿用矩形→resize 链
@@ -420,6 +446,84 @@ pub fn show(
                 }
                 out.pane_close_rects.push(close_rect);
 
+                // —— 最大化/还原按钮（P14）：✕ 左侧，仅多窗格时显示
+                // （单窗格本就满屏，无最大化语义）。普通态画 ▢（最大
+                // 化），最大化态画 ⧉（双矩形，还原）；painter 画线与
+                // ✕ 同款风格，不赌字体覆盖。命中矩形进 pane_close_rects
+                // 让 raw 鼠标路由让位（同 ✕：点击不聚焦/不建选区）。
+                let mut title_end = close_rect.min.x - 4.0;
+                if input.panes.len() > 1 {
+                    let max_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            close_rect.min.x - 4.0 - PANE_CLOSE_SIZE / 2.0,
+                            title_rect.center().y,
+                        ),
+                        egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                    );
+                    let mresp = ui.interact(
+                        max_rect,
+                        ui.id().with(("pane_maximize", i)),
+                        egui::Sense::click(),
+                    );
+                    {
+                        let painter = ui.painter();
+                        let c = max_rect.center();
+                        if mresp.hovered() {
+                            painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                        }
+                        let stroke =
+                            egui::Stroke::new(1.2, if mresp.hovered() { pal.fg } else { bar_fg });
+                        if maximized.is_some() {
+                            // 还原图标 ⧉：错位双矩形——后框只画露出的
+                            // 上右两边，前框完整（前框底色填充挡住后框
+                            // 重叠段会连 hover 圆底一起盖掉，故改画线）。
+                            let r = 2.5;
+                            let back = egui::Rect::from_center_size(
+                                c + egui::vec2(1.5, -1.5),
+                                egui::vec2(2.0 * r, 2.0 * r),
+                            );
+                            painter.line_segment(
+                                [
+                                    egui::pos2(back.min.x + 2.0, back.min.y),
+                                    egui::pos2(back.max.x, back.min.y),
+                                ],
+                                stroke,
+                            );
+                            painter.line_segment(
+                                [
+                                    egui::pos2(back.max.x, back.min.y),
+                                    egui::pos2(back.max.x, back.max.y - 2.0),
+                                ],
+                                stroke,
+                            );
+                            let front = egui::Rect::from_center_size(
+                                c + egui::vec2(-1.0, 1.0),
+                                egui::vec2(2.0 * r, 2.0 * r),
+                            );
+                            painter.rect_stroke(front, 0.0, stroke, egui::StrokeKind::Middle);
+                        } else {
+                            // 最大化图标 ▢：单矩形描边。
+                            let r = 3.5;
+                            painter.rect_stroke(
+                                egui::Rect::from_center_size(c, egui::vec2(2.0 * r, 2.0 * r)),
+                                0.0,
+                                stroke,
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                    let tip = if maximized.is_some() {
+                        "还原窗格 (Ctrl+Shift+Enter)"
+                    } else {
+                        "最大化窗格 (Ctrl+Shift+Enter)"
+                    };
+                    if mresp.on_hover_text(tip).clicked() {
+                        out.pane_maximize = Some(i);
+                    }
+                    out.pane_close_rects.push(max_rect);
+                    title_end = max_rect.min.x - 4.0;
+                }
+
                 // 标题：左侧单行截断展示；点击标题栏 = 聚焦该窗格，
                 // 拖动标题栏 = 拖起整个窗格换位（F7①②）。点击与拖动
                 // 的仲裁交给 egui 现成语义：按下后移动不超阈值（6 逻辑
@@ -428,7 +532,7 @@ pub fn show(
                 // （截断时可看全）。
                 let title_hit = egui::Rect::from_min_max(
                     title_rect.min,
-                    egui::pos2(close_rect.min.x - 4.0, title_rect.max.y),
+                    egui::pos2(title_end, title_rect.max.y),
                 );
                 let text_rect = egui::Rect::from_min_max(
                     egui::pos2(title_hit.min.x + 8.0, title_hit.min.y),
@@ -453,9 +557,10 @@ pub fn show(
                     out.pane_clicked = Some(i);
                     out.term_clicked = true;
                 }
-                // 拖动换位（F7②）：仅多窗格时有交换对象。悬停标题栏
-                // 给 Grab 光标提示可拖；拖动中/松手的状态循环后处理。
-                if input.panes.len() > 1 {
+                // 拖动换位（F7②）：仅多窗格时有交换对象；最大化期间
+                // 只剩一格可见、无落点，禁用（P14）。悬停标题栏给
+                // Grab 光标提示可拖；拖动中/松手的状态循环后处理。
+                if input.panes.len() > 1 && maximized.is_none() {
                     if tresp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                     }
@@ -493,8 +598,8 @@ pub fn show(
                 }
                 // 焦点窗格指示：多窗格时画 1px accent 边框（整格含
                 // 标题栏；M3.7b 起 accent = 纯白/近黑；单窗格不画，
-                // 满屏边框只是视觉噪音）。
-                if pane.focused && input.panes.len() > 1 {
+                // 满屏边框只是视觉噪音——最大化态同理，P14）。
+                if pane.focused && input.panes.len() > 1 && maximized.is_none() {
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
@@ -514,8 +619,15 @@ pub fn show(
             // 便于抓取，向两侧压住窗格边缘几个像素——interact 注册
             // 晚于窗格（同层后注册者在上），按下优先归分隔条；raw
             // 鼠标路由的让位见 main.rs（divider_rects_px）。
+            // 最大化期间分隔条不显示不可拖（P14：只剩一格，无比例可
+            // 调；divider_rects 留空 = raw 鼠标无让位区）。
+            let dividers = if maximized.is_some() {
+                Vec::new()
+            } else {
+                lay.dividers(area)
+            };
             let hit_w = 8.0f32.max(6.0 / ppp);
-            for (di, div) in lay.dividers(area).iter().enumerate() {
+            for (di, div) in dividers.iter().enumerate() {
                 let vertical = matches!(div.kind, layout::DividerKind::Col { .. });
                 let hit = if vertical {
                     div.rect

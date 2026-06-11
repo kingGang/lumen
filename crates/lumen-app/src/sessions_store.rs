@@ -75,6 +75,10 @@ pub struct TabEntry {
     pub row_weights: Vec<f32>,
     /// 每排内各列宽度权重（同上）。
     pub col_weights: Vec<Vec<f32>>,
+    /// 最大化窗格下标（P14，重启保持）。读侧夹紧：越界（手改文件/
+    /// 恢复时窗格 spawn 失败致数量变化）降级 None；旧文件无字段 →
+    /// serde default None，纯增量可选字段不 bump 版本号。
+    pub maximized: Option<usize>,
 }
 
 /// 旧版平铺条目（M3.6b 格式，仅读侧迁移用）。
@@ -196,6 +200,14 @@ impl SessionsFile {
         for tab in &mut file.tabs {
             tab.panes.truncate(MAX_PANES);
             tab.focused = tab.focused.min(tab.panes.len() - 1);
+            // 最大化下标越界（手改/截断后）降级 None；单窗格无最大化
+            // 语义也归 None（P14）。
+            if tab
+                .maximized
+                .is_some_and(|m| m >= tab.panes.len() || tab.panes.len() == 1)
+            {
+                tab.maximized = None;
+            }
             if tab
                 .custom_title
                 .as_ref()
@@ -300,6 +312,7 @@ mod tests {
                 focused: 2,
                 row_weights: vec![0.3, 0.7],
                 col_weights: vec![vec![0.25, 0.75], vec![0.6, 0.4]],
+                maximized: None,
             }],
             0,
         );
@@ -310,6 +323,48 @@ mod tests {
         assert_eq!(loaded, f);
         assert_eq!(loaded.tabs[0].row_weights, vec![0.3, 0.7]);
         assert_eq!(loaded.tabs[0].col_weights[1], vec![0.6, 0.4]);
+    }
+
+    #[test]
+    fn 最大化下标往返与夹紧() {
+        // P14：maximized 随 tab 条目写盘/读回；越界与单窗格降级 None。
+        let f = SessionsFile::new(
+            vec![TabEntry {
+                panes: vec![pane(None), pane(None), pane(None)],
+                focused: 1,
+                maximized: Some(2),
+                ..Default::default()
+            }],
+            0,
+        );
+        let p = temp_path("maximized_roundtrip");
+        f.save_to(&p).expect("写盘失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs[0].maximized, Some(2));
+
+        // 越界（手改文件）→ None。
+        let p = temp_path("maximized_clamp");
+        std::fs::write(
+            &p,
+            r#"{ "version": 2, "tabs": [ { "panes": [ {}, {} ], "maximized": 9 } ], "active_tab": 0 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs[0].maximized, None, "越界应降级 None");
+
+        // 单窗格无最大化语义 → None；旧文件无字段 → None。
+        let p = temp_path("maximized_single");
+        std::fs::write(
+            &p,
+            r#"{ "version": 2, "tabs": [ { "panes": [ {} ], "maximized": 0 }, { "panes": [ {}, {} ] } ], "active_tab": 0 }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = SessionsFile::load_from(&p).expect("应能加载");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.tabs[0].maximized, None, "单窗格应降级 None");
+        assert_eq!(loaded.tabs[1].maximized, None, "缺字段默认 None");
     }
 
     #[test]

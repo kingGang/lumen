@@ -385,6 +385,11 @@ impl AppState {
         if idx >= tab.panes.len() || idx == tab.focused {
             return;
         }
+        // 最大化期间焦点强制为最大化格（P14）：隐藏窗格的矩形不在
+        // 本帧布局里、正常路径点不到，纯防御（陈旧矩形/竞态）。
+        if tab.maximized.is_some_and(|m| m != idx) {
+            return;
+        }
         // 旧焦点窗格的拖选手势随切焦点结束（与 activate 同理：标志
         // 残留会在切回时产生幽灵拖选）。窗格本身保持可见、渲染计划
         // 与冻结计时是「正在上屏」的活状态，不清。
@@ -467,6 +472,17 @@ impl AppState {
         } else if pi == tab.focused {
             tab.focused = pi.min(tab.panes.len() - 1);
         }
+        // 最大化下标随移除调整（P14）：关最大化格自动退出（其余格
+        // 还原可见）；关它之前的隐藏格（shell 自行退出）下标左移。
+        tab.maximized = match tab.maximized {
+            Some(m) if pi == m => None,
+            Some(m) if pi < m => Some(m - 1),
+            other => other,
+        };
+        // 剩单格无最大化语义（不变量：Some 时必有多格）。
+        if tab.panes.len() == 1 {
+            tab.maximized = None;
+        }
         // 删窗格重置比例为均分（与增窗格同理，F7 拍板）。
         tab.layout = PaneLayout::uniform(tab.panes.len());
         if ti == self.active_tab {
@@ -505,6 +521,7 @@ impl AppState {
                     panes: vec![s],
                     focused: 0,
                     layout: PaneLayout::uniform(1),
+                    maximized: None,
                 });
                 // activate 内部会落盘会话快照（新建是结构性变更）。
                 self.activate(self.tabs.len() - 1);
@@ -550,6 +567,9 @@ impl AppState {
         ) {
             Ok(s) => {
                 let tab = &mut self.tabs[self.active_tab];
+                // 最大化态先自动退出再加格（P14：新格要可见，隐藏着
+                // 加格没有意义）。
+                tab.maximized = None;
                 tab.panes.push(s);
                 tab.focused = tab.panes.len() - 1;
                 // 增窗格重置比例为均分（F7 拍板：简单正确优先——网格
@@ -570,6 +590,53 @@ impl AppState {
                 self.window.request_redraw();
             }
         }
+    }
+
+    /// 最大化/还原激活 tab 的窗格 `pi`（P14：标题栏按钮 /
+    /// Ctrl+Shift+Enter）。已处于最大化态时还原（无论 `pi` 是哪格
+    /// ——可见的只有最大化格，按钮/快捷键都落在它身上）；普通态把
+    /// `pi` 最大化并强制聚焦。布局权重不动：还原即回原比例。
+    fn toggle_maximize_pane(&mut self, pi: usize) {
+        let tab = &mut self.tabs[self.active_tab];
+        if pi >= tab.panes.len() {
+            return; // 防御：结构刚变更的过渡帧
+        }
+        if tab.maximized.is_some() {
+            tab.maximized = None;
+            // 还原后其余窗格的离屏纹理还是隐藏前的旧画面：强制下一帧
+            // 渲染（同 activate 的「超龄欠帧」手法——即使正处同步
+            // 区间也不许把旧帧多留一帧）。
+            for s in &mut tab.panes {
+                s.term_frame_due_since = Some(
+                    Instant::now()
+                        .checked_sub(REDRAW_ABS_CAP)
+                        .unwrap_or_else(Instant::now),
+                );
+            }
+        } else {
+            if tab.panes.len() <= 1 {
+                return; // 单窗格本就满屏，无最大化语义
+            }
+            // 焦点强制为最大化格（旧焦点窗格的拖选手势随切焦点结束，
+            // 与 focus_pane 同理）。
+            tab.panes[tab.focused].selecting = false;
+            tab.focused = pi;
+            tab.maximized = Some(pi);
+            // 隐藏窗格清残留渲染计划（后台消化不再武装新计划，残留
+            // 计划会让 about_to_wait 空打一帧）。
+            for (i, s) in tab.panes.iter_mut().enumerate() {
+                if i != pi {
+                    s.redraw_at = None;
+                    s.redraw_hard_at = None;
+                    s.redraw_abs_at = None;
+                }
+            }
+        }
+        // 布局变化：下一帧 egui 产出新矩形并触发离屏重建 + resize；
+        // 最大化态是持久化状态的一部分（P14，重启保持）。
+        self.update_window_title();
+        self.window.request_redraw();
+        self.persist_sessions();
     }
 
     /// 循环切换激活 tab：dir 为 1（下一个）或 -1（上一个）。
@@ -615,6 +682,8 @@ impl AppState {
                     // 原值（拖动结束/双击复位时由调用时机触发落盘）。
                     row_weights: t.layout.row_weights().to_vec(),
                     col_weights: t.layout.col_weights().to_vec(),
+                    // 最大化态（P14）：toggle 即落盘，重启保持。
+                    maximized: t.maximized,
                 })
                 .collect(),
             self.active_tab,
@@ -785,7 +854,13 @@ impl App {
                     // 整个 tab 的窗格都没起来：跳过该 tab。
                     continue;
                 }
-                let focused = tab_entry.focused.min(panes.len() - 1);
+                // 最大化态还原（P14）：读侧已夹紧，这里再按实际起来的
+                // 窗格数防御（spawn 失败跳窗格会改变数量）；单格无最大
+                // 化语义。最大化期间焦点强制为最大化格。
+                let maximized = tab_entry
+                    .maximized
+                    .filter(|&m| m < panes.len() && panes.len() > 1);
+                let focused = maximized.unwrap_or(tab_entry.focused.min(panes.len() - 1));
                 // 布局比例还原（F7 持久化）：保存的权重形状须与实际
                 // 起来的窗格数一致（spawn 失败跳窗格会改变数量）且
                 // 数值合法，否则回退均分（旧 v2 无字段也走这条路）。
@@ -806,6 +881,7 @@ impl App {
                     panes,
                     focused,
                     layout,
+                    maximized,
                 });
                 next_tab_id += 1;
             }
@@ -833,6 +909,7 @@ impl App {
                 )?],
                 focused: 0,
                 layout: PaneLayout::uniform(1),
+                maximized: None,
             });
             next_session_id += 1;
             next_tab_id += 1;
@@ -995,6 +1072,11 @@ impl ApplicationHandler<PtyWake> for App {
                 continue;
             }
             let visible = ti == active_tab;
+            // 最大化期间被隐藏的激活 tab 窗格（P14）：照常消化与回写
+            // （下方），但不参与渲染调度（同「后台 tab 不渲染」闸门）；
+            // 也不标未读点——所属 tab 本身可见，激活态下挂未读点既
+            // 矛盾也无法被 activate() 清除。
+            let hidden_by_max = visible && state.tabs[ti].maximized.is_some_and(|m| m != pi);
             let s = &mut state.tabs[ti].panes[pi];
             // 终端应答（DSR/DA/DECRQM 等）回写给 shell。
             let resp = s.term.take_responses();
@@ -1016,6 +1098,9 @@ impl ApplicationHandler<PtyWake> for App {
                     s.has_unseen_output = true;
                     needs_shell_redraw = true;
                 }
+                continue;
+            }
+            if hidden_by_max {
                 continue;
             }
             if pi == focused {
@@ -1332,6 +1417,14 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                             return;
                         }
+                    }
+                    // Ctrl+Shift+Enter：最大化/还原焦点窗格（P14；守卫
+                    // 与 Ctrl+Shift+D/W 一致——含 alt screen 全局拦截，
+                    // 裁决同款：全屏 TUI 几乎不绑 Ctrl+Shift+Enter）。
+                    if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
+                        let pi = state.tabs[state.active_tab].focused;
+                        state.toggle_maximize_pane(pi);
+                        return;
                     }
                 }
                 if pressed
@@ -1699,6 +1792,15 @@ impl ApplicationHandler<PtyWake> for App {
                                 .is_none_or(|d| render_t0.duration_since(d) < REDRAW_ABS_CAP)
                     })
                     .collect();
+                // 最大化期间其余窗格无条件跳过渲染（P14：不可见，纹理
+                // 不上屏；后台照常消化输出，还原/重启时强制补帧）。
+                if let Some(m) = state.tabs[state.active_tab].maximized {
+                    for (i, skip) in skip_pane.iter_mut().enumerate() {
+                        if i != m {
+                            *skip = true;
+                        }
+                    }
+                }
 
                 for (i, s) in state.tabs[state.active_tab].panes.iter_mut().enumerate() {
                     if skip_pane[i] {
@@ -1823,6 +1925,7 @@ impl ApplicationHandler<PtyWake> for App {
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
+                    maximized: tab.maximized,
                     tabs: &entries,
                     profile: state.profile.as_ref(),
                     cwd: active_cwd.as_deref(),
@@ -1924,6 +2027,11 @@ impl ApplicationHandler<PtyWake> for App {
                         return; // 不再呈现本帧（应用退出中）
                     }
                 }
+                // —— 窗格最大化/还原（P14）：标题栏按钮（与
+                // Ctrl+Shift+Enter 同语义，toggle 内部含下标防御）。
+                if let Some(pi) = shell_out.pane_maximize {
+                    state.toggle_maximize_pane(pi);
+                }
 
                 // —— 拖动标题栏换位（F7②）：交换两窗格在 panes 中的
                 // 下标——交换的是格子里的「内容」（Session），格子的
@@ -1935,7 +2043,12 @@ impl ApplicationHandler<PtyWake> for App {
                 // 瞬态）。
                 if let Some((src, dst)) = shell_out.pane_swap {
                     let tab = &mut state.tabs[state.active_tab];
-                    if src != dst && src < tab.panes.len() && dst < tab.panes.len() {
+                    // 最大化期间换位禁用（P14；UI 侧已不发拖动，纯防御）。
+                    if src != dst
+                        && src < tab.panes.len()
+                        && dst < tab.panes.len()
+                        && tab.maximized.is_none()
+                    {
                         tab.panes.swap(src, dst);
                         if tab.focused == src {
                             tab.focused = dst;
@@ -2216,13 +2329,14 @@ impl ApplicationHandler<PtyWake> for App {
                     state.layout_apply_logged = true;
                     let t = &state.tabs[state.active_tab];
                     info!(
-                        "外壳布局应用：侧栏宽 {:.1}（设置 {:.1}）文件树宽 {:?}（设置 {:.1}）窗格权重 rows={:?} cols={:?}",
+                        "外壳布局应用：侧栏宽 {:.1}（设置 {:.1}）文件树宽 {:?}（设置 {:.1}）窗格权重 rows={:?} cols={:?} 最大化={:?}",
                         shell_out.sidebar_width,
                         state.settings.layout.sidebar_width,
                         shell_out.filetree_width,
                         state.settings.layout.filetree_width,
                         t.layout.row_weights(),
                         t.layout.col_weights(),
+                        t.maximized,
                     );
                 }
                 let structure_unchanged = state.tabs.get(state.active_tab).is_some_and(|t| {
@@ -2257,6 +2371,16 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.pane_rects_px.clear();
                     for (i, r) in shell_out.pane_rects.iter().enumerate() {
+                        // 最大化期间的隐藏窗格（P14）：shell 侧矩形为
+                        // NOTHING 占位——不重建离屏/不 resize（保持隐藏
+                        // 前的网格，后台输出按原尺寸消化）、不进鼠标/IME
+                        // 路由表。
+                        if state.tabs[state.active_tab]
+                            .maximized
+                            .is_some_and(|m| m != i)
+                        {
+                            continue;
+                        }
                         let x0 = (r.min.x * ppp).round();
                         let y0 = (r.min.y * ppp).round();
                         let x1 = (r.max.x * ppp).round();
