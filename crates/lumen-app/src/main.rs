@@ -19,6 +19,7 @@ use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
 use lumen_term::{SelPoint, Selection};
 use session::{Session, SessionId, Tab, TabId, MAX_PANES};
+use shell::layout::{DividerKind, PaneLayout};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -159,6 +160,11 @@ struct AppState {
     /// 时非空），来自最近一帧 egui 布局。raw 鼠标路由对它让位：✕ 的
     /// 点击由 egui 处理（pane_close 动作），按下不聚焦/不建选区。
     pane_close_rects_px: Vec<(f32, f32, f32, f32)>,
+    /// 各分隔条命中矩形（物理像素 x/y/w/h；F7③），来自最近一帧
+    /// egui 布局。raw 鼠标路由对它让位：按下不聚焦/不建选区、不交出
+    /// 终端焦点（调完比例接着打字不该断流），拖动与双击由 egui 侧
+    /// 处理（divider_drag / divider_reset）。
+    divider_rects_px: Vec<(f32, f32, f32, f32)>,
     /// 终端是否持有键盘/IME 焦点：点击终端区 true、点击 egui 面板
     /// false。egui 不会为非控件区域持焦点，键盘与 IME 路由全靠它。
     terminal_focused: bool,
@@ -219,6 +225,11 @@ impl AppState {
         if self.mouse_on_pane_close() {
             return None;
         }
+        // 分隔条命中区让位（F7③）：分隔条上的按下是调比例的开始，
+        // 不算「在窗格上」（拖动由 egui 侧处理）。
+        if self.mouse_on_pane_divider() {
+            return None;
+        }
         let (mx, my) = self.mouse_pos;
         let (sid, _) = self.pane_rects_px.iter().find(|(_, (x, y, w, h))| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
@@ -243,6 +254,14 @@ impl AppState {
     fn mouse_on_pane_close(&self) -> bool {
         let (mx, my) = self.mouse_pos;
         self.pane_close_rects_px.iter().any(|(x, y, w, h)| {
+            mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
+        })
+    }
+
+    /// 鼠标当前位置是否落在某个分隔条命中区上（上一帧布局，F7③）。
+    fn mouse_on_pane_divider(&self) -> bool {
+        let (mx, my) = self.mouse_pos;
+        self.divider_rects_px.iter().any(|(x, y, w, h)| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
         })
     }
@@ -410,6 +429,8 @@ impl AppState {
         } else if pi == tab.focused {
             tab.focused = pi.min(tab.panes.len() - 1);
         }
+        // 删窗格重置比例为均分（与增窗格同理，F7 拍板）。
+        tab.layout = PaneLayout::uniform(tab.panes.len());
         if ti == self.active_tab {
             // 可见窗格布局变化 + 标题可能跟随新焦点窗格；后台 tab 关
             // 窗格也要重绘侧栏（未读点可能随窗格消失），统一请求。
@@ -445,6 +466,7 @@ impl AppState {
                     custom_title: None,
                     panes: vec![s],
                     focused: 0,
+                    layout: PaneLayout::uniform(1),
                 });
                 // activate 内部会落盘会话快照（新建是结构性变更）。
                 self.activate(self.tabs.len() - 1);
@@ -492,6 +514,9 @@ impl AppState {
                 let tab = &mut self.tabs[self.active_tab];
                 tab.panes.push(s);
                 tab.focused = tab.panes.len() - 1;
+                // 增窗格重置比例为均分（F7 拍板：简单正确优先——网格
+                // 结构随数量变化，旧权重的形状已不适用）。
+                tab.layout = PaneLayout::uniform(tab.panes.len());
                 // 布局变化：下一帧 egui 产出新窗格矩形并触发逐窗格
                 // 离屏重建 + term/pty resize。
                 self.update_window_title();
@@ -707,11 +732,16 @@ impl App {
                     continue;
                 }
                 let focused = tab_entry.focused.min(panes.len() - 1);
+                // 布局比例还原（F7 持久化）：保存的权重形状须与实际
+                // 起来的窗格数一致（spawn 失败跳窗格会改变数量），
+                // 否则回退均分。
+                let layout = PaneLayout::uniform(panes.len());
                 tabs.push(Tab {
                     id: next_tab_id,
                     custom_title: tab_entry.custom_title.clone(),
                     panes,
                     focused,
+                    layout,
                 });
                 next_tab_id += 1;
             }
@@ -738,6 +768,7 @@ impl App {
                     None,
                 )?],
                 focused: 0,
+                layout: PaneLayout::uniform(1),
             });
             next_session_id += 1;
             next_tab_id += 1;
@@ -782,6 +813,7 @@ impl App {
             pending_tex_free: Vec::new(),
             pane_rects_px: Vec::new(),
             pane_close_rects_px: Vec::new(),
+            divider_rects_px: Vec::new(),
             terminal_focused: true,
             egui_repaint_at: None,
             was_popup_open: false,
@@ -1444,6 +1476,12 @@ impl ApplicationHandler<PtyWake> for App {
                     if state.mouse_on_pane_close() {
                         return;
                     }
+                    // 按在分隔条上：拖动调比例由 egui 侧处理（F7③，
+                    // divider_drag），这里不聚焦/不建选区，也不交出
+                    // 终端焦点——调完比例接着打字不该断流。
+                    if state.mouse_on_pane_divider() {
+                        return;
+                    }
                     // 焦点仲裁（F5）：点击窗格聚焦该窗格 + 终端拿键盘/
                     // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
                     let Some(pi) = state.pane_under_mouse() else {
@@ -1683,6 +1721,7 @@ impl ApplicationHandler<PtyWake> for App {
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
+                    layout: tab.layout.clone(),
                     tabs: &entries,
                     profile: state.profile.as_ref(),
                     cwd: active_cwd.as_deref(),
@@ -1783,6 +1822,42 @@ impl ApplicationHandler<PtyWake> for App {
                         event_loop.exit();
                         return; // 不再呈现本帧（应用退出中）
                     }
+                }
+
+                // —— 分隔条调比例（F7③）：拖动把边界拖到指针处（实时
+                // 生效——比例变化下一帧产出新矩形，沿用「矩形变化 →
+                // 离屏重建 + term/pty resize」既有链路；拖动重绘已被
+                // 事件驱动的 8ms 合帧下限节流）；双击恢复该方向均分。
+                // 下标对应 run_ui 时的布局，结构同帧变更时由 layout
+                // 侧的越界检查兜底（不施加、不 panic）。
+                if let Some(kind) = shell_out.divider_reset {
+                    let tab = &mut state.tabs[state.active_tab];
+                    let changed = match kind {
+                        DividerKind::Row(_) => tab.layout.reset_rows(),
+                        DividerKind::Col { row, .. } => tab.layout.reset_cols(row),
+                    };
+                    if changed {
+                        state.window.request_redraw();
+                        // 双击复位与拖动结束同义：比例落盘（F7 持久化）。
+                        state.persist_sessions();
+                    }
+                } else if let Some((kind, pos)) = shell_out.divider_drag {
+                    let area = shell_out.term_rect;
+                    let tab = &mut state.tabs[state.active_tab];
+                    let changed = match kind {
+                        DividerKind::Row(idx) => tab.layout.drag_row_to(idx, pos.y, area),
+                        DividerKind::Col { row, idx } => {
+                            tab.layout.drag_col_to(row, idx, pos.x, area)
+                        }
+                    };
+                    if changed {
+                        state.window.request_redraw();
+                    }
+                }
+                if shell_out.divider_drag_ended {
+                    // 拖动结束才落盘（拖动中不写）；快照一致时内部
+                    // 自动跳过。
+                    state.persist_sessions();
                 }
 
                 // —— 覆盖层（设置页/登录页）焦点路由：先处理关闭再处理
@@ -1952,6 +2027,17 @@ impl ApplicationHandler<PtyWake> for App {
                     state.pane_close_rects_px.clear();
                     for r in &shell_out.pane_close_rects {
                         state.pane_close_rects_px.push((
+                            r.min.x * ppp,
+                            r.min.y * ppp,
+                            r.width() * ppp,
+                            r.height() * ppp,
+                        ));
+                    }
+                    // 分隔条命中区（F7③）：raw 鼠标路由的让位判定用
+                    // （mouse_on_pane_divider）。
+                    state.divider_rects_px.clear();
+                    for r in &shell_out.divider_rects {
+                        state.divider_rects_px.push((
                             r.min.x * ppp,
                             r.min.y * ppp,
                             r.width() * ppp,

@@ -69,6 +69,8 @@ pub struct PaneView {
 pub struct ShellInput<'a> {
     /// 激活 tab 的窗格（布局顺序：先上排后下排、行内自左向右）。
     pub panes: &'a [PaneView],
+    /// 激活 tab 的窗格比例布局（F7③；本帧快照，main 持有真身）。
+    pub layout: layout::PaneLayout,
     /// tab 条目（侧栏列表；顶栏标题取自其中的激活条目）。
     pub tabs: &'a [TabItem],
     /// 登录态（顶栏头像、头像菜单、设置页 Account 三处同源展示）。
@@ -98,6 +100,16 @@ pub struct ShellOutput {
     pub pane_close_rects: Vec<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
+    /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
+    /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
+    pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
+    /// 分隔条拖动本帧结束（main 落盘比例，F7 持久化）。
+    pub divider_drag_ended: bool,
+    /// 双击了分隔条：该方向恢复均分（列分隔=该排列宽、排分隔=排高）。
+    pub divider_reset: Option<layout::DividerKind>,
+    /// 各分隔条命中矩形（egui 逻辑坐标）。main 据此让 raw 鼠标路由
+    /// 让位：按下不聚焦/不建选区/不交出终端焦点（拖动由 egui 处理）。
+    pub divider_rects: Vec<egui::Rect>,
     /// 点击了某 tab 条目（切换激活）。
     pub activate: Option<u64>,
     /// 请求关闭某 tab（右键菜单）。
@@ -160,6 +172,10 @@ pub fn show(
         pane_close: None,
         pane_close_rects: Vec::new(),
         new_pane: false,
+        divider_drag: None,
+        divider_drag_ended: false,
+        divider_reset: None,
+        divider_rects: Vec::new(),
         activate: None,
         close: None,
         rename: None,
@@ -263,8 +279,17 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
-            // 分屏布局（F5）：固定均分 1~6 格，窗格各自一张离屏纹理。
-            let rects = layout::pane_rects(input.panes.len(), area);
+            // 分屏布局（F5/F7③）：网格结构固定、比例可调（权重挂
+            // Tab，main 传入本帧快照）；布局与窗格数不符（防御：结构
+            // 刚变更的过渡帧）时退回均分。
+            let uniform_fallback;
+            let lay = if input.layout.pane_count() == input.panes.len() {
+                &input.layout
+            } else {
+                uniform_fallback = layout::PaneLayout::uniform(input.panes.len());
+                &uniform_fallback
+            };
+            let rects = lay.pane_rects(area);
             for (i, (pane, rect)) in input.panes.iter().zip(&rects).enumerate() {
                 let rect = rect.round_to_pixels(ppp);
                 if let Some(tex) = pane.tex {
@@ -333,6 +358,65 @@ pub fn show(
                     out.pane_close_rects.push(close_rect);
                 }
                 out.pane_rects.push(rect);
+            }
+
+            // —— 分隔条（F7③ + P11 一体）：可视 1px 灰阶细线 + 加宽
+            // 命中区。hover/拖动变 resize 光标；拖动把相邻两格/两排的
+            // 边界拖到指针处（实时生效，main 施加权重）；双击恢复该
+            // 方向均分。命中区比可视线宽（≥8 逻辑点且 ≥6 物理像素）
+            // 便于抓取，向两侧压住窗格边缘几个像素——interact 注册
+            // 晚于窗格（同层后注册者在上），按下优先归分隔条；raw
+            // 鼠标路由的让位见 main.rs（divider_rects_px）。
+            let hit_w = 8.0f32.max(6.0 / ppp);
+            for (di, div) in lay.dividers(area).iter().enumerate() {
+                let vertical = matches!(div.kind, layout::DividerKind::Col { .. });
+                let hit = if vertical {
+                    div.rect
+                        .expand2(egui::vec2((hit_w - div.rect.width()).max(0.0) / 2.0, 0.0))
+                } else {
+                    div.rect
+                        .expand2(egui::vec2(0.0, (hit_w - div.rect.height()).max(0.0) / 2.0))
+                };
+                let resp = ui.interact(
+                    hit,
+                    ui.id().with(("pane_divider", di)),
+                    egui::Sense::click_and_drag(),
+                );
+                let icon = if vertical {
+                    egui::CursorIcon::ResizeHorizontal
+                } else {
+                    egui::CursorIcon::ResizeVertical
+                };
+                // 拖动中指针可能滑出命中区：dragged 期间也保持光标。
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(icon);
+                }
+                if resp.double_clicked() {
+                    out.divider_reset = Some(div.kind);
+                } else if resp.dragged() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        out.divider_drag = Some((div.kind, p));
+                    }
+                }
+                if resp.drag_stopped() {
+                    out.divider_drag_ended = true;
+                }
+                // 可视线：1 物理像素，居中于间隙、像素对齐（色值取
+                // 黑白色板的分隔档 bg_highlight，P11）。
+                let line = if vertical {
+                    egui::Rect::from_center_size(
+                        div.rect.center(),
+                        egui::vec2(1.0 / ppp, div.rect.height()),
+                    )
+                } else {
+                    egui::Rect::from_center_size(
+                        div.rect.center(),
+                        egui::vec2(div.rect.width(), 1.0 / ppp),
+                    )
+                };
+                ui.painter()
+                    .rect_filled(line.round_to_pixels(ppp), 0.0, pal.bg_highlight);
+                out.divider_rects.push(hit);
             }
         });
 

@@ -21,6 +21,7 @@ use lumen_pty::{PtyEvent, PtySession};
 use lumen_term::{Selection, Terminal};
 use winit::event_loop::EventLoopProxy;
 
+use crate::shell::layout::PaneLayout;
 use crate::PtyWake;
 
 /// 会话唯一标识。自增分配、关闭后不复用——退出列表/侧栏动作等按
@@ -52,6 +53,10 @@ pub struct Tab {
     /// 焦点窗格在 `panes` 中的下标。增删窗格时由调用方维护合法性，
     /// 访问器仍做防御夹紧。
     pub focused: usize,
+    /// 窗格比例布局（F7③：每排高度权重 + 排内列宽权重，网格结构由
+    /// 窗格数推导）。增删窗格时由 main 重置均分（简单正确优先）；
+    /// 拖动分隔条调整，随 sessions.json 持久化、重启还原。
+    pub layout: PaneLayout,
 }
 
 impl Tab {
