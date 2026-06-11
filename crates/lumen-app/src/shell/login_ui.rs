@@ -5,6 +5,7 @@
 //! 期间键盘归 egui（main 把终端聚焦布尔置 false），Esc / ✕ 关闭，
 //! 关闭后焦点与 IME 复位链路与设置页同款。真账号后端 M5 接入。
 
+use crate::i18n;
 use crate::profile::{self, Profile};
 
 use super::theme::Palette;
@@ -72,6 +73,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                 }
             });
 
+            let s = i18n::strings();
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new("Lumen")
@@ -81,7 +83,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                 );
                 ui.add_space(2.0);
                 ui.label(
-                    egui::RichText::new("登录（本地模拟，真账号后续版本接入）")
+                    egui::RichText::new(s.login_subtitle)
                         .size(11.0)
                         .color(pal.fg_dim),
                 );
@@ -90,7 +92,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
 
             let email_edit = ui.add(
                 egui::TextEdit::singleline(&mut st.email)
-                    .hint_text("邮箱")
+                    .hint_text(s.login_email_hint)
                     .desired_width(f32::INFINITY),
             );
             if st.focus_email {
@@ -101,7 +103,7 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
             let pwd_edit = ui.add(
                 egui::TextEdit::singleline(&mut st.password)
                     .password(true)
-                    .hint_text("密码")
+                    .hint_text(s.login_password_hint)
                     .desired_width(f32::INFINITY),
             );
             ui.add_space(14.0);
@@ -111,17 +113,21 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
             // 主操作按钮 = Warp CTA 形态：accent 实底 + 反相文字
             // （深色主题白底黑字，浅色主题近黑底白字，M3.7b）。
-            let login_btn =
-                egui::Button::new(egui::RichText::new("登录").size(13.0).color(pal.accent_fg))
-                    .fill(pal.accent)
-                    .min_size(egui::vec2(ui.available_width(), 32.0));
+            let login_btn = egui::Button::new(
+                egui::RichText::new(s.login_btn)
+                    .size(13.0)
+                    .color(pal.accent_fg),
+            )
+            .fill(pal.accent)
+            .min_size(egui::vec2(ui.available_width(), 32.0));
             if ui.add(login_btn).clicked() || submitted {
                 match profile::mock_login(&st.email, &st.password) {
                     Ok(p) => {
                         st.error = None;
                         out.logged_in = Some(p);
                     }
-                    Err(msg) => st.error = Some(msg),
+                    // 错误枚举化（F6）：UI 侧调 message() 取当前语言文案。
+                    Err(e) => st.error = Some(e.message().to_owned()),
                 }
             }
             if let Some(err) = &st.error {

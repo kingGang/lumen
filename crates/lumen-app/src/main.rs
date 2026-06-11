@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod background;
+mod i18n;
 mod input;
 mod profile;
 mod session;
@@ -457,7 +458,7 @@ impl AppState {
                 log::error!("背景图加载失败：{e}");
                 self.shell_state.toast.push(
                     shell::toast::ToastKind::Error,
-                    format!("背景图加载失败：{e}"),
+                    i18n::fmt1(i18n::strings().toast_bg_load_failed_fmt, &e),
                 );
                 // 加载失败 = 本次运行禁用背景图（不改写 settings）。
                 self.renderer.set_transparent_background(false);
@@ -805,7 +806,7 @@ impl AppState {
         if self.tabs[self.active_tab].panes.len() >= MAX_PANES {
             self.shell_state.toast.push(
                 shell::toast::ToastKind::Warn,
-                format!("每个会话最多 {MAX_PANES} 个窗格"),
+                i18n::fmt1(i18n::strings().toast_max_panes_fmt, MAX_PANES),
             );
             // push 不在 egui 帧内：请求一帧立即显示。
             self.window.request_redraw();
@@ -887,9 +888,10 @@ impl AppState {
             }
             Err(e) => {
                 error!("新建窗格失败: {e:#}");
-                self.shell_state
-                    .toast
-                    .push(shell::toast::ToastKind::Error, format!("新建窗格失败：{e}"));
+                self.shell_state.toast.push(
+                    shell::toast::ToastKind::Error,
+                    i18n::fmt1(i18n::strings().toast_new_pane_failed_fmt, &e),
+                );
                 self.window.request_redraw();
             }
         }
@@ -1063,6 +1065,8 @@ impl App {
 
         // —— 设置加载与应用（settings.json；缺失/损坏降级默认值）——
         let app_settings = settings::Settings::load();
+        // F6 多语言：启动后立即将全局语言设为设置中存储的语言。
+        i18n::set_language(app_settings.language);
         // 系统深浅模式（P12 Sync with OS）：winit 报不出来（None）按
         // 深色处理——默认主题即深色；后续变化经 ThemeChanged 事件维护。
         let os_dark = !matches!(window.theme(), Some(winit::window::Theme::Light));
@@ -1335,7 +1339,7 @@ impl App {
         if stale_cwd > 0 {
             state.shell_state.toast.push(
                 shell::toast::ToastKind::Warn,
-                format!("{stale_cwd} 个会话的保存目录已失效，已回退默认目录"),
+                i18n::fmt1(i18n::strings().toast_stale_cwd_fmt, stale_cwd),
             );
         }
         // 启动时加载背景图（P13）：enabled 且有 path 时解码上传 GPU。
@@ -2338,7 +2342,9 @@ impl ApplicationHandler<PtyWake> for App {
                                 let t = p.term.title();
                                 (!t.is_empty()).then(|| t.to_owned())
                             })
-                            .unwrap_or_else(|| format!("窗格 {}", i + 1));
+                            .unwrap_or_else(|| {
+                                i18n::fmt1(i18n::strings().pane_default_name_fmt, i + 1)
+                            });
                         shell::PaneView {
                             tex: state.pane_textures.get(&p.id).copied(),
                             focused: i == tab.focused,
@@ -2593,7 +2599,13 @@ impl ApplicationHandler<PtyWake> for App {
                         .reconfigure_font(&ap.font_family, ap.font_size);
                     state.shell_state.settings.font_hint = (!ap.font_family.is_empty()
                         && !actual.eq_ignore_ascii_case(&ap.font_family))
-                    .then(|| format!("系统中未找到「{}」，已回退「{actual}」", ap.font_family));
+                    .then(|| {
+                        i18n::fmt2(
+                            i18n::strings().toast_font_fallback_fmt,
+                            &ap.font_family,
+                            &actual,
+                        )
+                    });
                 }
                 if shell_out.settings_theme_changed {
                     // 主题即时生效（P12 画廊点选/槽位变更/Sync 开关
@@ -2613,14 +2625,15 @@ impl ApplicationHandler<PtyWake> for App {
                 let need_save = shell_out.settings_font_changed
                     || shell_out.settings_theme_changed
                     || shell_out.settings_background_image_changed
-                    || shell_out.settings_background_params_changed;
+                    || shell_out.settings_background_params_changed
+                    || shell_out.settings_language_changed;
                 if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
                     // 弹 toast：用户以为改完即存，静默丢失重启才发现。
                     if let Some(err) = state.settings.save() {
                         state.shell_state.toast.push(
                             shell::toast::ToastKind::Error,
-                            format!("设置保存失败：{err}"),
+                            i18n::fmt1(i18n::strings().toast_settings_save_failed_fmt, &err),
                         );
                         // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                         state.window.request_redraw();
@@ -2635,7 +2648,7 @@ impl ApplicationHandler<PtyWake> for App {
                     info!("登录成功（mock）：{} <{}>", p.display_name, p.email);
                     state.shell_state.toast.push(
                         shell::toast::ToastKind::Info,
-                        format!("已登录：{}", p.display_name),
+                        i18n::fmt1(i18n::strings().toast_logged_in_fmt, &p.display_name),
                     );
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
@@ -2693,16 +2706,16 @@ impl ApplicationHandler<PtyWake> for App {
                         Some(Ok(()))
                     );
                     if ok {
-                        state
-                            .shell_state
-                            .toast
-                            .push(shell::toast::ToastKind::Info, format!("已复制：{text}"));
+                        state.shell_state.toast.push(
+                            shell::toast::ToastKind::Info,
+                            i18n::fmt1(i18n::strings().toast_copied_fmt, &text),
+                        );
                     } else {
                         error!("写剪贴板失败（复制路径）");
-                        state
-                            .shell_state
-                            .toast
-                            .push(shell::toast::ToastKind::Error, "复制失败：剪贴板不可用");
+                        state.shell_state.toast.push(
+                            shell::toast::ToastKind::Error,
+                            i18n::strings().toast_copy_failed,
+                        );
                     }
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();

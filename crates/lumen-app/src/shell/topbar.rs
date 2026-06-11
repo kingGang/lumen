@@ -12,6 +12,7 @@
 //! 浮于终端内容上的按钮会遮挡输出且与选区/右键粘贴冲突。UI 只产出
 //! 动作（[`TopbarOutput`]），登录/登出与设置页打开/增窗格由上层执行。
 
+use crate::i18n;
 use crate::profile::Profile;
 use crate::session::MAX_PANES;
 
@@ -77,10 +78,11 @@ pub fn show(
                 let plus =
                     egui::Button::new(egui::RichText::new("＋").size(15.0).color(pal.fg_dim))
                         .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
+                let s = i18n::strings();
                 let presp = ui
                     .add_enabled(pane_count < MAX_PANES, plus)
-                    .on_hover_text("新增窗格 (Ctrl+Shift+D)")
-                    .on_disabled_hover_text(format!("最多 {MAX_PANES} 个窗格"));
+                    .on_hover_text(s.topbar_new_pane_tip)
+                    .on_disabled_hover_text(i18n::fmt1(s.topbar_max_panes_fmt, MAX_PANES));
                 if presp.clicked() {
                     out.new_pane = true;
                 }
@@ -92,8 +94,8 @@ pub fn show(
                         .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
                 let rresp = ui
                     .add_enabled(pane_count > 1, reset)
-                    .on_hover_text("恢复窗格默认大小")
-                    .on_disabled_hover_text("单窗格无需复位");
+                    .on_hover_text(s.topbar_reset_tip)
+                    .on_disabled_hover_text(s.topbar_reset_disabled_tip);
                 if rresp.clicked() {
                     out.reset_layout = true;
                 }
@@ -144,11 +146,15 @@ fn avatar_button(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette) ->
         ui.painter()
             .circle_stroke(center, radius, egui::Stroke::new(1.5, pal.fg_dim));
     }
-    resp.on_hover_text(profile.map_or_else(|| "未登录".to_owned(), |p| p.email.clone()))
+    resp.on_hover_text(profile.map_or_else(
+        || i18n::strings().topbar_not_logged_in.to_owned(),
+        |p| p.email.clone(),
+    ))
 }
 
 /// 下拉菜单内容（参照截图，按登录态二选一）。
 fn menu_ui(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut TopbarOutput) {
+    let s = i18n::strings();
     match profile {
         Some(p) => {
             // 首行展示名：灰字不可点（参照截图 Jimhy Liu 行）。
@@ -156,32 +162,32 @@ fn menu_ui(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
                 false,
                 egui::Button::new(egui::RichText::new(&p.display_name).color(pal.fg_dim)),
             );
-            if ui.button("Settings").clicked() {
+            if ui.button(s.menu_settings).clicked() {
                 out.open_settings = true;
                 ui.close();
             }
-            if ui.button("Keyboard shortcuts").clicked() {
+            if ui.button(s.menu_keyboard_shortcuts).clicked() {
                 out.open_shortcuts = true;
                 ui.close();
             }
             // Documentation 灰显占位（本期无文档站，§7 不做清单）。
-            ui.add_enabled(false, egui::Button::new("Documentation"));
+            ui.add_enabled(false, egui::Button::new(s.menu_documentation));
             ui.separator();
-            if ui.button("Log out").clicked() {
+            if ui.button(s.menu_log_out).clicked() {
                 out.log_out = true;
                 ui.close();
             }
         }
         None => {
-            if ui.button("Log in").clicked() {
+            if ui.button(s.menu_log_in).clicked() {
                 out.open_login = true;
                 ui.close();
             }
-            if ui.button("Settings").clicked() {
+            if ui.button(s.menu_settings).clicked() {
                 out.open_settings = true;
                 ui.close();
             }
-            if ui.button("Keyboard shortcuts").clicked() {
+            if ui.button(s.menu_keyboard_shortcuts).clicked() {
                 out.open_shortcuts = true;
                 ui.close();
             }

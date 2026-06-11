@@ -8,6 +8,7 @@
 //! Esc / 右上角 ✕ 关闭。设置页打开期间 PTY 消化与终端渲染照常进行
 //! ——覆盖层只是 UI 层。
 
+use crate::i18n::{self, Language};
 use crate::profile::Profile;
 use crate::settings::{self, Settings};
 
@@ -41,18 +42,19 @@ const FONT_PRESETS: &[&str] = &[
     "Source Code Pro",
 ];
 
-/// 快捷键说明（表驱动的只读列表；新增快捷键在此补一行）。
-const SHORTCUTS: &[(&str, &str)] = &[
-    ("Ctrl+T", "新建会话"),
-    ("Ctrl+W", "关闭当前会话"),
-    ("Ctrl+Tab / Ctrl+Shift+Tab", "下一个 / 上一个会话"),
-    ("Ctrl+B", "文件树开合"),
-    ("Ctrl+,", "打开 / 关闭设置"),
-    ("Ctrl+↑ / Ctrl+↓", "命令块间跳转"),
-    ("Ctrl+C", "复制选区或选中块输出；无选择时发送中断"),
-    ("Ctrl+V / Shift+Insert", "粘贴"),
-    ("Shift+PgUp / PgDn", "上下翻屏"),
-    ("Esc", "关闭设置页"),
+/// 快捷键表（键位列固定不翻；说明列通过 i18n 表取值）。
+/// 元组：(键位字符串, Strings 字段取值闭包)。
+const SHORTCUT_KEYS: &[&str] = &[
+    "Ctrl+T",
+    "Ctrl+W",
+    "Ctrl+Tab / Ctrl+Shift+Tab",
+    "Ctrl+B",
+    "Ctrl+,",
+    "Ctrl+↑ / Ctrl+↓",
+    "Ctrl+C",
+    "Ctrl+V / Shift+Insert",
+    "Shift+PgUp / PgDn",
+    "Esc",
 ];
 
 /// 设置页分类。
@@ -73,13 +75,14 @@ impl Category {
         Self::About,
     ];
 
-    /// 导航与标题文案（对标 Warp 用英文分类名）。
+    /// 导航与标题文案（从 i18n 表读取）。
     fn label(self) -> &'static str {
+        let s = i18n::strings();
         match self {
-            Self::Account => "Account",
-            Self::Appearance => "Appearance",
-            Self::Shortcuts => "Keyboard shortcuts",
-            Self::About => "About",
+            Self::Account => s.nav_account,
+            Self::Appearance => s.nav_appearance,
+            Self::Shortcuts => s.nav_keyboard_shortcuts,
+            Self::About => s.nav_about,
         }
     }
 }
@@ -147,6 +150,8 @@ pub struct SettingsOutput {
     /// 背景图路径变更（选新图/清除）——需重载纹理（main 调
     /// `apply_background_image` + 写盘）。
     pub background_image_changed: bool,
+    /// 语言变更（F6）：main 进 need_save 落盘。
+    pub language_changed: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -171,12 +176,12 @@ pub fn show(
             ui.set_min_size(screen.size());
             let full = ui.min_rect();
 
-            // —— 顶栏：居中 Settings 标题 + 右上 ✕ ——
+            // —— 顶栏：居中设置标题 + 右上 ✕ ——
             let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), TOP_BAR_HEIGHT));
             ui.painter().text(
                 bar.center(),
                 egui::Align2::CENTER_CENTER,
-                "Settings",
+                i18n::strings().settings_title,
                 egui::FontId::proportional(13.0),
                 pal.fg_dim,
             );
@@ -264,7 +269,8 @@ fn heading(ui: &mut egui::Ui, pal: &Palette, text: &str) {
 /// 圆头像、展示名、邮箱与 Log out；未登录展示占位头像与 Log in 入口。
 /// 登录态与顶栏头像、头像菜单同源 main 的 `Option<Profile>`。
 fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut SettingsOutput) {
-    heading(ui, pal, "Account");
+    let s = i18n::strings();
+    heading(ui, pal, s.nav_account);
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
         match profile {
@@ -301,9 +307,9 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
                     ui.label(egui::RichText::new(&p.email).size(11.0).color(pal.fg_dim));
                 }
                 None => {
-                    ui.label(egui::RichText::new("未登录").color(pal.fg));
+                    ui.label(egui::RichText::new(s.account_not_logged_in).color(pal.fg));
                     ui.label(
-                        egui::RichText::new("本地模拟登录，真账号后续版本接入")
+                        egui::RichText::new(s.account_not_logged_in_sub)
                             .size(11.0)
                             .color(pal.fg_dim),
                     );
@@ -314,14 +320,14 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
     ui.add_space(20.0);
     match profile {
         Some(_) => {
-            let btn = egui::Button::new(egui::RichText::new("Log out").color(pal.fg))
+            let btn = egui::Button::new(egui::RichText::new(s.account_log_out).color(pal.fg))
                 .min_size(egui::vec2(120.0, 30.0));
             if ui.add(btn).clicked() {
                 out.log_out = true;
             }
         }
         None => {
-            let btn = egui::Button::new(egui::RichText::new("Log in").color(pal.fg))
+            let btn = egui::Button::new(egui::RichText::new(s.account_log_in).color(pal.fg))
                 .min_size(egui::vec2(120.0, 30.0));
             if ui.add(btn).clicked() {
                 out.open_login = true;
@@ -330,8 +336,8 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
     }
 }
 
-/// Appearance（P12 Warp 版式）：Themes 组（Sync with OS + 当前主题
-/// 展示卡 + 主题画廊）+ Text 组（字体/字号），全部即时生效。
+/// Appearance（P12 Warp 版式）：Language 组 + Themes 组（Sync with OS +
+/// 当前主题展示卡 + 主题画廊）+ Text 组（字体/字号），全部即时生效。
 fn appearance(
     ui: &mut egui::Ui,
     st: &mut SettingsUiState,
@@ -340,11 +346,41 @@ fn appearance(
     out: &mut SettingsOutput,
     os_dark: bool,
 ) {
-    heading(ui, pal, "Appearance");
+    let s = i18n::strings();
+    heading(ui, pal, s.appearance_heading);
+
+    // —— 语言选择组（F6，放在 Themes 之前）——
+    ui.label(
+        egui::RichText::new(s.appearance_language)
+            .size(14.0)
+            .strong()
+            .color(pal.fg),
+    );
+    ui.add_space(8.0);
+    let mut current_lang = i18n::current_language();
+    egui::ComboBox::from_id_salt("lumen_language_combo")
+        .width(200.0)
+        .selected_text(current_lang.label())
+        .show_ui(ui, |ui| {
+            for lang in Language::ALL {
+                let selected = current_lang == lang;
+                if ui.selectable_label(selected, lang.label()).clicked() {
+                    current_lang = lang;
+                }
+            }
+        });
+    if current_lang != i18n::current_language() {
+        i18n::set_language(current_lang);
+        settings.language = current_lang;
+        out.language_changed = true;
+    }
+    ui.add_space(16.0);
 
     // —— Themes 组 ——
+    // 语言可能刚切换，重新取一次 strings()。
+    let s = i18n::strings();
     ui.label(
-        egui::RichText::new("Themes")
+        egui::RichText::new(s.appearance_themes)
             .size(14.0)
             .strong()
             .color(pal.fg),
@@ -353,7 +389,7 @@ fn appearance(
 
     // Sync with OS：文字左、开关右（对照 Warp 截图的行布局）。
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Sync with OS").color(pal.fg));
+        ui.label(egui::RichText::new(s.appearance_sync_with_os).color(pal.fg));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if toggle_switch(ui, &mut settings.appearance.sync_with_os, pal).changed() {
                 // 开/关都可能改变生效主题（手选 ↔ 槽位），交 main
@@ -363,7 +399,7 @@ fn appearance(
         });
     });
     ui.label(
-        egui::RichText::new("跟随系统深浅模式自动切换主题")
+        egui::RichText::new(s.appearance_sync_sub)
             .size(11.0)
             .color(pal.fg_dim),
     );
@@ -371,8 +407,10 @@ fn appearance(
         let dark_name = settings::theme_info(&settings.appearance.dark_theme_id).name;
         let light_name = settings::theme_info(&settings.appearance.light_theme_id).name;
         ui.label(
-            egui::RichText::new(format!(
-                "深色：{dark_name} ｜ 浅色：{light_name}——点击下方深/浅色主题卡片分别指定"
+            egui::RichText::new(i18n::fmt2(
+                s.appearance_sync_slots_fmt,
+                dark_name,
+                light_name,
             ))
             .size(11.0)
             .color(pal.fg_dim),
@@ -403,7 +441,7 @@ fn appearance(
                 ui.vertical(|ui| {
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("Current theme")
+                        egui::RichText::new(s.appearance_current_theme)
                             .size(11.0)
                             .color(pal.fg_dim),
                     );
@@ -430,8 +468,9 @@ fn appearance(
     ui.add_space(16.0);
 
     // —— Text 组 ——
+    let s = i18n::strings();
     ui.label(
-        egui::RichText::new("Text")
+        egui::RichText::new(s.appearance_text)
             .size(14.0)
             .strong()
             .color(pal.fg),
@@ -439,12 +478,12 @@ fn appearance(
     ui.add_space(8.0);
 
     // —— 终端字体 ——
-    ui.label(egui::RichText::new("终端字体").color(pal.fg));
+    ui.label(egui::RichText::new(s.appearance_font_family).color(pal.fg));
     let before_family = settings.appearance.font_family.clone();
     let selected_label = if st.custom_font_mode {
-        "自定义…".to_owned()
+        s.appearance_font_custom.to_owned()
     } else if settings.appearance.font_family.is_empty() {
-        "自动（系统等宽）".to_owned()
+        s.appearance_font_auto.to_owned()
     } else {
         settings.appearance.font_family.clone()
     };
@@ -454,7 +493,7 @@ fn appearance(
         .show_ui(ui, |ui| {
             let auto_active = !st.custom_font_mode && settings.appearance.font_family.is_empty();
             if ui
-                .selectable_label(auto_active, "自动（系统等宽）")
+                .selectable_label(auto_active, s.appearance_font_auto)
                 .clicked()
             {
                 st.custom_font_mode = false;
@@ -468,7 +507,7 @@ fn appearance(
                 }
             }
             if ui
-                .selectable_label(st.custom_font_mode, "自定义…")
+                .selectable_label(st.custom_font_mode, s.appearance_font_custom)
                 .clicked()
             {
                 st.custom_font_mode = true;
@@ -479,11 +518,11 @@ fn appearance(
         ui.horizontal(|ui| {
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut st.custom_font_buf)
-                    .hint_text("字体家族名，如 Sarasa Mono SC")
+                    .hint_text(s.appearance_font_hint)
                     .desired_width(240.0),
             );
             let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("应用").clicked() || submitted {
+            if ui.button(s.appearance_font_apply).clicked() || submitted {
                 settings.appearance.font_family = st.custom_font_buf.trim().to_owned();
             }
         });
@@ -501,7 +540,7 @@ fn appearance(
     // 滑块绑定预览值而非 settings：拖动中只更新数字显示，松手
     // （drag_stopped）才提交真实字号——否则每跨一个步进就触发一次
     // 「全会话 term/PTY resize + 同步写盘」风暴（M3 审查项）。
-    ui.label(egui::RichText::new("终端字号").color(pal.fg));
+    ui.label(egui::RichText::new(s.appearance_font_size).color(pal.fg));
     let mut preview = st.font_size_drag.unwrap_or(settings.appearance.font_size);
     let resp = ui.add(
         egui::Slider::new(
@@ -543,8 +582,9 @@ fn background_group(
     pal: &Palette,
     out: &mut SettingsOutput,
 ) {
+    let s = i18n::strings();
     ui.label(
-        egui::RichText::new("背景图片")
+        egui::RichText::new(s.appearance_bg_title)
             .size(14.0)
             .strong()
             .color(pal.fg),
@@ -553,7 +593,7 @@ fn background_group(
 
     // —— 启用开关 ——
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("启用背景图片").color(pal.fg));
+        ui.label(egui::RichText::new(s.appearance_bg_enable).color(pal.fg));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if toggle_switch(ui, &mut settings.appearance.background.enabled, pal).changed() {
                 out.background_image_changed = true;
@@ -565,7 +605,7 @@ fn background_group(
     // —— 选图按钮 + 路径展示 + 清除 ——
     ui.horizontal(|ui| {
         if ui
-            .button(egui::RichText::new("选择图片…").color(pal.fg))
+            .button(egui::RichText::new(s.appearance_bg_pick).color(pal.fg))
             .clicked()
         {
             // 同步对话框：阻塞事件循环，PTY 输出在通道中堆积，
@@ -573,8 +613,11 @@ fn background_group(
             // rfd 0.15 在 Windows 使用原生 IFileOpenDialog（COM），
             // 零外部 DLL 依赖。
             let result = rfd::FileDialog::new()
-                .set_title("选择背景图片")
-                .add_filter("图片文件", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .set_title(s.appearance_bg_dialog_title)
+                .add_filter(
+                    s.appearance_bg_filter_name,
+                    &["png", "jpg", "jpeg", "webp", "bmp"],
+                )
                 .pick_file();
             if let Some(path) = result {
                 let path_str = path.to_string_lossy().into_owned();
@@ -598,7 +641,7 @@ fn background_group(
 
             // 清除按钮。
             if ui
-                .button(egui::RichText::new("清除").color(pal.fg_dim))
+                .button(egui::RichText::new(s.appearance_bg_clear).color(pal.fg_dim))
                 .clicked()
             {
                 settings.appearance.background.path = None;
@@ -606,7 +649,7 @@ fn background_group(
                 out.background_image_changed = true;
             }
         } else {
-            ui.label(egui::RichText::new("未选择图片").color(pal.fg_dim));
+            ui.label(egui::RichText::new(s.appearance_bg_none).color(pal.fg_dim));
         }
     });
     ui.add_space(10.0);
@@ -617,9 +660,10 @@ fn background_group(
     // 保持一致，防止用户误以为操作无效或 UI 故障。
     let sliders_enabled = settings.appearance.background.enabled;
     ui.add_enabled_ui(sliders_enabled, |ui| {
+        let s = i18n::strings();
         // —— 不透明度滑块 ——
         // 拖动中预览（settings 字段实时更新），松手才写盘（background_params_changed）。
-        ui.label(egui::RichText::new("不透明度").color(pal.fg));
+        ui.label(egui::RichText::new(s.appearance_bg_opacity).color(pal.fg));
         let mut opacity_preview = st
             .bg_opacity_drag
             .unwrap_or(settings.appearance.background.opacity);
@@ -652,7 +696,7 @@ fn background_group(
         ui.add_space(8.0);
 
         // —— 暗化滑块 ——
-        ui.label(egui::RichText::new("暗化").color(pal.fg));
+        ui.label(egui::RichText::new(s.appearance_bg_dim).color(pal.fg));
         let mut dim_preview = st.bg_dim_drag.unwrap_or(settings.appearance.background.dim);
         let resp_dim = ui.add(
             egui::Slider::new(
@@ -675,7 +719,7 @@ fn background_group(
         }
 
         ui.label(
-            egui::RichText::new("0% = 不暗化；90% = 最暗（可增强文字可读性）")
+            egui::RichText::new(s.appearance_bg_dim_sub)
                 .size(11.0)
                 .color(pal.fg_dim),
         );
@@ -724,7 +768,12 @@ fn theme_card(
             .rect_stroke(prev, 6.0, stroke, egui::StrokeKind::Inside);
         // 槽位徽标（仅 Sync 开启时）：右上角小标签。
         if slot == Some(true) {
-            let text = if info.light { "浅色" } else { "深色" };
+            let s = i18n::strings();
+            let text = if info.light {
+                s.appearance_theme_badge_light
+            } else {
+                s.appearance_theme_badge_dark
+            };
             let galley = ui.painter().layout_no_wrap(
                 text.to_owned(),
                 egui::FontId::proportional(10.0),
@@ -846,14 +895,28 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Respo
     resp
 }
 
-/// Keyboard shortcuts：只读列表（表驱动）。
+/// Keyboard shortcuts：只读列表（表驱动；键位列固定，说明列走 i18n 表）。
 fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
-    heading(ui, pal, "Keyboard shortcuts");
+    let s = i18n::strings();
+    heading(ui, pal, s.shortcuts_heading);
+    // 说明列与键位列保持同序（与 SHORTCUT_KEYS 同索引）。
+    let descs: [&str; 10] = [
+        s.shortcut_new_session,
+        s.shortcut_close_session,
+        s.shortcut_next_prev_session,
+        s.shortcut_filetree_toggle,
+        s.shortcut_settings_toggle,
+        s.shortcut_jump_block,
+        s.shortcut_copy_or_interrupt,
+        s.shortcut_paste,
+        s.shortcut_scroll,
+        s.shortcut_close_settings,
+    ];
     egui::Grid::new("lumen_shortcut_grid")
         .num_columns(2)
         .spacing([32.0, 8.0])
         .show(ui, |ui| {
-            for (keys, desc) in SHORTCUTS {
+            for (keys, desc) in SHORTCUT_KEYS.iter().zip(descs.iter()) {
                 ui.label(egui::RichText::new(*keys).monospace().color(pal.fg));
                 ui.label(egui::RichText::new(*desc).color(pal.fg_dim));
                 ui.end_row();
@@ -863,14 +926,18 @@ fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
 
 /// About：产品名 / 版本 / 技术栈。
 fn about(ui: &mut egui::Ui, pal: &Palette) {
-    heading(ui, pal, "About");
+    let s = i18n::strings();
+    heading(ui, pal, s.about_heading);
     ui.label(
         egui::RichText::new("Lumen")
             .size(16.0)
             .strong()
             .color(pal.fg),
     );
-    ui.label(egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION"))).color(pal.fg_dim));
+    ui.label(
+        egui::RichText::new(i18n::fmt1(s.about_version_fmt, env!("CARGO_PKG_VERSION")))
+            .color(pal.fg_dim),
+    );
     ui.add_space(8.0);
     ui.label(
         egui::RichText::new("Rust · winit · wgpu · egui · glyphon · ConPTY")

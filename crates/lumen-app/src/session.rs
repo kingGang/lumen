@@ -86,9 +86,9 @@ impl Tab {
         if let Some(t) = &self.custom_title {
             return t.clone();
         }
-        self.focused_pane()
-            .default_title()
-            .unwrap_or_else(|| format!("会话 {}", self.id + 1))
+        self.focused_pane().default_title().unwrap_or_else(|| {
+            crate::i18n::fmt1(crate::i18n::strings().session_default_name_fmt, self.id + 1)
+        })
     }
 
     /// 默认标题当前是否来自焦点窗格的 cwd（侧栏据此挂全路径悬停提示）。

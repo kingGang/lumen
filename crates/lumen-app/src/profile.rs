@@ -145,19 +145,40 @@ impl Profile {
     }
 }
 
+/// 登录校验错误（UI 侧通过 i18n 表翻译为用户可见文案，F6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginError {
+    /// 邮箱格式不正确
+    InvalidEmail,
+    /// 密码为空
+    EmptyPassword,
+}
+
+impl LoginError {
+    /// 取当前语言的错误文案。
+    pub fn message(self) -> &'static str {
+        let s = crate::i18n::strings();
+        match self {
+            Self::InvalidEmail => s.login_err_invalid_email,
+            Self::EmptyPassword => s.login_err_empty_password,
+        }
+    }
+}
+
 /// mock 登录校验：邮箱含 `@`（且 `@` 前后段非空）、密码非空即成功，
-/// 展示名取 `@` 前段。失败返回登录界面展示的红字文案。
+/// 展示名取 `@` 前段。失败返回 [`LoginError`]，由 UI 侧调用 `.message()`
+/// 取当前语言的展示文案。
 /// 密码仅在此过手用于「非空」校验，**绝不落盘**。
-pub fn mock_login(email: &str, password: &str) -> std::result::Result<Profile, String> {
+pub fn mock_login(email: &str, password: &str) -> std::result::Result<Profile, LoginError> {
     let email = email.trim();
     let valid = email
         .split_once('@')
         .is_some_and(|(user, host)| !user.is_empty() && !host.is_empty());
     if !valid {
-        return Err("邮箱格式不正确（需形如 name@example.com）".to_owned());
+        return Err(LoginError::InvalidEmail);
     }
     if password.is_empty() {
-        return Err("请输入密码".to_owned());
+        return Err(LoginError::EmptyPassword);
     }
     let logged_in_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -270,10 +291,26 @@ mod tests {
             mock_login("  jimhy@example.com  ", "x").is_ok(),
             "邮箱应去首尾空白"
         );
-        assert!(mock_login("no-at-sign", "x").is_err(), "无 @ 应拒绝");
-        assert!(mock_login("@host", "x").is_err(), "@ 前段为空应拒绝");
-        assert!(mock_login("user@", "x").is_err(), "@ 后段为空应拒绝");
-        assert!(mock_login("a@b.c", "").is_err(), "空密码应拒绝");
+        assert_eq!(
+            mock_login("no-at-sign", "x"),
+            Err(LoginError::InvalidEmail),
+            "无 @ 应拒绝"
+        );
+        assert_eq!(
+            mock_login("@host", "x"),
+            Err(LoginError::InvalidEmail),
+            "@ 前段为空应拒绝"
+        );
+        assert_eq!(
+            mock_login("user@", "x"),
+            Err(LoginError::InvalidEmail),
+            "@ 后段为空应拒绝"
+        );
+        assert_eq!(
+            mock_login("a@b.c", ""),
+            Err(LoginError::EmptyPassword),
+            "空密码应拒绝"
+        );
     }
 
     #[test]

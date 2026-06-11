@@ -205,6 +205,8 @@ pub struct ShellOutput {
     /// 设置页改了背景图路径（选新图/清除），需重载纹理。
     /// main 调 apply_background_image + 写盘。
     pub settings_background_image_changed: bool,
+    /// 设置页改了界面语言（F6）：main 进 need_save 落盘。
+    pub settings_language_changed: bool,
     /// 登录覆盖层本帧被打开（main 把终端焦点交给 egui）。
     pub login_opened: bool,
     /// 登录覆盖层本帧被关闭（main 按覆盖层整体状态决定焦点归属）。
@@ -260,6 +262,7 @@ pub fn show(
         settings_theme_changed: false,
         settings_background_params_changed: false,
         settings_background_image_changed: false,
+        settings_language_changed: false,
         login_opened: false,
         login_closed: false,
         logged_in: None,
@@ -450,7 +453,7 @@ pub fn show(
         // shell 忙未注入 cd：树内轻提示之外再弹 toast（更醒目，树栏
         // 收窄/视线在终端区时也能看到）。
         st.toast
-            .push(toast::ToastKind::Warn, "Shell 正忙，未执行 cd");
+            .push(toast::ToastKind::Warn, crate::i18n::strings().shell_busy_cd);
     }
     // 文件操作/搜索的结果反馈（egui 帧内 push，当帧即可见）。
     for (kind, text) in ft.toasts {
@@ -611,7 +614,10 @@ pub fn show(
                         stroke,
                     );
                 }
-                if cresp.on_hover_text("关闭窗格 (Ctrl+Shift+W)").clicked() {
+                if cresp
+                    .on_hover_text(crate::i18n::strings().pane_close_tip)
+                    .clicked()
+                {
                     out.pane_close = Some(i);
                 }
                 out.pane_close_rects.push(close_rect);
@@ -682,10 +688,13 @@ pub fn show(
                             );
                         }
                     }
-                    let tip = if maximized.is_some() {
-                        "还原窗格 (Ctrl+Shift+Enter)"
-                    } else {
-                        "最大化窗格 (Ctrl+Shift+Enter)"
+                    let tip = {
+                        let s = crate::i18n::strings();
+                        if maximized.is_some() {
+                            s.pane_restore_tip
+                        } else {
+                            s.pane_maximize_tip
+                        }
                     };
                     if mresp.on_hover_text(tip).clicked() {
                         out.pane_maximize = Some(i);
@@ -967,6 +976,7 @@ pub fn show(
         out.settings_theme_changed = s_out.theme_changed;
         out.settings_background_params_changed = s_out.background_params_changed;
         out.settings_background_image_changed = s_out.background_image_changed;
+        out.settings_language_changed = s_out.language_changed;
         if s_out.log_out {
             out.logged_out = true;
         }
@@ -1021,8 +1031,13 @@ fn sidebar_ui(
     pal: &theme::Palette,
     out: &mut ShellOutput,
 ) {
+    let s = crate::i18n::strings();
     ui.add_space(2.0);
-    ui.label(egui::RichText::new("会话").size(11.0).color(pal.fg_dim));
+    ui.label(
+        egui::RichText::new(s.sidebar_sessions)
+            .size(11.0)
+            .color(pal.fg_dim),
+    );
     ui.add_space(4.0);
 
     for entry in tabs {
@@ -1076,12 +1091,13 @@ fn sidebar_ui(
             out.activate = Some(entry.id);
         }
         resp.context_menu(|ui| {
-            if ui.button("重命名").clicked() {
+            let s = crate::i18n::strings();
+            if ui.button(s.menu_rename).clicked() {
                 st.renaming = Some((entry.id, entry.title.clone()));
                 st.rename_focus = true;
                 ui.close();
             }
-            if ui.button("关闭").clicked() {
+            if ui.button(s.menu_close).clicked() {
                 out.close = Some(entry.id);
                 ui.close();
             }
@@ -1098,7 +1114,7 @@ fn sidebar_ui(
             ui.painter().text(
                 egui::pos2(x, resp.rect.center().y),
                 egui::Align2::RIGHT_CENTER,
-                format!("{} 格", entry.pane_count),
+                crate::i18n::fmt1(s.pane_count_fmt, entry.pane_count),
                 egui::FontId::proportional(10.0),
                 pal.fg_dim,
             );
@@ -1107,14 +1123,16 @@ fn sidebar_ui(
 
     // 底部（bottom_up：先加的在最底）：齿轮设置 → 新建会话。
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+        let s = crate::i18n::strings();
         ui.add_space(2.0);
-        let gear = egui::Button::new(egui::RichText::new("⚙ 设置").color(pal.fg_dim))
+        let gear = egui::Button::new(egui::RichText::new(s.sidebar_settings_btn).color(pal.fg_dim))
             .min_size(egui::vec2(ui.available_width(), 26.0));
-        if ui.add(gear).on_hover_text("设置 (Ctrl+,)").clicked() {
+        if ui.add(gear).on_hover_text(s.sidebar_settings_tip).clicked() {
             out.settings_opened = true;
         }
-        let plus = egui::Button::new(egui::RichText::new("＋ 新建会话").color(pal.fg_dim))
-            .min_size(egui::vec2(ui.available_width(), 28.0));
+        let plus =
+            egui::Button::new(egui::RichText::new(s.sidebar_new_session_btn).color(pal.fg_dim))
+                .min_size(egui::vec2(ui.available_width(), 28.0));
         if ui.add(plus).clicked() {
             out.new_session = true;
         }

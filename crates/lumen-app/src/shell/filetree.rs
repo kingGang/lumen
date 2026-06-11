@@ -118,6 +118,53 @@ struct LoadReply {
     result: Result<(Vec<(PathBuf, bool)>, usize), ()>,
 }
 
+/// 后台文件操作结果枚举（F6：后台线程不持有翻译文本；UI 侧展示时查 i18n 表组装）。
+///
+/// 注意：`Reveal`（在文件管理器中打开）在 UI 线程同步执行，失败时直接推
+/// toast，不走此枚举；枚举只覆盖真正在后台线程完成的新建/删除操作。
+enum OpResult {
+    /// 创建成功，name = 创建的文件/目录名
+    Created(String),
+    /// 创建失败：目标已存在，name = 冲突项名
+    CreateExists(String),
+    /// 创建失败：其他错误，msg = 系统错误文本
+    CreateFailed(String),
+    /// 移入回收站成功，name = 被删项名
+    Trashed(String),
+    /// 删除失败，msg = 系统错误文本
+    DeleteFailed(String),
+}
+
+impl OpResult {
+    /// 取当前语言的展示文案和 toast 级别。
+    fn to_toast(&self) -> (super::toast::ToastKind, String) {
+        use super::toast::ToastKind;
+        let s = crate::i18n::strings();
+        match self {
+            Self::Created(name) => (
+                ToastKind::Info,
+                crate::i18n::fmt1(s.filetree_created_fmt, name),
+            ),
+            Self::CreateExists(name) => (
+                ToastKind::Warn,
+                crate::i18n::fmt1(s.filetree_create_exists_fmt, name),
+            ),
+            Self::CreateFailed(msg) => (
+                ToastKind::Error,
+                crate::i18n::fmt1(s.filetree_create_failed_fmt, msg),
+            ),
+            Self::Trashed(name) => (
+                ToastKind::Info,
+                crate::i18n::fmt1(s.filetree_trashed_fmt, name),
+            ),
+            Self::DeleteFailed(msg) => (
+                ToastKind::Error,
+                crate::i18n::fmt1(s.filetree_delete_failed_fmt, msg),
+            ),
+        }
+    }
+}
+
 /// 后台文件操作（新建/删除）的回包。
 ///
 /// 不带代次号：操作已真实发生，结果 toast 无论树状态如何都要展示；
@@ -125,8 +172,8 @@ struct LoadReply {
 struct OpReply {
     /// 操作成功后需要刷新的目录（失败不刷新）。
     refresh: Option<PathBuf>,
-    /// `Ok(成功提示)` / `Err(失败提示)`，由上层弹 toast。
-    result: Result<String, String>,
+    /// 操作结果（F6 枚举化，UI 侧取当前语言文案）。
+    result: OpResult,
 }
 
 /// 后台搜索扫描的回包。
@@ -369,15 +416,15 @@ impl FileTreeState {
     fn drain_ops(&mut self, out: &mut FileTreeOutput) {
         while let Ok(reply) = self.op_rx.try_recv() {
             self.ops_pending = self.ops_pending.saturating_sub(1);
-            match reply.result {
-                Ok(msg) => {
-                    if let Some(dir) = &reply.refresh {
-                        self.refresh_dir(dir);
-                    }
-                    out.toasts.push((ToastKind::Info, msg));
+            // 成功时刷新目录（失败不刷新）。
+            let is_success = matches!(reply.result, OpResult::Created(_) | OpResult::Trashed(_));
+            if is_success {
+                if let Some(dir) = &reply.refresh {
+                    self.refresh_dir(dir);
                 }
-                Err(msg) => out.toasts.push((ToastKind::Error, msg)),
             }
+            // F6：UI 侧取当前语言文案。
+            out.toasts.push(reply.result.to_toast());
         }
     }
 
@@ -389,8 +436,12 @@ impl FileTreeState {
             }
             self.search_pending = false;
             if reply.truncated {
-                out.toasts
-                    .push((ToastKind::Warn, "搜索结果已截断".to_owned()));
+                out.toasts.push((
+                    ToastKind::Warn,
+                    crate::i18n::strings()
+                        .filetree_search_truncated_toast
+                        .to_owned(),
+                ));
             }
             self.search_results = Some(SearchResults {
                 items: reply.items,
@@ -463,15 +514,15 @@ impl FileTreeState {
             let reply = match result {
                 Ok(()) => OpReply {
                     refresh: Some(dir),
-                    result: Ok(format!("已创建：{name}")),
+                    result: OpResult::Created(name),
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => OpReply {
                     refresh: None,
-                    result: Err(format!("创建失败：「{name}」已存在")),
+                    result: OpResult::CreateExists(name),
                 },
                 Err(e) => OpReply {
                     refresh: None,
-                    result: Err(format!("创建失败：{e}")),
+                    result: OpResult::CreateFailed(e.to_string()),
                 },
             };
             // UI 先退出时通道已关：发送失败静默忽略。
@@ -490,11 +541,11 @@ impl FileTreeState {
             let reply = match trash::delete(&path) {
                 Ok(()) => OpReply {
                     refresh: parent,
-                    result: Ok(format!("已移入回收站：{name}")),
+                    result: OpResult::Trashed(name),
                 },
                 Err(e) => OpReply {
                     refresh: None,
-                    result: Err(format!("删除失败：{e}")),
+                    result: OpResult::DeleteFailed(e.to_string()),
                 },
             };
             let _ = tx.send(reply);
@@ -618,7 +669,11 @@ pub fn show(
             .show_inside(root, |ui| {
                 let btn =
                     egui::Button::new(egui::RichText::new("▶").size(9.0).color(pal.fg_dim)).small();
-                if ui.add(btn).on_hover_text("展开文件树 (Ctrl+B)").clicked() {
+                if ui
+                    .add(btn)
+                    .on_hover_text(crate::i18n::strings().filetree_expand_tip)
+                    .clicked()
+                {
                     st.visible = true;
                 }
             });
@@ -651,20 +706,29 @@ fn panel_ui(
     out: &mut FileTreeOutput,
 ) {
     // —— 工具条：收起按钮 + 根目录名（悬停看全路径）+ 搜索/刷新 ——
+    let s = crate::i18n::strings();
     ui.horizontal(|ui| {
         let collapse =
             egui::Button::new(egui::RichText::new("◀").size(9.0).color(pal.fg_dim)).small();
         if ui
             .add(collapse)
-            .on_hover_text("收起文件树 (Ctrl+B)")
+            .on_hover_text(s.filetree_collapse_tip)
             .clicked()
         {
             st.visible = false;
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let refresh =
-                egui::Button::new(egui::RichText::new("刷新").size(10.0).color(pal.fg_dim)).small();
-            if ui.add(refresh).on_hover_text("重新读取目录").clicked() {
+            let refresh = egui::Button::new(
+                egui::RichText::new(s.filetree_refresh)
+                    .size(10.0)
+                    .color(pal.fg_dim),
+            )
+            .small();
+            if ui
+                .add(refresh)
+                .on_hover_text(s.filetree_refresh_tip)
+                .clicked()
+            {
                 st.reset_nodes();
             }
             // 搜索开关：点击展开输入行；再点收起并清空（Esc 同义）。
@@ -675,7 +739,11 @@ fn panel_ui(
             };
             let search_btn =
                 egui::Button::new(egui::RichText::new("🔍").size(10.0).color(search_color)).small();
-            if ui.add(search_btn).on_hover_text("搜索文件名").clicked() {
+            if ui
+                .add(search_btn)
+                .on_hover_text(s.filetree_search_tip)
+                .clicked()
+            {
                 if st.search_open {
                     st.close_search();
                 } else {
@@ -686,7 +754,7 @@ fn panel_ui(
             let title = st
                 .root
                 .as_deref()
-                .map_or_else(|| "文件".to_owned(), display_name);
+                .map_or_else(|| s.filetree_root_placeholder.to_owned(), display_name);
             let label =
                 egui::Label::new(egui::RichText::new(title).size(12.0).color(pal.fg)).truncate();
             let resp = ui.add(label);
@@ -700,7 +768,7 @@ fn panel_ui(
     if st.search_open {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut st.search_query)
-                .hint_text("搜索文件名（≥2 字符）")
+                .hint_text(s.filetree_search_hint)
                 .desired_width(f32::INFINITY),
         );
         if st.search_focus {
@@ -730,7 +798,7 @@ fn panel_ui(
         let now = Instant::now();
         if now < until {
             ui.label(
-                egui::RichText::new("Shell 忙碌中，未执行 cd")
+                egui::RichText::new(s.filetree_shell_busy)
                     .size(10.0)
                     .color(pal.fg_dim),
             );
@@ -744,7 +812,7 @@ fn panel_ui(
     if st.root.is_none() {
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("等待 shell 上报路径…")
+            egui::RichText::new(s.filetree_waiting_cwd)
                 .size(11.0)
                 .color(pal.fg_dim),
         );
@@ -903,8 +971,10 @@ fn handle_menu_action(
         }
         MenuAction::Reveal(path) => {
             if let Err(e) = reveal_in_explorer(&path) {
-                out.toasts
-                    .push((ToastKind::Error, format!("打开文件管理器失败：{e}")));
+                out.toasts.push((
+                    ToastKind::Error,
+                    crate::i18n::fmt1(crate::i18n::strings().filetree_reveal_failed_fmt, &e),
+                ));
             }
         }
         MenuAction::CopyAbs(path) => {
@@ -963,12 +1033,13 @@ fn search_results_ui(
                         .italics(),
                 );
             };
+            let s = crate::i18n::strings();
             let Some(res) = &st.search_results else {
-                placeholder(ui, "搜索中…");
+                placeholder(ui, s.filetree_searching);
                 return;
             };
             if res.items.is_empty() {
-                placeholder(ui, "无匹配项");
+                placeholder(ui, s.filetree_no_results);
                 return;
             }
             // 先收集动作再应用，绕开 search_results 与 selected 的
@@ -995,7 +1066,7 @@ fn search_results_ui(
                 }
             }
             if res.truncated {
-                placeholder(ui, "（结果已截断）");
+                placeholder(ui, s.filetree_truncated);
             }
             if let Some(i) = clicked {
                 st.search_selected = Some(i);
@@ -1036,10 +1107,11 @@ fn dialog_ui(
             focus,
             error,
         } => {
+            let s = crate::i18n::strings();
             let title = if *is_dir {
-                "新建文件夹"
+                s.filetree_create_dir_title
             } else {
-                "新建文件"
+                s.filetree_create_file_title
             };
             let mut confirmed = false;
             let modal = egui::Modal::new(egui::Id::new("lumen_filetree_create"))
@@ -1050,16 +1122,19 @@ fn dialog_ui(
                     ui.label(egui::RichText::new(title).size(14.0).strong().color(pal.fg));
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("位于 {}", dir.display()))
-                                .size(10.5)
-                                .color(pal.fg_dim),
+                            egui::RichText::new(crate::i18n::fmt1(
+                                s.filetree_create_location_fmt,
+                                dir.display(),
+                            ))
+                            .size(10.5)
+                            .color(pal.fg_dim),
                         )
                         .truncate(),
                     );
                     ui.add_space(8.0);
                     let edit = ui.add(
                         egui::TextEdit::singleline(name)
-                            .hint_text("名称")
+                            .hint_text(s.filetree_create_name_hint)
                             .desired_width(f32::INFINITY),
                     );
                     if *focus {
@@ -1080,13 +1155,14 @@ fn dialog_ui(
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         // 主操作按钮：accent 实底 + 反相文字（M3.7b 黑白 CTA）。
-                        let create_btn =
-                            egui::Button::new(egui::RichText::new("创建").color(pal.accent_fg))
-                                .fill(pal.accent);
+                        let create_btn = egui::Button::new(
+                            egui::RichText::new(s.filetree_create_btn).color(pal.accent_fg),
+                        )
+                        .fill(pal.accent);
                         if ui.add(create_btn).clicked() || submitted {
                             confirmed = true;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(s.filetree_cancel_btn).clicked() {
                             close = true;
                         }
                     });
@@ -1110,6 +1186,7 @@ fn dialog_ui(
             }
         }
         Dialog::ConfirmDelete { path, is_dir } => {
+            let s = crate::i18n::strings();
             let name = display_name(path);
             let mut confirmed = false;
             let modal = egui::Modal::new(egui::Id::new("lumen_filetree_delete"))
@@ -1118,34 +1195,38 @@ fn dialog_ui(
                 .show(ctx, |ui| {
                     ui.set_width(280.0);
                     ui.label(
-                        egui::RichText::new("删除")
+                        egui::RichText::new(s.filetree_delete_title)
                             .size(14.0)
                             .strong()
                             .color(pal.fg),
                     );
                     ui.add_space(8.0);
                     let what = if *is_dir {
-                        "文件夹（含其中全部内容）"
+                        s.filetree_delete_what_dir
                     } else {
-                        "文件"
+                        s.filetree_delete_what_file
                     };
                     ui.label(
-                        egui::RichText::new(format!("确认将{what}「{name}」移入回收站？"))
-                            .size(12.0)
-                            .color(pal.fg),
+                        egui::RichText::new(crate::i18n::fmt2(
+                            s.filetree_delete_confirm_fmt,
+                            what,
+                            &name,
+                        ))
+                        .size(12.0)
+                        .color(pal.fg),
                     );
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         // 危险操作按钮：语义红实底（保留彩色）+ 反相文字
                         // （accent_fg 对深/浅两套红底均 ≥4.5:1，M3.7b）。
                         let del_btn = egui::Button::new(
-                            egui::RichText::new("移入回收站").color(pal.accent_fg),
+                            egui::RichText::new(s.filetree_delete_trash_btn).color(pal.accent_fg),
                         )
                         .fill(pal.error);
                         if ui.add(del_btn).clicked() {
                             confirmed = true;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(s.filetree_cancel_btn).clicked() {
                             close = true;
                         }
                     });
@@ -1197,9 +1278,10 @@ fn add_node(
             );
         }
         NodeKind::Overflow(n) => {
+            let s = crate::i18n::strings();
             builder.node(
                 NodeBuilder::leaf(id).activatable(false).label(
-                    egui::RichText::new(format!("…还有 {n} 项未显示"))
+                    egui::RichText::new(crate::i18n::fmt1(s.filetree_overflow_fmt, n))
                         .size(11.0)
                         .color(pal.fg_dim)
                         .italics(),
@@ -1209,7 +1291,7 @@ fn add_node(
         NodeKind::Unreadable => {
             builder.node(
                 NodeBuilder::leaf(id).activatable(false).label(
-                    egui::RichText::new("无法读取")
+                    egui::RichText::new(crate::i18n::strings().filetree_unreadable)
                         .size(11.0)
                         .color(pal.fg_dim)
                         .italics(),
@@ -1219,7 +1301,7 @@ fn add_node(
         NodeKind::Loading => {
             builder.node(
                 NodeBuilder::leaf(id).activatable(false).label(
-                    egui::RichText::new("加载中…")
+                    egui::RichText::new(crate::i18n::strings().filetree_loading)
                         .size(11.0)
                         .color(pal.fg_dim)
                         .italics(),
@@ -1268,22 +1350,23 @@ fn dir_context_menu(
     is_root: bool,
     menu: &RefCell<Option<MenuAction>>,
 ) {
+    let s = crate::i18n::strings();
     ui.set_min_width(150.0);
     // 进入文件夹 = 双击目录的菜单等价物（需求池 P7）；树根也提供
     // ——shell 中途 cd 走了之后可借此回到树根目录。
-    if ui.button("进入文件夹").clicked() {
+    if ui.button(s.filetree_menu_enter_dir).clicked() {
         *menu.borrow_mut() = Some(MenuAction::EnterDir(path.to_path_buf()));
         ui.close();
     }
     ui.separator();
-    if ui.button("新建文件").clicked() {
+    if ui.button(s.filetree_menu_new_file).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Create {
             dir: path.to_path_buf(),
             is_dir: false,
         });
         ui.close();
     }
-    if ui.button("新建文件夹").clicked() {
+    if ui.button(s.filetree_menu_new_dir).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Create {
             dir: path.to_path_buf(),
             is_dir: true,
@@ -1291,21 +1374,21 @@ fn dir_context_menu(
         ui.close();
     }
     ui.separator();
-    if ui.button("在文件管理器中打开").clicked() {
+    if ui.button(s.filetree_menu_reveal).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Reveal(path.to_path_buf()));
         ui.close();
     }
-    if ui.button("复制绝对路径").clicked() {
+    if ui.button(s.filetree_menu_copy_abs).clicked() {
         *menu.borrow_mut() = Some(MenuAction::CopyAbs(path.to_path_buf()));
         ui.close();
     }
     if !is_root {
-        if ui.button("复制相对路径").clicked() {
+        if ui.button(s.filetree_menu_copy_rel).clicked() {
             *menu.borrow_mut() = Some(MenuAction::CopyRel(path.to_path_buf()));
             ui.close();
         }
         ui.separator();
-        if ui.button("删除（移入回收站）").clicked() {
+        if ui.button(s.filetree_menu_delete).clicked() {
             *menu.borrow_mut() = Some(MenuAction::Delete {
                 path: path.to_path_buf(),
                 is_dir: true,
@@ -1317,17 +1400,18 @@ fn dir_context_menu(
 
 /// 文件节点的右键菜单（新建的目标目录 = 文件所在目录）。
 fn file_context_menu(ui: &mut egui::Ui, path: &Path, menu: &RefCell<Option<MenuAction>>) {
+    let s = crate::i18n::strings();
     ui.set_min_width(150.0);
     // 文件必有父目录（位于树根之下），防御回退自身。
     let parent = path.parent().unwrap_or(path);
-    if ui.button("新建文件").clicked() {
+    if ui.button(s.filetree_menu_new_file).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Create {
             dir: parent.to_path_buf(),
             is_dir: false,
         });
         ui.close();
     }
-    if ui.button("新建文件夹").clicked() {
+    if ui.button(s.filetree_menu_new_dir).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Create {
             dir: parent.to_path_buf(),
             is_dir: true,
@@ -1335,20 +1419,20 @@ fn file_context_menu(ui: &mut egui::Ui, path: &Path, menu: &RefCell<Option<MenuA
         ui.close();
     }
     ui.separator();
-    if ui.button("在文件管理器中打开").clicked() {
+    if ui.button(s.filetree_menu_reveal).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Reveal(path.to_path_buf()));
         ui.close();
     }
-    if ui.button("复制绝对路径").clicked() {
+    if ui.button(s.filetree_menu_copy_abs).clicked() {
         *menu.borrow_mut() = Some(MenuAction::CopyAbs(path.to_path_buf()));
         ui.close();
     }
-    if ui.button("复制相对路径").clicked() {
+    if ui.button(s.filetree_menu_copy_rel).clicked() {
         *menu.borrow_mut() = Some(MenuAction::CopyRel(path.to_path_buf()));
         ui.close();
     }
     ui.separator();
-    if ui.button("删除（移入回收站）").clicked() {
+    if ui.button(s.filetree_menu_delete).clicked() {
         *menu.borrow_mut() = Some(MenuAction::Delete {
             path: path.to_path_buf(),
             is_dir: false,
@@ -1530,26 +1614,29 @@ fn display_name(path: &Path) -> String {
 }
 
 /// 新建文件/文件夹的名字校验（Windows 文件名规则 + 注入防御）。
+///
+/// 返回值的 `&'static str` 是当前语言的错误文案（由 i18n 表提供）。
 fn validate_entry_name(name: &str) -> Result<(), &'static str> {
+    let s = crate::i18n::strings();
     if name.is_empty() {
-        return Err("名称不能为空");
+        return Err(s.validate_name_empty);
     }
     if name == "." || name == ".." {
-        return Err("名称不合法");
+        return Err(s.validate_name_illegal);
     }
     if name.chars().any(char::is_control) {
-        return Err("名称不能包含控制字符");
+        return Err(s.validate_name_control_chars);
     }
     if name
         .chars()
         .any(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
     {
-        return Err(r#"名称不能包含 \ / : * ? " < > | 字符"#);
+        return Err(s.validate_name_bad_chars);
     }
     if name.ends_with(['.', ' ']) {
         // Win32 命名空间会静默吞掉结尾点/空格，建出来的名字和输入
         // 对不上，直接拒绝。
-        return Err("名称不能以点或空格结尾");
+        return Err(s.validate_name_trailing);
     }
     Ok(())
 }

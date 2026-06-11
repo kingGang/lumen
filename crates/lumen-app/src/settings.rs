@@ -159,6 +159,9 @@ pub struct Settings {
     pub version: u32,
     pub appearance: AppearanceSettings,
     pub layout: LayoutSettings,
+    /// 界面语言（F6）：`#[serde(default)]` 旧文件无此字段时补默认值
+    /// [`crate::i18n::Language::ZhCn`]（简体中文）。
+    pub language: crate::i18n::Language,
 }
 
 impl Default for Settings {
@@ -167,6 +170,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             appearance: AppearanceSettings::default(),
             layout: LayoutSettings::default(),
+            language: crate::i18n::Language::default(),
         }
     }
 }
@@ -333,6 +337,15 @@ impl Settings {
                 log::warn!("设置节 layout 不是对象，整节降级默认值: {}", path.display());
             }
         }
+        // language：旧文件缺字段时静默补默认值（ZhCn）；值非法记 warn
+        // 后降级——与其余字段同款字段级容错。
+        s.language = lenient_field(
+            root,
+            "language",
+            "language",
+            crate::i18n::Language::default(),
+            path,
+        );
         s
     }
 
@@ -549,6 +562,7 @@ mod tests {
                 sidebar_width: 260.0,
                 filetree_width: 320.0,
             },
+            language: crate::i18n::Language::ZhTw,
         };
         let p = temp_path("roundtrip");
         s.save_to(&p).expect("写盘失败");
