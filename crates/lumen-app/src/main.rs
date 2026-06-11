@@ -2588,7 +2588,21 @@ impl ApplicationHandler<PtyWake> for App {
                     // 共用）：按生效主题 id 切终端配色 + 外壳样式。
                     state.apply_theme();
                 }
-                if shell_out.settings_font_changed || shell_out.settings_theme_changed {
+                if shell_out.settings_background_image_changed {
+                    // 路径变更/清除/开关：重载纹理，renderer 透明状态同步。
+                    state.apply_background_image();
+                }
+                if shell_out.settings_background_params_changed {
+                    // 仅 opacity/dim 变更：不需重载纹理，直接更新透明状态。
+                    let enabled =
+                        state.settings.appearance.background.enabled && state.bg_texture.is_some();
+                    state.renderer.set_transparent_background(enabled);
+                }
+                let need_save = shell_out.settings_font_changed
+                    || shell_out.settings_theme_changed
+                    || shell_out.settings_background_image_changed
+                    || shell_out.settings_background_params_changed;
+                if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
                     // 弹 toast：用户以为改完即存，静默丢失重启才发现。
                     if let Some(err) = state.settings.save() {

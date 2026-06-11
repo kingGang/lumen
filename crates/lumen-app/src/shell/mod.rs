@@ -199,6 +199,12 @@ pub struct ShellOutput {
     pub settings_font_changed: bool,
     /// 设置页改了主题（main 切终端 Theme + egui 样式联动）。
     pub settings_theme_changed: bool,
+    /// 设置页改了背景图参数（opacity/dim/enabled），不需重载纹理。
+    /// main 更新 renderer 透明状态 + 写盘。
+    pub settings_background_params_changed: bool,
+    /// 设置页改了背景图路径（选新图/清除），需重载纹理。
+    /// main 调 apply_background_image + 写盘。
+    pub settings_background_image_changed: bool,
     /// 登录覆盖层本帧被打开（main 把终端焦点交给 egui）。
     pub login_opened: bool,
     /// 登录覆盖层本帧被关闭（main 按覆盖层整体状态决定焦点归属）。
@@ -252,6 +258,8 @@ pub fn show(
         settings_closed: false,
         settings_font_changed: false,
         settings_theme_changed: false,
+        settings_background_params_changed: false,
+        settings_background_image_changed: false,
         login_opened: false,
         login_closed: false,
         logged_in: None,
@@ -957,6 +965,8 @@ pub fn show(
         );
         out.settings_font_changed = s_out.font_changed;
         out.settings_theme_changed = s_out.theme_changed;
+        out.settings_background_params_changed = s_out.background_params_changed;
+        out.settings_background_image_changed = s_out.background_image_changed;
         if s_out.log_out {
             out.logged_out = true;
         }

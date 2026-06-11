@@ -13,6 +13,9 @@ use crate::settings::{self, Settings};
 
 use super::theme::Palette;
 
+// rfd 文件对话框（P13）：Windows 原生 IFileOpenDialog，同步调用。
+use rfd;
+
 /// 左侧分类导航宽度（逻辑像素）。
 const NAV_WIDTH: f32 = 220.0;
 /// 顶栏高度（居中标题 + 关闭按钮）。
@@ -99,6 +102,10 @@ pub struct SettingsUiState {
     /// 字体回退提示：main 在 reconfigure 后写入实际生效信息，
     /// None 表示请求的字体已生效（无回退）。
     pub font_hint: Option<String>,
+    /// 背景图不透明度滑块拖动中的预览值（松手才写盘）。
+    bg_opacity_drag: Option<f32>,
+    /// 背景图暗化滑块拖动中的预览值（松手才写盘）。
+    bg_dim_drag: Option<f32>,
 }
 
 impl SettingsUiState {
@@ -132,6 +139,12 @@ pub struct SettingsOutput {
     pub log_out: bool,
     /// Account：未登录态点击了 Log in（打开登录覆盖层）。
     pub open_login: bool,
+    /// 背景图参数（opacity/dim/enabled 开关）变更——仅需刷新绘制，
+    /// 不需要重载纹理（main 写盘 + 刷新渲染器透明状态）。
+    pub background_params_changed: bool,
+    /// 背景图路径变更（选新图/清除）——需重载纹理（main 调
+    /// `apply_background_image` + 写盘）。
+    pub background_image_changed: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -509,6 +522,155 @@ fn appearance(
             out.font_changed = true;
         }
     }
+
+    ui.add_space(16.0);
+
+    // —— 背景图片组（P13）——
+    background_group(ui, st, settings, pal, out);
+}
+
+/// 背景图片设置组（P13）：启用开关 + 选图按钮 + 路径展示 +
+/// 清除按钮 + 不透明度/暗化滑块。
+///
+/// 开关/选图/清除：即时生效并写盘（`background_image_changed`）。
+/// 滑块：拖动中预览（改 settings 字段但不写盘），松手落盘（`background_params_changed`）。
+fn background_group(
+    ui: &mut egui::Ui,
+    st: &mut SettingsUiState,
+    settings: &mut Settings,
+    pal: &Palette,
+    out: &mut SettingsOutput,
+) {
+    ui.label(
+        egui::RichText::new("背景图片")
+            .size(14.0)
+            .strong()
+            .color(pal.fg),
+    );
+    ui.add_space(8.0);
+
+    // —— 启用开关 ——
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("启用背景图片").color(pal.fg));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if toggle_switch(ui, &mut settings.appearance.background.enabled, pal).changed() {
+                out.background_image_changed = true;
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    // —— 选图按钮 + 路径展示 + 清除 ——
+    ui.horizontal(|ui| {
+        if ui
+            .button(egui::RichText::new("选择图片…").color(pal.fg))
+            .clicked()
+        {
+            // 同步对话框：阻塞事件循环，PTY 输出在通道中堆积，
+            // 对话框关闭后恢复消化。阻塞时长通常 <1s，可接受。
+            // rfd 0.15 在 Windows 使用原生 IFileOpenDialog（COM），
+            // 零外部 DLL 依赖。
+            let result = rfd::FileDialog::new()
+                .set_title("选择背景图片")
+                .add_filter("图片文件", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file();
+            if let Some(path) = result {
+                let path_str = path.to_string_lossy().into_owned();
+                settings.appearance.background.path = Some(path_str);
+                settings.appearance.background.enabled = true;
+                out.background_image_changed = true;
+            }
+        }
+
+        // 当前路径展示（文件名，hover 显示完整路径）。
+        if let Some(p) = &settings.appearance.background.path {
+            let name = std::path::Path::new(p)
+                .file_name()
+                .map_or(p.as_str(), |n| n.to_str().unwrap_or(p.as_str()));
+            let label = ui.add(
+                egui::Label::new(egui::RichText::new(name).color(pal.fg_dim))
+                    .truncate()
+                    .sense(egui::Sense::hover()),
+            );
+            label.on_hover_text(p.clone());
+
+            // 清除按钮。
+            if ui
+                .button(egui::RichText::new("清除").color(pal.fg_dim))
+                .clicked()
+            {
+                settings.appearance.background.path = None;
+                settings.appearance.background.enabled = false;
+                out.background_image_changed = true;
+            }
+        } else {
+            ui.label(egui::RichText::new("未选择图片").color(pal.fg_dim));
+        }
+    });
+    ui.add_space(10.0);
+
+    // —— 不透明度滑块 ——
+    // 拖动中预览（settings 字段实时更新），松手才写盘（background_params_changed）。
+    ui.label(egui::RichText::new("不透明度").color(pal.fg));
+    let before_opacity = settings.appearance.background.opacity;
+    let mut opacity_preview = st
+        .bg_opacity_drag
+        .unwrap_or(settings.appearance.background.opacity);
+    let resp_opacity = ui.add(
+        egui::Slider::new(
+            &mut opacity_preview,
+            settings::BACKGROUND_OPACITY_MIN..=settings::BACKGROUND_OPACITY_MAX,
+        )
+        .step_by(0.05)
+        .fixed_decimals(2),
+    );
+    if resp_opacity.dragged() {
+        st.bg_opacity_drag = Some(opacity_preview);
+        // 拖动中即时预览（不写盘）。
+        settings.appearance.background.opacity = opacity_preview;
+    }
+    let opacity_committed =
+        resp_opacity.drag_stopped() || (resp_opacity.changed() && !resp_opacity.dragged());
+    if opacity_committed {
+        st.bg_opacity_drag = None;
+        settings.appearance.background.opacity = opacity_preview;
+        if (before_opacity - opacity_preview).abs() > f32::EPSILON {
+            out.background_params_changed = true;
+        }
+    }
+
+    ui.add_space(8.0);
+
+    // —— 暗化滑块 ——
+    ui.label(egui::RichText::new("暗化").color(pal.fg));
+    let before_dim = settings.appearance.background.dim;
+    let mut dim_preview = st.bg_dim_drag.unwrap_or(settings.appearance.background.dim);
+    let resp_dim = ui.add(
+        egui::Slider::new(
+            &mut dim_preview,
+            settings::BACKGROUND_DIM_MIN..=settings::BACKGROUND_DIM_MAX,
+        )
+        .step_by(0.05)
+        .fixed_decimals(2),
+    );
+    if resp_dim.dragged() {
+        st.bg_dim_drag = Some(dim_preview);
+        settings.appearance.background.dim = dim_preview;
+    }
+    let dim_committed = resp_dim.drag_stopped() || (resp_dim.changed() && !resp_dim.dragged());
+    if dim_committed {
+        st.bg_dim_drag = None;
+        settings.appearance.background.dim = dim_preview;
+        if (before_dim - dim_preview).abs() > f32::EPSILON {
+            out.background_params_changed = true;
+        }
+    }
+
+    ui.label(
+        egui::RichText::new("0% = 不暗化；90% = 最暗（可增强文字可读性）")
+            .size(11.0)
+            .color(pal.fg_dim),
+    );
 }
 
 /// 一张主题画廊卡片（P12）：迷你终端预览 + 名字标签，整卡可点。
