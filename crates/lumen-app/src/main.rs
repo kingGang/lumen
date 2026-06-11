@@ -99,6 +99,15 @@ fn drain_order(pane_counts: &[usize], active_tab: usize, focused: usize) -> Vec<
     order
 }
 
+/// 面板宽度写盘判定（P10；B1 抽成纯函数加单测）：指针松开后的实际
+/// 宽度 `actual` 在合法范围 ±1 容差内、且与已存值 `stored` 差 ≥1 逻辑
+/// 像素才值得写盘——窗口过窄被临时压缩到范围外的瞬态宽度不写（重启
+/// 还原用户最后一次主动调整的值），亚像素抖动不写（避免每帧白写）。
+/// NaN/Inf（防御）一律不写。
+fn width_worth_persisting(actual: f32, stored: f32, min: f32, max: f32) -> bool {
+    (min - 1.0..=max + 1.0).contains(&actual) && (actual - stored).abs() >= 1.0
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -132,6 +141,16 @@ struct AppState {
     /// 最近一次写盘的会话列表快照（F4 持久化去重：cwd 上报/结构
     /// 变更都先与它比对，无变化不重复写盘）。None = 本次运行尚未写。
     last_sessions_snapshot: Option<sessions_store::SessionsFile>,
+    /// 分隔条拖动改过比例、尚未确认落盘（B1 加固）：正常由
+    /// drag_stopped → divider_drag_ended 触发落盘，但 egui 的拖动结束
+    /// 事件在边角场景可能错失（拖动中窗口失焦/指针态被清）。指针
+    /// 松开的帧看到此标志即兜底落盘（快照一致时内部自动跳过），
+    /// 保证「拖过的比例一定进盘」。
+    layout_dirty: bool,
+    /// 启动首帧的「外壳布局实际应用值」日志已输出（B1 恢复面验收：
+    /// 只凭加载日志不能证明 UI 真用了持久化值，首帧布局后把实际
+    /// 侧栏/文件树宽与窗格权重打进日志，一次性）。
+    layout_apply_logged: bool,
     /// 登录档案（mock）：None = 未登录。顶栏头像、头像菜单、设置页
     /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
     profile: Option<profile::Profile>,
@@ -611,6 +630,14 @@ impl AppState {
         if self.last_sessions_snapshot.as_ref() == Some(&snap) {
             return;
         }
+        log::debug!(
+            "会话快照落盘：{} 个 tab，权重 {:?}",
+            snap.tabs.len(),
+            snap.tabs
+                .iter()
+                .map(|t| (&t.row_weights, &t.col_weights))
+                .collect::<Vec<_>>()
+        );
         snap.save();
         self.last_sessions_snapshot = Some(snap);
     }
@@ -838,6 +865,8 @@ impl App {
             proxy: self.proxy.clone(),
             settings: app_settings,
             last_sessions_snapshot: None,
+            layout_dirty: false,
+            layout_apply_logged: false,
             profile: user_profile,
             modifiers: ModifiersState::default(),
             clipboard,
@@ -1194,7 +1223,14 @@ impl ApplicationHandler<PtyWake> for App {
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
-                ));
+                ))
+            // 诊断开关（B1）：无交互桌面的自动化环境里物理光标不在窗口
+            // 内，每个注入的 WM_MOUSEMOVE 都伴随系统补发的 WM_MOUSELEAVE
+            // （TrackMouseEvent 语义），egui 的指针态被清空导致注入的
+            // 按下被丢弃。设 LUMEN_DIAG_IGNORE_CURSOR_LEFT=1 时不把
+            // CursorLeft 喂给 egui（仅自动化拖动测试用，正常使用不设）。
+            || (matches!(event, WindowEvent::CursorLeft { .. })
+                && std::env::var_os("LUMEN_DIAG_IGNORE_CURSOR_LEFT").is_some());
         if !bypass_egui {
             let resp = state.egui_state.on_window_event(&state.window, &event);
             if resp.repaint {
@@ -1940,13 +1976,17 @@ impl ApplicationHandler<PtyWake> for App {
                             tab.layout.drag_col_to(row, idx, pos.x, area)
                         }
                     };
+                    log::debug!("分隔条拖动: {kind:?} pos={pos:?} changed={changed}");
                     if changed {
+                        state.layout_dirty = true;
                         state.window.request_redraw();
                     }
                 }
                 if shell_out.divider_drag_ended {
                     // 拖动结束才落盘（拖动中不写）；快照一致时内部
                     // 自动跳过。
+                    log::debug!("分隔条拖动结束：落盘比例");
+                    state.layout_dirty = false;
                     state.persist_sessions();
                 }
 
@@ -2118,25 +2158,32 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // —— 侧栏宽度持久化（P10）：egui 面板自管宽度（本帧
                 // 实际值经 shell_out 报回），这里只负责落盘——指针
-                // 松开（拖动结束）且与已存值差 ≥1px 才写；窗口过窄被
+                // 松开（拖动结束）且与已存值差 ≥1px 才写（判定抽
+                // width_worth_persisting，B1 单测覆盖）；窗口过窄被
                 // 临时压缩到范围之外的瞬态宽度不写（重启还原用户最后
                 // 一次主动调整的值）。
                 if !state.egui_ctx.input(|i| i.pointer.any_down()) {
                     let lay = &mut state.settings.layout;
                     let mut width_changed = false;
                     let sw = shell_out.sidebar_width;
-                    if (settings::SIDEBAR_WIDTH_MIN - 1.0..=settings::SIDEBAR_WIDTH_MAX + 1.0)
-                        .contains(&sw)
-                        && (sw - lay.sidebar_width).abs() >= 1.0
-                    {
+                    if width_worth_persisting(
+                        sw,
+                        lay.sidebar_width,
+                        settings::SIDEBAR_WIDTH_MIN,
+                        settings::SIDEBAR_WIDTH_MAX,
+                    ) {
+                        log::debug!("侧栏宽度落盘：{} → {sw}", lay.sidebar_width);
                         lay.sidebar_width = sw;
                         width_changed = true;
                     }
                     if let Some(fw) = shell_out.filetree_width {
-                        if (settings::FILETREE_WIDTH_MIN - 1.0..=settings::FILETREE_WIDTH_MAX + 1.0)
-                            .contains(&fw)
-                            && (fw - lay.filetree_width).abs() >= 1.0
-                        {
+                        if width_worth_persisting(
+                            fw,
+                            lay.filetree_width,
+                            settings::FILETREE_WIDTH_MIN,
+                            settings::FILETREE_WIDTH_MAX,
+                        ) {
+                            log::debug!("文件树宽度落盘：{} → {fw}", lay.filetree_width);
                             lay.filetree_width = fw;
                             width_changed = true;
                         }
@@ -2152,6 +2199,31 @@ impl ApplicationHandler<PtyWake> for App {
                             state.window.request_redraw();
                         }
                     }
+                    // 比例写盘兜底（B1 加固）：drag_stopped 在边角场景
+                    // 可能错失（拖动中窗口失焦等），拖动改过比例且指针
+                    // 已松开就补一次落盘（快照一致时内部自动跳过，
+                    // 正常路径无重复写）。
+                    if state.layout_dirty {
+                        state.layout_dirty = false;
+                        log::debug!("比例写盘兜底：指针已松开且布局有未落盘变更");
+                        state.persist_sessions();
+                    }
+                }
+                // —— 启动首帧的布局应用值日志（B1 恢复面验收）：加载
+                // 日志只证明文件读到了值，这里输出 UI 实际用上的值
+                // （egui 面板实际宽度 + 激活 tab 实际权重），一次性。
+                if !state.layout_apply_logged {
+                    state.layout_apply_logged = true;
+                    let t = &state.tabs[state.active_tab];
+                    info!(
+                        "外壳布局应用：侧栏宽 {:.1}（设置 {:.1}）文件树宽 {:?}（设置 {:.1}）窗格权重 rows={:?} cols={:?}",
+                        shell_out.sidebar_width,
+                        state.settings.layout.sidebar_width,
+                        shell_out.filetree_width,
+                        state.settings.layout.filetree_width,
+                        t.layout.row_weights(),
+                        t.layout.col_weights(),
+                    );
                 }
                 let structure_unchanged = state.tabs.get(state.active_tab).is_some_and(|t| {
                     t.panes.len() == layout_pane_ids.len()
@@ -2409,7 +2481,7 @@ impl ApplicationHandler<PtyWake> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::drain_order;
+    use super::{drain_order, width_worth_persisting};
 
     #[test]
     fn 焦点窗格最先_激活tab次之() {
@@ -2434,5 +2506,28 @@ mod tests {
         assert_eq!(drain_order(&[2], 7, 0), vec![(0, 0), (0, 1)]);
         // 焦点窗格越界：激活 tab 仍领先，但无焦点优先项。
         assert_eq!(drain_order(&[1, 2], 1, 9), vec![(1, 0), (1, 1), (0, 0)]);
+    }
+
+    #[test]
+    fn 宽度写盘判定_正常变化才写() {
+        // 范围内且差 ≥1px：写。
+        assert!(width_worth_persisting(240.0, 180.0, 140.0, 320.0));
+        assert!(width_worth_persisting(180.0, 240.0, 140.0, 320.0));
+        // 差 <1px（亚像素抖动/无变化）：不写。
+        assert!(!width_worth_persisting(180.5, 180.0, 140.0, 320.0));
+        assert!(!width_worth_persisting(180.0, 180.0, 140.0, 320.0));
+        // 端点 ±1 容差内：写（面板钳到 min/max 是用户主动拖到头）。
+        assert!(width_worth_persisting(139.5, 180.0, 140.0, 320.0));
+        assert!(width_worth_persisting(320.8, 180.0, 140.0, 320.0));
+    }
+
+    #[test]
+    fn 宽度写盘判定_瞬态与非法不写() {
+        // 窗口过窄被临时压缩到范围之外：不写（重启还原用户值）。
+        assert!(!width_worth_persisting(80.0, 180.0, 140.0, 320.0));
+        assert!(!width_worth_persisting(500.0, 180.0, 140.0, 320.0));
+        // NaN/Inf 防御：不写。
+        assert!(!width_worth_persisting(f32::NAN, 180.0, 140.0, 320.0));
+        assert!(!width_worth_persisting(f32::INFINITY, 180.0, 140.0, 320.0));
     }
 }
