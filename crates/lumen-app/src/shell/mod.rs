@@ -306,17 +306,40 @@ pub fn show(
         )
         .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
     out.sidebar_width = sb_resp.response.rect.width();
-    // P16：左侧会话栏 1px 内描边——像素对齐（物理像素 1px），防分数 DPI 模糊。
-    // 用 StrokeKind::Inside 避免与相邻面板描边叠成 2px。
+    // P16b：左侧会话栏轮廓描边——只画左/上/下三边，省略右边。
+    // 右边是侧栏与文件树栏的共享边；两侧面板都画会叠成 2px（P16b 问题1
+    // 修复）。像素对齐（1/ppp 逻辑点 = 1 物理像素），防分数 DPI 模糊。
     {
         use egui::emath::GuiRounding as _;
         let ppp = root.pixels_per_point();
-        let sr = sb_resp.response.rect.round_to_pixels(ppp);
-        root.painter().rect_stroke(
-            sr,
-            0.0,
-            egui::Stroke::new(1.0 / ppp, pal.panel_outline),
-            egui::StrokeKind::Inside,
+        let r = sb_resp.response.rect.round_to_pixels(ppp);
+        let hw = 0.5 / ppp; // 半像素：inner 边相当于向内缩半像素绘制
+        let col = pal.panel_outline;
+        let stroke = egui::Stroke::new(1.0 / ppp, col);
+        let p = root.painter();
+        // 左边
+        p.line_segment(
+            [
+                egui::pos2(r.min.x + hw, r.min.y),
+                egui::pos2(r.min.x + hw, r.max.y),
+            ],
+            stroke,
+        );
+        // 上边
+        p.line_segment(
+            [
+                egui::pos2(r.min.x, r.min.y + hw),
+                egui::pos2(r.max.x, r.min.y + hw),
+            ],
+            stroke,
+        );
+        // 下边
+        p.line_segment(
+            [
+                egui::pos2(r.min.x, r.max.y - hw),
+                egui::pos2(r.max.x, r.max.y - hw),
+            ],
+            stroke,
         );
     }
     // 侧栏右缘的拖宽手柄命中区（与面板边线同心、向两侧各探
@@ -341,16 +364,41 @@ pub fn show(
         app_settings.layout.filetree_width,
     );
     out.filetree_width = ft.panel_width;
-    // P16：文件树栏（展开或窄条）1px 内描边，像素对齐。
+    // P16b：文件树栏轮廓描边——只画右/上/下三边，省略左边。
+    // 左边是与侧栏的共享边（侧栏右边 = 文件树左边），双画叠 2px；
+    // 文件树可折叠为窄条、可拖宽，相邻关系动态变化时也始终不叠边。
+    // 无 panel_rect（文件树完全隐藏）时跳过。
     if let Some(ft_rect) = ft.panel_rect {
         use egui::emath::GuiRounding as _;
         let ppp = root.pixels_per_point();
-        let fr = ft_rect.round_to_pixels(ppp);
-        root.painter().rect_stroke(
-            fr,
-            0.0,
-            egui::Stroke::new(1.0 / ppp, pal.panel_outline),
-            egui::StrokeKind::Inside,
+        let r = ft_rect.round_to_pixels(ppp);
+        let hw = 0.5 / ppp;
+        let col = pal.panel_outline;
+        let stroke = egui::Stroke::new(1.0 / ppp, col);
+        let p = root.painter();
+        // 右边
+        p.line_segment(
+            [
+                egui::pos2(r.max.x - hw, r.min.y),
+                egui::pos2(r.max.x - hw, r.max.y),
+            ],
+            stroke,
+        );
+        // 上边
+        p.line_segment(
+            [
+                egui::pos2(r.min.x, r.min.y + hw),
+                egui::pos2(r.max.x, r.min.y + hw),
+            ],
+            stroke,
+        );
+        // 下边
+        p.line_segment(
+            [
+                egui::pos2(r.min.x, r.max.y - hw),
+                egui::pos2(r.max.x, r.max.y - hw),
+            ],
+            stroke,
         );
     }
     if ft.panel_width.is_some() {
@@ -387,14 +435,16 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
-            // P16：命令行区（CentralPanel 整体）1px 内描边，像素对齐。
-            // 在终端内容区外缘画，视觉层次：轮廓 < 分隔线 < 焦点 accent 边框。
-            ui.painter().rect_stroke(
-                area,
-                0.0,
-                egui::Stroke::new(1.0 / ppp, pal.panel_outline),
-                egui::StrokeKind::Inside,
-            );
+            // P16b：命令行区（CentralPanel 整体）轮廓描边——只画右/上/下三边，
+            // 省略左边（左边是与文件树右边的共享边，文件树侧已画）。
+            //
+            // 【层级修复（P16b 问题3）】原来在 area 赋值后立即画，此后 ui.put
+            // 的终端纹理图像会把它盖掉。现在改用 Foreground painter：Foreground
+            // 层在 egui 布局完整帧结束后统一叠在最上，绝对不会被面板内容遮住。
+            // 同时与焦点窗格 accent 边框（同为 Foreground）共层但 panel_outline
+            // 先画、accent 后画（循环内），accent 会盖住 panel_outline 同像素
+            // 处——视觉层次符合预期：轮廓 < 焦点 accent。
+            // （描边在闭包末尾用 Foreground painter 绘制，见下方）
             // 分屏布局（F5/F7③）：网格结构固定、比例可调（权重挂
             // Tab，main 传入本帧快照）；布局与窗格数不符（防御：结构
             // 刚变更的过渡帧）时退回均分。
@@ -775,6 +825,45 @@ pub fn show(
                 // 落在标题栏时 raw 路由按「点击面板」交出过焦点，这里
                 // 收回——拖完接着打字不该断流。
                 out.term_clicked = true;
+            }
+
+            // P16b：命令行区（CentralPanel 整体）轮廓描边——右/上/下三边。
+            // 使用 Foreground 层 painter：egui 在帧末将 Foreground 层叠在
+            // 所有面板内容（终端纹理贴图、窗格标题栏等）之上，确保描边
+            // 可见（P16b 问题3 修复——原来画的时机比终端纹理早，被盖住）。
+            // 不画左边：文件树栏右边线即为本区左边线，共享边不重复画。
+            {
+                let fg_painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("central_panel_outline"),
+                ));
+                let hw = 0.5 / ppp;
+                let col = pal.panel_outline;
+                let stroke = egui::Stroke::new(1.0 / ppp, col);
+                // 右边
+                fg_painter.line_segment(
+                    [
+                        egui::pos2(area.max.x - hw, area.min.y),
+                        egui::pos2(area.max.x - hw, area.max.y),
+                    ],
+                    stroke,
+                );
+                // 上边
+                fg_painter.line_segment(
+                    [
+                        egui::pos2(area.min.x, area.min.y + hw),
+                        egui::pos2(area.max.x, area.min.y + hw),
+                    ],
+                    stroke,
+                );
+                // 下边
+                fg_painter.line_segment(
+                    [
+                        egui::pos2(area.min.x, area.max.y - hw),
+                        egui::pos2(area.max.x, area.max.y - hw),
+                    ],
+                    stroke,
+                );
             }
         });
 

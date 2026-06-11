@@ -88,12 +88,11 @@ pub static DARK: Palette = Palette {
     error: egui::Color32::from_rgb(0xf7, 0x76, 0x8e),
     // #d6d6d6 toast Info 中性白灰（原青 #7dcfff 去彩）。
     info: egui::Color32::from_rgb(0xd6, 0xd6, 0xd6),
-    // #626262 面板外轮廓描边（P16）：比 bg_highlight #383838 明显更亮，
-    // 在近黑外壳底（#161616）和终端黑底（#0d0d0d）上均清晰可见。
-    // 选 #626262（对 #161616 底约 4.0:1）——略低于 AA 但作为装饰线足够，
-    // 比焦点 accent 白弱一档，视觉层次：轮廓 < 分隔线(bg_highlight) <
-    // 焦点 accent(white)。
-    panel_outline: egui::Color32::from_rgb(0x62, 0x62, 0x62),
+    // #4a4a4a 面板外轮廓描边（P16b 调暗）：比初版 #626262 更沉，
+    // 在近黑底（#161616）上对比约 2.8:1——装饰线不需全 AA，
+    // 深色背景下这个亮度已明显可辨而不刺眼（「灰色」目标）。
+    // 视觉层次：轮廓(4a) < 分隔线 bg_highlight(38) < 焦点 accent(白)。
+    panel_outline: egui::Color32::from_rgb(0x4a, 0x4a, 0x4a),
 };
 
 /// 浅色色板（深色板的白底黑字反转：近黑强调、控件「越深越明显」，
@@ -128,9 +127,10 @@ pub static LIGHT: Palette = Palette {
     error: egui::Color32::from_rgb(0xc6, 0x43, 0x43),
     // #3c3c3c toast Info 中性深灰（原青 #07879d 去彩）。
     info: egui::Color32::from_rgb(0x3c, 0x3c, 0x3c),
-    // #888888 面板外轮廓描边（P16）：浅色板方向——比 bg_highlight #cccccc
-    // 更深，在浅灰外壳底（#e6e6e6）上清晰可见（对 #e6e6e6 约 4.1:1）。
-    panel_outline: egui::Color32::from_rgb(0x88, 0x88, 0x88),
+    // #a0a0a0 面板外轮廓描边（P16b 调整）：浅色板方向——比初版 #888888
+    // 略亮（更接近背景，更「低调的灰」），在浅灰底（#e6e6e6）上
+    // 对比约 2.5:1——装饰线语义，视觉存在而不抢眼。
+    panel_outline: egui::Color32::from_rgb(0xa0, 0xa0, 0xa0),
 };
 
 /// 取主题对应的外壳色板（P12 外壳联动）。
@@ -198,8 +198,9 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, black),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, black),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, black),
-            // 浅色派生：比 bg_highlight 再深 0.12 档，清晰勾勒面板边界。
-            panel_outline: mix(bg_dark, black, 0.28),
+            // 浅色派生（P16b）：比 bg_highlight 再深 0.20 档，
+            // 与 LIGHT 手调板 #a0a0a0 量级保持一致（低调灰线）。
+            panel_outline: mix(bg_dark, black, 0.20),
         }
     } else {
         // 深色：外壳比终端 bg 略暗（终端内容区微浮起），控件递亮。
@@ -231,8 +232,9 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, white),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, white),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, white),
-            // 深色派生：比 bg_highlight 再亮 0.12 档，在暗底上清晰勾勒面板边界。
-            panel_outline: mix(bg_dark, white, 0.40),
+            // 深色派生（P16b）：比 bg_highlight 再亮 0.22 档，
+            // 与 DARK 手调板 #4a4a4a 量级保持一致（低调灰线）。
+            panel_outline: mix(bg_dark, white, 0.22),
         }
     }
 }
