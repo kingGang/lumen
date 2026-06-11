@@ -306,9 +306,12 @@ pub fn show(
         )
         .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
     out.sidebar_width = sb_resp.response.rect.width();
-    // P16b：左侧会话栏轮廓描边——只画左/上/下三边，省略右边。
-    // 右边是侧栏与文件树栏的共享边；两侧面板都画会叠成 2px（P16b 问题1
-    // 修复）。像素对齐（1/ppp 逻辑点 = 1 物理像素），防分数 DPI 模糊。
+    // P16b：左侧会话栏轮廓描边——画左/右/上/下四边。共享边去重规则
+    // （P16b 复验修正）：每对相邻面板的共享边由**左侧**面板画右边线，
+    // 右侧面板不画左边线——侧栏画右（侧栏|文件树共享边）、文件树画右
+    // （文件树|命令行区共享边）、两者均不画左。原「侧栏省右+文件树省左」
+    // 把同一条共享边两侧都省了，中间反而没线（海风哥实测反馈）。
+    // 像素对齐（1/ppp 逻辑点 = 1 物理像素），防分数 DPI 模糊。
     {
         use egui::emath::GuiRounding as _;
         let ppp = root.pixels_per_point();
@@ -322,6 +325,14 @@ pub fn show(
             [
                 egui::pos2(r.min.x + hw, r.min.y),
                 egui::pos2(r.min.x + hw, r.max.y),
+            ],
+            stroke,
+        );
+        // 右边（侧栏|文件树共享边，由本侧负责画）
+        p.line_segment(
+            [
+                egui::pos2(r.max.x - hw, r.min.y),
+                egui::pos2(r.max.x - hw, r.max.y),
             ],
             stroke,
         );
