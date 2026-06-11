@@ -157,33 +157,6 @@ pub struct Session {
     pub term_frame_due_since: Option<Instant>,
     /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
     pub has_unseen_output: bool,
-    /// `shell_waiting_input()` 在上一次 drain 批末的值（B3-5b 提示符沿检测）。
-    ///
-    /// 每次 drain 批后处理时与 `s.term.shell_waiting_input()` 当前值比较：
-    /// false→true 的边沿即「新提示符到达」，清零 `user_input_since_prompt`。
-    /// 初始值 false（会话刚 spawn，尚未收到任何 OSC 133 标记）。
-    pub shell_waiting_input_last: bool,
-    /// 上次成功向本窗格注入 `\r`（B3-5b 回车注入）的时刻（B3-6 节流）。
-    ///
-    /// 防止极端高频 resize（如手动拖分隔条）堆积注入：每次计划注入前
-    /// 检查距上次注入是否已过 `RESIZE_INJECT_THROTTLE`；未满则跳过计划，
-    /// 防止窗格里累积多行 `PS F:\...>` 提示符。None = 本会话从未注入。
-    pub last_inject_at: Option<Instant>,
-    /// 当前提示符周期内是否已有用户输入写入 PTY（B3-5b 注入守卫）。
-    ///
-    /// 置 true：通过 [`Self::write_user_input`] 写入 PTY 时（键盘编码、
-    /// IME Commit、粘贴、文件树 cd 注入、拖拽路径插入——所有用户主动
-    /// 写 PTY 的路径统一经此方法，不直接调 `pty.write`）。
-    ///
-    /// 清 false：检测到「提示符沿」——`shell_waiting_input()` 从
-    /// false 变 true 的瞬间（per-session 上次值比较，在 drain 批后
-    /// 处理中检测），以及会话首次 spawn 时初始值。
-    ///
-    /// 注入执行点双重守卫：`shell_waiting_input()==true` **且**
-    /// `user_input_since_prompt==false` 才发 `\r`；否则丢弃注入
-    /// （用户已敲字，不能清他的输入；他自己回车后下一个提示符沿
-    /// 会在 drain 时将此字段清 false，下次 resize 注入恢复正常）。
-    pub user_input_since_prompt: bool,
 }
 
 impl Session {
@@ -247,13 +220,6 @@ impl Session {
             redraw_abs_at: None,
             term_frame_due_since: None,
             has_unseen_output: false,
-            // 初始为 false：会话刚 spawn，尚未收到任何用户输入，
-            // resize 触发的注入不受干扰。
-            user_input_since_prompt: false,
-            // 初始为 false：会话刚 spawn，尚未处理任何 OSC 133 标记。
-            shell_waiting_input_last: false,
-            // 初始为 None：会话刚 spawn，从未注入过（B3-6 节流初始值）。
-            last_inject_at: None,
         })
     }
 
@@ -347,7 +313,7 @@ impl Session {
         }
     }
 
-    /// 向 PTY 写入用户主动产生的输入（B3-5b 注入守卫收口）。
+    /// 向 PTY 写入用户主动产生的输入（统一收口）。
     ///
     /// **所有**用户写 PTY 的路径必须经此方法，不得直接调用 `pty.write`：
     /// - 键盘编码写入（`encode_key` / `encode_key_win32`）
@@ -356,17 +322,15 @@ impl Session {
     /// - 文件树 cd 注入（`cd_command` 生成后经此写入）
     /// - 拖拽路径插入（`path_insert_text` 生成后经此写入）
     ///
-    /// 写入后置 `user_input_since_prompt = true`，令注入守卫在本提示符
-    /// 周期内不再发 `\r`（用户已在输入，不能替他回车清掉在途内容）。
+    /// 统一收口便于将来在此处叠加审计、限流等横切逻辑，无需逐处改动。
+    /// B3-7：注入守卫跟踪字段（user_input_since_prompt / shell_waiting_input_last /
+    /// last_inject_at）已随 resize 注入机制整体拆除，包装方法本身保留收口价值。
     ///
     /// # Errors
     /// 返回 `pty.write` 的底层错误（PTY 管道写失败，通常为 ConPTY 进
     /// 程已退出）。
     pub fn write_user_input(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.pty.write(bytes)?;
-        // 写入成功才标脏：写失败（PTY 已关）无需污染守卫状态。
-        self.user_input_since_prompt = true;
-        Ok(())
+        self.pty.write(bytes)
     }
 
     /// 粘贴剪贴板文本：换行规整为 CR，按需包 bracketed paste 标记。

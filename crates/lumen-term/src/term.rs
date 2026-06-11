@@ -76,41 +76,6 @@ impl Terminal {
                 .is_some_and(|b| b.cmd_line.is_some() && b.output_line.is_none() && !b.is_closed())
     }
 
-    /// 当前提示符是否处于折行状态（B3-6 注入精准条件）。
-    ///
-    /// 判定：最后一个处于「等待输入」态的命令块中，`cmd_line`（OSC 133;B
-    /// 行号）严格大于 `prompt_line`（OSC 133;A 行号）——提示符文本跨越
-    /// 了至少一个换行，即提示符折行。
-    ///
-    /// 只有折行状态下才需要注入 `\r` 修复 PSReadLine 锚点：
-    /// - 不折行时，提示符长度与 `_initialX` 在同一行内，PSReadLine 在
-    ///   第一次 MoveCursor/ReallyRender 时通过 `CursorTop` 自愈，无需注入。
-    ///   （海风哥实测：宽格无折行 resize 后打字无错乱，背书此推论。）
-    /// - 折行时，旧锚点 `_initialY` 已过期，只有重新走提示符周期才能
-    ///   正确重建（回车注入触发 shell 重发提示符）。
-    ///
-    /// `shell_waiting_input()` 为 false 时本方法返回 false（无最后块或
-    /// 尚未收到 133;B）。
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// // 提示符单行（A 行 == B 行）：不折行
-    /// // 提示符跨行（B 行 > A 行）：折行，需注入
-    /// ```
-    pub fn prompt_is_wrapped(&self) -> bool {
-        if self.is_alt_screen() {
-            return false;
-        }
-        self.inner
-            .blocks
-            .last()
-            .is_some_and(|b| match (b.cmd_line, b.output_line) {
-                (Some(cmd), None) if !b.is_closed() => cmd > b.prompt_line,
-                _ => false,
-            })
-    }
-
     /// 已采集的命令块（OSC 133）。
     pub fn blocks(&self) -> &[Block] {
         &self.inner.blocks
@@ -1377,56 +1342,5 @@ mod tests {
         assert!(!t.shell_waiting_input());
         t.advance(b"\x1b[?1049l");
         assert!(t.shell_waiting_input());
-    }
-
-    // ── B3-6：prompt_is_wrapped 单测 ──
-
-    /// 提示符单行不折行：133;A 与 133;B 在同一绝对行上，prompt_is_wrapped 为 false。
-    #[test]
-    fn b36_提示符单行不折行() {
-        // 在可视区较宽的终端里（cols=80），提示符一行放得下：
-        // A 在行 0，B 也在行 0 → prompt_line == cmd_line → 不折行。
-        let mut t = Terminal::new(10, 80, 100);
-        // 133;A → 写提示符（单行）→ 133;B，始终在同一行
-        t.advance(b"\x1b]133;A\x07PS F:\\> \x1b]133;B\x07");
-        assert!(t.shell_waiting_input(), "等待输入");
-        assert!(!t.prompt_is_wrapped(), "提示符不折行（A 行 == B 行）");
-    }
-
-    /// 提示符折行：133;A 在行 0，133;B 在行 1（提示符文本跨越换行），
-    /// prompt_is_wrapped 为 true。
-    #[test]
-    fn b36_提示符折行() {
-        // 在很窄的终端里（cols=5），长提示符「PS F:\path> 」必然换行：
-        // 构造：133;A → 写超过 5 列的提示符 → 换行 → 133;B。
-        // 用 \r\n 让光标换行，模拟 shell 写完提示符后多了一行。
-        let mut t = Terminal::new(10, 5, 100);
-        // 133;A（行 0）→ 任何让光标换到行 1 的序列 → 133;B（行 1）
-        // 用 LF 移动光标到下一行模拟提示符折行。
-        t.advance(b"\x1b]133;A\x07");
-        // 强制光标到行 1（\n 即 linefeed）
-        t.advance(b"\n\x1b]133;B\x07");
-        assert!(t.shell_waiting_input(), "等待输入");
-        // prompt_line=0，cmd_line=1 → 折行
-        assert!(t.prompt_is_wrapped(), "提示符折行（B 行 > A 行）");
-    }
-
-    /// 命令执行中不折行判定为 false：133;C 已到，output_line 不为 None。
-    #[test]
-    fn b36_命令执行中不折行() {
-        let mut t = Terminal::new(10, 5, 100);
-        t.advance(b"\x1b]133;A\x07\n\x1b]133;B\x07ls\r\n\x1b]133;C\x07");
-        assert!(!t.shell_waiting_input(), "命令执行中，非等待输入");
-        assert!(!t.prompt_is_wrapped(), "命令执行中 prompt_is_wrapped=false");
-    }
-
-    /// 备用屏幕中 prompt_is_wrapped 为 false。
-    #[test]
-    fn b36_备用屏幕不折行() {
-        let mut t = Terminal::new(10, 5, 100);
-        t.advance(b"\x1b]133;A\x07\n\x1b]133;B\x07");
-        assert!(t.prompt_is_wrapped(), "主屏折行");
-        t.advance(b"\x1b[?1049h"); // 进入备用屏幕
-        assert!(!t.prompt_is_wrapped(), "备用屏幕 prompt_is_wrapped=false");
     }
 }

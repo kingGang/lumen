@@ -48,50 +48,6 @@ const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// （动画残留位）——经实战验证 50ms 能盖住 codex 归位批的延迟，
 /// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
 const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
-/// PSReadLine 锚点修复注入的延迟（B3-5b）：resize 完成后等待此时长，
-/// 再向处于「等待输入且输入缓冲干净」的窗格注入空行回车 (`\r`)，
-/// 令 shell 重发一条新提示符序列（OSC 133;D/A + 提示符文本 + 133;B），
-/// PSReadLine 在新宽度下重新测量提示符、重建锚点，消除「旧窄格折行
-/// 锚点留存 → 扩宽后打字写到旧列位置」的混叠根因。
-///
-/// 为什么不用旧方案 F13（`ESC[25~`）：
-/// 1. PSReadLine Render.cs 的 RecomputeInitialCoords 仅在
-///    ReallyRender/MoveCursor 内被调；F13 无绑定 → SelfInsert 收
-///    '\0' 直接 return，**不调任何 Render/MoveCursor** → 锚点不重算。
-/// 2. 即使触发了渲染，RecomputeInitialCoords 只做
-///    `_initialX %= BufferWidth` 取模修正——「提示符折行→解折行」
-///    场景下旧锚点 3 取模后仍是 3（正确值 31），它不重新测量提示符，
-///    算不对。这也解释了「打第一个键（真实 Render）也没修复锚点」
-///    的现场观察。
-/// 3. 唯一真正重建锚点的时机 = shell 重发全新提示符，用户实测
-///    「空行回车后恢复正常」背书。
-///
-/// 代价：会多出一行空命令块（OSC 133 周期 D→A→B），是诚实可接受的
-/// 副作用（类似用户自己按了一下 Enter）。
-///
-/// 300ms 足够 ConPTY VT reflow 报文送达并被 PSReadLine 消化完毕
-/// （实测 resize 完到 ESC[8…t 的整条重绘序列在 100ms 内完成），
-/// 同时对用户打字无感（300ms 是 PSReadLine 内部键盘批次去抖的 6 倍）。
-const RESIZE_INJECT_DELAY: Duration = Duration::from_millis(300);
-/// 注入节流下限（B3-6）：同一窗格两次注入之间的最短间隔。
-///
-/// 防止极端高频 resize（如连续放大/缩小）在窗格里堆积多行提示符：
-/// 用户实测反复缩放每轮都注入一次，会堆出连续 4+ 行 `PS F:\...>`。
-/// 节流逻辑：每次计划注入前检查该窗格的 `last_inject_at`；若距上次
-/// 注入不足 2s 则跳过本次计划（而非 300ms 后再执行），完全不入队列。
-/// 2s 足够一轮窗格 resize → ConPTY 重绘 → 提示符刷新的完整周期
-/// （实测 300ms 内即可完成），同时对正常交互（缩放间隔通常 >2s）无感。
-const RESIZE_INJECT_THROTTLE: Duration = Duration::from_secs(2);
-/// 注入的字节载荷：空行回车 `\r`（B3-5b 方案）。
-///
-/// resize 稳定后向「等待输入且缓冲干净」的窗格写入 CR，shell 把它
-/// 当作空命令回车，依次输出：OSC 133;D（命令结束）、OSC 133;A（新提示符开始）、
-/// 提示符文本、OSC 133;B（输入区就绪）。PSReadLine 在新缓冲宽度下
-/// 重新测量提示符长度并重建 `_initialX`/`_initialY` 锚点。
-///
-/// 守卫条件（注入执行点双重检查，见 AppState::resize_inject_pending 注释）：
-/// `shell_waiting_input()==true` **且** `user_input_since_prompt==false`。
-const RESIZE_REDRAW_SEQ: &[u8] = b"\r";
 /// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
 /// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在**本
 /// 会话自己的通道**里（靠 bounded 容量反压该会话的读线程，不连坐
@@ -426,22 +382,6 @@ struct AppState {
     was_popup_open: bool,
     /// 外壳 UI 的跨帧状态（重命名编辑等）。
     shell_state: shell::ShellState,
-    /// resize 后待注入重绘回车的窗格队列（B3-5b PSReadLine 锚点修复）。
-    ///
-    /// 元素 `(SessionId, Instant)`：会话 id + 注入时刻（`now + RESIZE_INJECT_DELAY`）。
-    /// 每次向处于 `shell_waiting_input()` 的窗格提交 PTY resize 时追加；
-    /// `about_to_wait` 循环中检查到期项，执行双重守卫检查后向对应窗格写入
-    /// [`RESIZE_REDRAW_SEQ`]（空行回车），令 shell 重发新提示符、PSReadLine
-    /// 以新宽度重建锚点。
-    ///
-    /// 双重守卫（注入执行前核验，二者同时满足才注入）：
-    /// 1. `shell_waiting_input()==true`：窗格仍处于等待输入态（OSC 133;B
-    ///    已收到、尚未收到 133;C），说明提示符当前可见。
-    /// 2. `user_input_since_prompt==false`：当前提示符周期内用户尚未键入任
-    ///    何字符——干净的输入缓冲，可以安全回车（不会截断用户正在输入的命令）。
-    ///
-    /// 同一窗格在前次注入未到期时再次 resize 只刷新时刻（覆盖而非重复追加）。
-    resize_inject_pending: Vec<(SessionId, Instant)>,
 }
 
 impl AppState {
@@ -1323,7 +1263,6 @@ impl App {
             egui_repaint_at: None,
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
-            resize_inject_pending: Vec::new(),
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1487,29 +1426,6 @@ impl ApplicationHandler<PtyWake> for App {
             // 清掉选中态，避免 Ctrl+C 被残留选中块吞成「复制」。
             if s.term.is_alt_screen() && s.selected_block.is_some() {
                 s.selected_block = None;
-            }
-            // B3-5b 提示符沿检测：shell_waiting_input() 从 false 变 true
-            // 的瞬间（新提示符到达、133;B 完成）清零 user_input_since_prompt。
-            // 这是注入守卫的复位点——用户回车执行命令后 shell 输出新提示符，
-            // 此时应重置「缓冲是否脏」状态，让下一次 resize 注入正常执行。
-            // 检测逻辑：per-session 记录「上次 shell_waiting_input 值」，
-            // 观察边沿（false→true）；直接在 Session 上对比避免额外辅助字段
-            // （shell_waiting_input 本身不可变地由 OSC 133 状态机维护，无副作用）。
-            // 注意：字段 user_input_since_prompt 仅在 true→false 时需要清零；
-            // 本轮没有 user_input（仍为 false）时清零是幂等的，无副作用。
-            {
-                let now_waiting = s.term.shell_waiting_input();
-                // 用 user_input_since_prompt 本身不能检测沿——需要上次值。
-                // 这里借用 shell_waiting_input_last 辅助字段（见 Session 定义）。
-                if now_waiting && !s.shell_waiting_input_last {
-                    // 提示符沿：false → true，新提示符已就绪。
-                    s.user_input_since_prompt = false;
-                    log::debug!(
-                        "B3-5b 提示符沿 窗格 id={}: user_input_since_prompt 清 false",
-                        s.id
-                    );
-                }
-                s.shell_waiting_input_last = now_waiting;
             }
             let sync = s.term.is_synchronized();
             let esu_mark = s.term.esu_mark();
@@ -1683,73 +1599,6 @@ impl ApplicationHandler<PtyWake> for App {
             }
             Some(e) => wake = Some(wake.map_or(e, |w| w.min(e))),
             None => {}
-        }
-
-        // B3-5b PSReadLine 锚点修复：处理 resize 后的延迟注入队列。
-        // 到期项：执行双重守卫检查后向对应窗格注入空行回车（`\r`），
-        // 令 shell 重发新提示符、PSReadLine 以新宽度重建锚点。
-        // 未到期项：时刻计入 wake，保证事件循环准时唤醒执行注入。
-        // 注入失败（窗格已关闭/PTY 退出）静默丢弃。
-        {
-            let mut remaining = Vec::with_capacity(state.resize_inject_pending.len());
-            for (sid, inject_at) in state.resize_inject_pending.drain(..) {
-                if now < inject_at {
-                    // 未到期：保留，并更新唤醒时刻。
-                    wake = Some(wake.map_or(inject_at, |w| w.min(inject_at)));
-                    remaining.push((sid, inject_at));
-                    continue;
-                }
-                // 到期：定位窗格，执行双重守卫后注入。
-                let found = state.tabs.iter().find_map(|t| {
-                    t.panes.iter().find(|p| p.id == sid).map(|p| {
-                        (
-                            p.id,
-                            p.term.shell_waiting_input(),
-                            p.user_input_since_prompt,
-                        )
-                    })
-                });
-                if let Some((found_sid, waiting, dirty)) = found {
-                    // 双重守卫：
-                    // 1. waiting==true：窗格仍处等待输入态（133;B 已收到但 133;C 未到）
-                    // 2. dirty==false：当前提示符周期内用户尚未键入任何字符
-                    //    → 输入缓冲干净，可以安全注入 \r
-                    if waiting && !dirty {
-                        // 找到可变引用执行写入。
-                        if let Some(pane) = state
-                            .tabs
-                            .iter_mut()
-                            .flat_map(|t| t.panes.iter_mut())
-                            .find(|p| p.id == found_sid)
-                        {
-                            match pane.pty.write(RESIZE_REDRAW_SEQ) {
-                                Ok(()) => {
-                                    // B3-5b/B3-6：注入成功日志（info 级别，便于日志侧确认注入发生）。
-                                    info!(
-                                        "B3-6 resize 后注入重绘回车 窗格 id={found_sid}（PSReadLine 锚点修复，折行提示符）"
-                                    );
-                                    // 记录注入时刻用于节流（B3-6）。
-                                    pane.last_inject_at = Some(Instant::now());
-                                    // 注入的 \r 本身视为「系统操作」，不标记 user_input_since_prompt，
-                                    // 以免污染本窗格下一个提示符周期的守卫状态——\r 注入后 shell
-                                    // 会走完 D→A→B 周期，drain 时提示符沿检测会将字段清 false。
-                                }
-                                Err(e) => {
-                                    log::warn!("B3-6 注入重绘回车失败 窗格 id={found_sid}: {e:#}")
-                                }
-                            }
-                        }
-                    } else {
-                        // 守卫不满足：丢弃注入并记录原因（debug 级）。
-                        log::debug!(
-                            "B3-5b 跳过注入 窗格 id={found_sid}: waiting={waiting} dirty={dirty}（用户已在输入，自愈等他回车）"
-                        );
-                    }
-                    // 到期项无论成功/丢弃均不放回队列（单次注入）。
-                }
-                // 找不到窗格（已关闭）：静默丢弃，不放回队列。
-            }
-            state.resize_inject_pending = remaining;
         }
 
         if fire {
@@ -2955,53 +2804,12 @@ impl ApplicationHandler<PtyWake> for App {
                                     s.id
                                 );
                             }
-                            // B3-5b/B3-6 PSReadLine 锚点修复：resize 时若窗格处于
-                            // 「等待输入且提示符折行」态，在 RESIZE_INJECT_DELAY 后
-                            // 向其注入空行回车（`\r`），令 shell 重发新提示符序列
-                            // （OSC 133;D/A + 提示符 + 133;B），PSReadLine 以新宽度
-                            // 重建锚点。
-                            //
-                            // B3-6 精准条件（两个前置守卫，二者同时满足才计划注入）：
-                            // 1. `prompt_is_wrapped()`：当前提示符处于折行状态
-                            //    （OSC 133;B 行号 > OSC 133;A 行号）。不折行时
-                            //    PSReadLine 自身的 CursorTop 反推可以在第一次按键时
-                            //    自愈，无需注入（海风哥实测宽格无错乱，背书此推论）。
-                            // 2. 节流：距本窗格上次注入 >= RESIZE_INJECT_THROTTLE
-                            //    （2s）——防止连续放大/缩小每轮注入一次、堆出多行提示符。
-                            //
-                            // 执行前还有双重守卫（waiting && !dirty），
-                            // 见 AppState::resize_inject_pending 注释。
-                            // 同窗格前次未到期的注入计划直接覆盖（按 sid 去重）：
-                            // 连续快速 resize（拖分隔条）只留最后一次延迟，不堆积。
-                            let wrapped = s.term.prompt_is_wrapped();
-                            let throttle_ok = s.last_inject_at.is_none_or(|t| {
-                                Instant::now().duration_since(t) >= RESIZE_INJECT_THROTTLE
-                            });
-                            if wrapped && throttle_ok {
-                                let inject_at = Instant::now() + RESIZE_INJECT_DELAY;
-                                let sid = s.id;
-                                log::debug!("B3-6 计划注入 窗格 id={sid}（折行提示符，节流通过）");
-                                if let Some(entry) = state
-                                    .resize_inject_pending
-                                    .iter_mut()
-                                    .find(|(id, _)| *id == sid)
-                                {
-                                    entry.1 = inject_at;
-                                } else {
-                                    state.resize_inject_pending.push((sid, inject_at));
-                                }
-                            } else if s.term.shell_waiting_input() && !wrapped {
-                                log::debug!(
-                                    "B3-6 跳过注入计划 窗格 id={} 提示符不折行，锚点由 PSReadLine 自愈",
-                                    s.id
-                                );
-                            } else if s.term.prompt_is_wrapped() && !throttle_ok {
-                                log::debug!(
-                                    "B3-6 跳过注入计划 窗格 id={} 节流中（距上次注入不足 {}s）",
-                                    s.id,
-                                    RESIZE_INJECT_THROTTLE.as_secs()
-                                );
-                            }
+                            // B3-7：已知限制——窄窗格提示符折行后经历宽度变化，
+                            // 当前提示符行打字会错位至用户回车自愈。根因为
+                            // PSReadLine 上游缺陷（锚点不随解折行重测，WT #2432/#15042
+                            // 同款），终端侧无非侵入手段，接受现状。
+                            // resize 后注入 \r 的方案（B3-5/B3-5b/B3-6）经海风哥实测
+                            // 否决：会产生多余提示符行，已全部拆除。
                             // 尺寸变化会夹紧光标位置，立即同步绘制态。
                             let g = s.term.grid();
                             s.cursor_displayed = (g.cursor.row, g.cursor.col, g.cursor.visible);
@@ -3273,104 +3081,5 @@ mod tests {
         // NaN/Inf 防御：不写。
         assert!(!width_worth_persisting(f32::NAN, 180.0, 140.0, 320.0));
         assert!(!width_worth_persisting(f32::INFINITY, 180.0, 140.0, 320.0));
-    }
-
-    /// B3-5b PSReadLine 锚点修复：注入载荷必须是空行回车（单字节 `\r`）。
-    ///
-    /// 原理：shell 把 \r 当作空命令回车 → 输出 OSC 133;D/A + 提示符 +
-    /// OSC 133;B → PSReadLine 以新缓冲宽度重新测量提示符并重建锚点。
-    #[test]
-    fn b3_5b_注入载荷是回车() {
-        use super::RESIZE_REDRAW_SEQ;
-        // 载荷是单字节 CR（0x0d）。
-        assert_eq!(RESIZE_REDRAW_SEQ, b"\r");
-        assert_eq!(RESIZE_REDRAW_SEQ.len(), 1);
-        assert_eq!(RESIZE_REDRAW_SEQ[0], b'\r');
-    }
-
-    /// B3-5b 注入守卫真值表（waiting × dirty 四种组合，只有 waiting=true
-    /// 且 dirty=false 时允许注入）。
-    ///
-    /// 此函数将守卫条件抽为纯函数进行测试，与 about_to_wait 中的实际
-    /// 判断逻辑完全一致（`waiting && !dirty`）。
-    #[test]
-    fn b3_5b_注入守卫真值表() {
-        /// 守卫逻辑：waiting=true 且 dirty=false 才允许注入。
-        fn should_inject(waiting: bool, dirty: bool) -> bool {
-            waiting && !dirty
-        }
-        // 唯一允许注入的组合：等待输入 且 输入缓冲干净。
-        assert!(should_inject(true, false), "waiting=T dirty=F → 应注入");
-        // 其余三种组合均不注入。
-        assert!(
-            !should_inject(false, false),
-            "waiting=F dirty=F → 不注入（shell 忙）"
-        );
-        assert!(
-            !should_inject(true, true),
-            "waiting=T dirty=T → 不注入（用户已敲字）"
-        );
-        assert!(!should_inject(false, true), "waiting=F dirty=T → 不注入");
-    }
-
-    /// B3-5b 提示符沿检测逻辑：shell_waiting_input false→true 的边沿清零
-    /// user_input_since_prompt，其余状态转换幂等不改变字段。
-    ///
-    /// 边沿检测函数签名：`fn detect_prompt_edge(now_waiting: bool, last: bool, dirty: &mut bool)`
-    /// 与 drain 批后处理中的内联逻辑完全一致。
-    #[test]
-    fn b3_5b_提示符沿检测状态机() {
-        /// 内联逻辑的纯函数版本（与 drain 批后处理完全等价）。
-        fn detect_prompt_edge(now_waiting: bool, last_waiting: bool, dirty: &mut bool) -> bool {
-            if now_waiting && !last_waiting {
-                // false → true 边沿：新提示符到达，清零脏标志。
-                *dirty = false;
-                true // 发生了清零
-            } else {
-                false // 无边沿，不改变 dirty
-            }
-        }
-
-        // 1. false → true（新提示符到达）：清零脏标志。
-        let mut dirty = true;
-        let edge = detect_prompt_edge(true, false, &mut dirty);
-        assert!(edge, "false→true 应触发边沿");
-        assert!(!dirty, "边沿后 dirty 应被清 false");
-
-        // 2. true → true（提示符态保持）：不改变脏标志。
-        let mut dirty = true;
-        let edge = detect_prompt_edge(true, true, &mut dirty);
-        assert!(!edge, "true→true 不触发边沿");
-        assert!(dirty, "非边沿时 dirty 不应改变");
-
-        // 3. true → false（shell 变忙：用户回车执行命令）：不改变脏标志。
-        let mut dirty = false;
-        let edge = detect_prompt_edge(false, true, &mut dirty);
-        assert!(!edge, "true→false 不触发边沿");
-        assert!(!dirty, "非边沿时 dirty 不应改变");
-
-        // 4. false → false（shell 持续忙）：不改变脏标志。
-        let mut dirty = true;
-        let edge = detect_prompt_edge(false, false, &mut dirty);
-        assert!(!edge, "false→false 不触发边沿");
-        assert!(dirty, "非边沿时 dirty 不应改变");
-
-        // 5. 连续提示符周期模拟：spawn → 第一个提示符 → 用户输入 →
-        //    回车执行 → 新提示符 → 守卫应为 clean。
-        let mut dirty = false; // spawn：初始 clean
-        let mut last = false; // spawn：初始无等待
-                              // 第一个提示符到达（false→true）：dirty 已是 false，清零幂等。
-        detect_prompt_edge(true, last, &mut dirty);
-        last = true;
-        assert!(!dirty, "首次提示符后 dirty=false");
-        // 用户输入（外部置 true）。
-        dirty = true;
-        // shell 变忙（用户回车）：true→false，不清零。
-        detect_prompt_edge(false, last, &mut dirty);
-        last = false;
-        assert!(dirty, "shell 执行中 dirty 保持 true");
-        // 新提示符到达（false→true）：清零。
-        detect_prompt_edge(true, last, &mut dirty);
-        assert!(!dirty, "新提示符后 dirty 应被清 false");
     }
 }
