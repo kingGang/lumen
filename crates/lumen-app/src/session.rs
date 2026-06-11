@@ -163,6 +163,12 @@ pub struct Session {
     /// false→true 的边沿即「新提示符到达」，清零 `user_input_since_prompt`。
     /// 初始值 false（会话刚 spawn，尚未收到任何 OSC 133 标记）。
     pub shell_waiting_input_last: bool,
+    /// 上次成功向本窗格注入 `\r`（B3-5b 回车注入）的时刻（B3-6 节流）。
+    ///
+    /// 防止极端高频 resize（如手动拖分隔条）堆积注入：每次计划注入前
+    /// 检查距上次注入是否已过 `RESIZE_INJECT_THROTTLE`；未满则跳过计划，
+    /// 防止窗格里累积多行 `PS F:\...>` 提示符。None = 本会话从未注入。
+    pub last_inject_at: Option<Instant>,
     /// 当前提示符周期内是否已有用户输入写入 PTY（B3-5b 注入守卫）。
     ///
     /// 置 true：通过 [`Self::write_user_input`] 写入 PTY 时（键盘编码、
@@ -246,6 +252,8 @@ impl Session {
             user_input_since_prompt: false,
             // 初始为 false：会话刚 spawn，尚未处理任何 OSC 133 标记。
             shell_waiting_input_last: false,
+            // 初始为 None：会话刚 spawn，从未注入过（B3-6 节流初始值）。
+            last_inject_at: None,
         })
     }
 

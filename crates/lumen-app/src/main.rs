@@ -73,6 +73,15 @@ const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
 /// （实测 resize 完到 ESC[8…t 的整条重绘序列在 100ms 内完成），
 /// 同时对用户打字无感（300ms 是 PSReadLine 内部键盘批次去抖的 6 倍）。
 const RESIZE_INJECT_DELAY: Duration = Duration::from_millis(300);
+/// 注入节流下限（B3-6）：同一窗格两次注入之间的最短间隔。
+///
+/// 防止极端高频 resize（如连续放大/缩小）在窗格里堆积多行提示符：
+/// 用户实测反复缩放每轮都注入一次，会堆出连续 4+ 行 `PS F:\...>`。
+/// 节流逻辑：每次计划注入前检查该窗格的 `last_inject_at`；若距上次
+/// 注入不足 2s 则跳过本次计划（而非 300ms 后再执行），完全不入队列。
+/// 2s 足够一轮窗格 resize → ConPTY 重绘 → 提示符刷新的完整周期
+/// （实测 300ms 内即可完成），同时对正常交互（缩放间隔通常 >2s）无感。
+const RESIZE_INJECT_THROTTLE: Duration = Duration::from_secs(2);
 /// 注入的字节载荷：空行回车 `\r`（B3-5b 方案）。
 ///
 /// resize 稳定后向「等待输入且缓冲干净」的窗格写入 CR，shell 把它
@@ -1715,16 +1724,18 @@ impl ApplicationHandler<PtyWake> for App {
                         {
                             match pane.pty.write(RESIZE_REDRAW_SEQ) {
                                 Ok(()) => {
-                                    // B3-5b：注入成功日志（info 级别，便于日志侧确认注入发生）。
+                                    // B3-5b/B3-6：注入成功日志（info 级别，便于日志侧确认注入发生）。
                                     info!(
-                                        "B3-5b resize 后注入重绘回车 窗格 id={found_sid}（PSReadLine 锚点修复）"
+                                        "B3-6 resize 后注入重绘回车 窗格 id={found_sid}（PSReadLine 锚点修复，折行提示符）"
                                     );
+                                    // 记录注入时刻用于节流（B3-6）。
+                                    pane.last_inject_at = Some(Instant::now());
                                     // 注入的 \r 本身视为「系统操作」，不标记 user_input_since_prompt，
                                     // 以免污染本窗格下一个提示符周期的守卫状态——\r 注入后 shell
                                     // 会走完 D→A→B 周期，drain 时提示符沿检测会将字段清 false。
                                 }
                                 Err(e) => {
-                                    log::warn!("B3-5b 注入重绘回车失败 窗格 id={found_sid}: {e:#}")
+                                    log::warn!("B3-6 注入重绘回车失败 窗格 id={found_sid}: {e:#}")
                                 }
                             }
                         }
@@ -2944,17 +2955,32 @@ impl ApplicationHandler<PtyWake> for App {
                                     s.id
                                 );
                             }
-                            // B3-5b PSReadLine 锚点修复：resize 时若窗格处于「等待输入」
-                            // 态（OSC 133;B 标记、非备用屏幕），在 RESIZE_INJECT_DELAY
-                            // 后向其注入空行回车（`\r`），令 shell 重发新提示符序列
+                            // B3-5b/B3-6 PSReadLine 锚点修复：resize 时若窗格处于
+                            // 「等待输入且提示符折行」态，在 RESIZE_INJECT_DELAY 后
+                            // 向其注入空行回车（`\r`），令 shell 重发新提示符序列
                             // （OSC 133;D/A + 提示符 + 133;B），PSReadLine 以新宽度
-                            // 重建锚点。执行前还有双重守卫（waiting && !dirty），
+                            // 重建锚点。
+                            //
+                            // B3-6 精准条件（两个前置守卫，二者同时满足才计划注入）：
+                            // 1. `prompt_is_wrapped()`：当前提示符处于折行状态
+                            //    （OSC 133;B 行号 > OSC 133;A 行号）。不折行时
+                            //    PSReadLine 自身的 CursorTop 反推可以在第一次按键时
+                            //    自愈，无需注入（海风哥实测宽格无错乱，背书此推论）。
+                            // 2. 节流：距本窗格上次注入 >= RESIZE_INJECT_THROTTLE
+                            //    （2s）——防止连续放大/缩小每轮注入一次、堆出多行提示符。
+                            //
+                            // 执行前还有双重守卫（waiting && !dirty），
                             // 见 AppState::resize_inject_pending 注释。
                             // 同窗格前次未到期的注入计划直接覆盖（按 sid 去重）：
                             // 连续快速 resize（拖分隔条）只留最后一次延迟，不堆积。
-                            if s.term.shell_waiting_input() {
+                            let wrapped = s.term.prompt_is_wrapped();
+                            let throttle_ok = s.last_inject_at.is_none_or(|t| {
+                                Instant::now().duration_since(t) >= RESIZE_INJECT_THROTTLE
+                            });
+                            if wrapped && throttle_ok {
                                 let inject_at = Instant::now() + RESIZE_INJECT_DELAY;
                                 let sid = s.id;
+                                log::debug!("B3-6 计划注入 窗格 id={sid}（折行提示符，节流通过）");
                                 if let Some(entry) = state
                                     .resize_inject_pending
                                     .iter_mut()
@@ -2964,6 +2990,17 @@ impl ApplicationHandler<PtyWake> for App {
                                 } else {
                                     state.resize_inject_pending.push((sid, inject_at));
                                 }
+                            } else if s.term.shell_waiting_input() && !wrapped {
+                                log::debug!(
+                                    "B3-6 跳过注入计划 窗格 id={} 提示符不折行，锚点由 PSReadLine 自愈",
+                                    s.id
+                                );
+                            } else if s.term.prompt_is_wrapped() && !throttle_ok {
+                                log::debug!(
+                                    "B3-6 跳过注入计划 窗格 id={} 节流中（距上次注入不足 {}s）",
+                                    s.id,
+                                    RESIZE_INJECT_THROTTLE.as_secs()
+                                );
                             }
                             // 尺寸变化会夹紧光标位置，立即同步绘制态。
                             let g = s.term.grid();
