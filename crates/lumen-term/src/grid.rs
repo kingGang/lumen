@@ -268,18 +268,33 @@ impl Grid {
     }
 
     /// 调整可视区尺寸。列直接截断/扩展，不做 reflow；缩小行数时
-    /// **优先丢弃光标行以下的纯空行**，不足时才把顶行滚入历史
-    /// （alacritty/wezterm 同语义）。
+    /// **优先丢弃光标行以下的纯空行**，不足时从顶部裁行（**不进
+    /// scrollback**）。
     ///
-    /// 收割空行这一步是 B2 多窗格回归（症状①「窗格只剩左缘两根竖
-    /// 条、提示符消失」）的根治：旧实现无条件从顶搬行进 scrollback，
-    /// 新鲜提示符窗格（内容只有顶部一行、下方全空）缩行后提示符行
-    /// 被搬进历史、可视区只剩空行——而命令块状态条与光标是按元数据
-    /// 另行绘制的，画面就退化成「两根竖条 + 正文全空」；shell 空闲
-    /// 不重印提示符，若 ConPTY 的 resize 重绘缺失/被后续缩行打断，
-    /// 空屏便永久定格。M3.7c/d 的窗格标题栏占高、恢复路径整区估算
-    /// spawn、分隔条逐帧 resize 把缩行从罕见事件变成常态，引爆了该
-    /// M1 时代的潜伏缺陷。
+    /// # 两步缩行策略与根因背景
+    ///
+    /// 第一步（B2 修复①）：收割光标行以下的纯空行直接丢弃。
+    /// 旧实现无条件从顶搬行进 scrollback，新鲜提示符窗格缩行后提示符
+    /// 进历史、可视区全空，命令块状态条与光标仍按元数据绘制，形成
+    /// 「两根竖条 + 正文全空」（海风哥截图对应场景）。
+    ///
+    /// 第二步（**B3 修复**）：空行收割不足仍超出时，从顶裁行但
+    /// **不推入 scrollback**。根因：ConPTY 在收到 pty.resize 信号后
+    /// 从自身的 screen buffer 重发整屏 repaint（CUP 绝对坐标 + 文本）；
+    /// 旧实现把顶行推入 scrollback 会使 screen[0] 偏移——ConPTY 重发
+    /// 的 `ESC[1;1H` 对我们来说是新的 screen[0]，但我们的 screen[0]
+    /// 是原来第 N 行（已发生偏移）；PSReadLine 的差量重绘按错误坐标
+    /// 写入，提示符开头丢字 + 输入混叠，且差量错误自我延续，cls 才能
+    /// 重置（B3 症状全特征）。不进 scrollback 则 screen[0] 保持与
+    /// ConPTY row-0 对齐，重发 repaint 落格正确。
+    ///
+    /// Windows/ConPTY 语境下「裁掉顶行不保留历史」是正确的：ConPTY
+    /// 的 scrollback 由 conhost 自己维护，我们只持有可视区镜像；
+    /// 裁掉的行由 ConPTY repaint 重新填入正确内容，用户不会看到丢失。
+    ///
+    /// # Errors（无，文档段）
+    ///
+    /// 此方法不返回 `Result`，维度夹紧在内部处理。
     pub fn resize(&mut self, rows: usize, cols: usize) {
         if rows == self.rows && cols == self.cols {
             return;
@@ -298,18 +313,15 @@ impl Grid {
         {
             self.screen.pop_back();
         }
-        // 第二步：仍超出时顶行滚入历史，尽量保留光标附近内容。超限
-        // 丢弃必须同步推进 dropped_lines（绝对行号基准，与
-        // scroll_up_one 一致）——漏计会让命令块/选区的绝对行号整体
-        // 错位一行。
+        // 第二步（B3 根治）：空行收割后仍超出时从顶裁行——**不推入
+        // scrollback**（与 B2 修①的空行丢弃同语义：均不修改历史长度
+        // 和 dropped_lines）。光标行同步上移（保持指向相同内容）；
+        // 但不超过 rows-1，防止光标越界。
+        // 核心约束：screen[0] 必须与 ConPTY 的 row-0 严格对齐——
+        // ConPTY resize 后重发 repaint 的 CUP 行号是 ConPTY screen 的
+        // 绝对行，pushback 到 scrollback 会让两者偏移、坐标失步。
         while self.screen.len() > rows {
-            if let Some(top) = self.screen.pop_front() {
-                self.scrollback.push_back(top);
-                if self.scrollback.len() > self.scrollback_limit {
-                    self.scrollback.pop_front();
-                    self.dropped_lines += 1;
-                }
-            }
+            self.screen.pop_front();
             if self.cursor.row > 0 {
                 self.cursor.row -= 1;
             }
@@ -386,50 +398,56 @@ mod tests {
     }
 
     #[test]
-    fn 缩行空行不足时顶行进历史() {
-        // 0..=4 行有内容、光标在第 4 行、第 5 行空：缩到 3 行时先
-        // 收割末尾空行，剩余超出从顶滚入历史，光标行内容保留。
+    fn 缩行空行不足时顶行被裁弃不进历史() {
+        // B3 根治回归测试。0..=4 行有内容、光标在第 4 行、第 5 行空：
+        // 缩到 3 行时先收割末尾空行，剩余超出从顶裁行（**不进
+        // scrollback**，B3 修复语义），光标行内容保留。
+        // 旧实现（B3 前）会把 2 行推入 scrollback → ConPTY repaint 的
+        // CUP 坐标与我们的 screen[0] 偏移 → 打字错乱。
         let mut g = Grid::new(6, 4, 100);
         for r in 0..5 {
             g.cell_mut(r, 0).ch = char::from(b'a' + r as u8);
         }
         g.cursor.row = 4;
         g.resize(3, 4);
-        assert_eq!(g.scrollback_len(), 2);
+        // B3 关键断言：scrollback 保持为零——顶行不再推入历史。
+        assert_eq!(g.scrollback_len(), 0, "B3: 缩行不得把顶行推入 scrollback");
         assert_eq!(g.cursor.row, 2);
         assert_eq!(g.row(2)[0].ch, 'e');
-        // 绝对行号不漂移：2(历史) + 2(行) = 缩行前的第 4 行。
-        assert_eq!(g.absolute_cursor_line(), 4);
+        // dropped_lines 也不增（不入 scrollback = 不丢失计数基准）。
+        assert_eq!(g.absolute_cursor_line(), 2);
     }
 
     #[test]
-    fn 缩行不收割带背景的空行() {
-        // 末行无字符但有背景色（TUI 留下的色块）：不算空行、不可
-        // 丢弃，照旧从顶搬行进历史。
+    fn 缩行不收割带背景的空行也不进历史() {
+        // 末行无字符但有背景色（TUI 留下的色块）：is_blank 返回 false，
+        // 不被第一步收割，进入第二步从顶裁行（B3 改语义：不入 scrollback）。
         let mut g = Grid::new(3, 2, 100);
         g.cell_mut(0, 0).ch = 'x';
         g.cursor.row = 0;
         g.cell_mut(2, 0).bg = Color::Indexed(1);
         g.resize(2, 2);
-        assert_eq!(g.scrollback_len(), 1);
+        // B3：不再进 scrollback；带背景的行被保留在可视区（顶行 'x' 被裁，
+        // 带背景的末行留在 screen[1]）。
+        assert_eq!(g.scrollback_len(), 0, "B3: 裁行不得推入 scrollback");
         assert_eq!(g.row(1)[0].bg, Color::Indexed(1));
     }
 
     #[test]
-    fn 缩行历史超限时绝对行号不漂移() {
-        // scrollback 容量 1：缩行搬入 3 行触发 2 次超限丢弃，
-        // dropped_lines 必须同步递增（旧实现漏计，命令块/选区的
-        // 绝对行号会整体错位）。
+    fn 缩行顶行裁弃绝对行号从scrollback为零开始() {
+        // B3 回归：B2 修前有 dropped_lines 漏计 bug；B3 改为不推入
+        // scrollback——dropped_lines 全程为零（不入历史 = 无超限淘汰）。
         let mut g = Grid::new(4, 2, 1);
         for r in 0..4 {
             g.cell_mut(r, 0).ch = 'x';
         }
         g.cursor.row = 3;
-        let before = g.absolute_cursor_line();
         g.resize(1, 2);
-        assert_eq!(g.scrollback_len(), 1);
+        // B3 语义：全部超出行从顶裁弃，不入 scrollback，不触发超限丢弃。
+        assert_eq!(g.scrollback_len(), 0, "B3: 不再推入 scrollback");
         assert_eq!(g.cursor.row, 0);
-        assert_eq!(g.absolute_cursor_line(), before);
+        // 绝对行号 = dropped_lines(0) + scrollback_len(0) + cursor.row(0) = 0。
+        assert_eq!(g.absolute_cursor_line(), 0);
     }
 
     #[test]
