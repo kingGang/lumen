@@ -1423,6 +1423,20 @@ impl ApplicationHandler<PtyWake> for App {
                 event_loop.exit();
             }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
+            WindowEvent::ThemeChanged(t) => {
+                // 系统深浅模式切换（P12 Sync with OS）：记录新状态；
+                // 开启跟随时即时切到对应槽位主题。不写盘——设置本身
+                // 没变，变的是系统侧。
+                let dark = t == winit::window::Theme::Dark;
+                if state.os_dark != dark {
+                    state.os_dark = dark;
+                    info!("系统主题切换：{}", if dark { "深色" } else { "浅色" });
+                    if state.settings.appearance.sync_with_os {
+                        state.apply_theme();
+                        state.window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::Resized(size) => {
                 state.renderer.resize_surface(size.width, size.height);
                 // 终端行列数跟随 egui 布局出的终端区矩形，统一在

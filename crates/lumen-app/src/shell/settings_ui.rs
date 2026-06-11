@@ -18,6 +18,15 @@ const NAV_WIDTH: f32 = 220.0;
 /// 顶栏高度（居中标题 + 关闭按钮）。
 const TOP_BAR_HEIGHT: f32 = 44.0;
 
+/// 主题画廊卡片宽度（P12，对照 Warp 截图的左栏预览卡形态）。
+const THEME_CARD_W: f32 = 148.0;
+/// 卡片内迷你终端预览图高度。
+const THEME_CARD_PREVIEW_H: f32 = 76.0;
+/// 卡片总高（预览图 + 下方名字标签行）。
+const THEME_CARD_H: f32 = THEME_CARD_PREVIEW_H + 22.0;
+/// 画廊卡片间距。
+const THEME_CARD_GAP: f32 = 12.0;
+
 /// 字体下拉的常见等宽字体预设（系统未装某项时选择后会回退并提示）。
 const FONT_PRESETS: &[&str] = &[
     "Cascadia Mono",
@@ -126,12 +135,15 @@ pub struct SettingsOutput {
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
+/// `os_dark` = 系统当前深浅模式（P12：「当前主题」展示卡与画廊
+/// 高亮按它解析 Sync with OS 的生效主题）。
 pub fn show(
     ctx: &egui::Context,
     st: &mut SettingsUiState,
     settings: &mut Settings,
     profile: Option<&Profile>,
     pal: &Palette,
+    os_dark: bool,
 ) -> SettingsOutput {
     let mut out = SettingsOutput::default();
     let screen = ctx.content_rect();
@@ -191,7 +203,7 @@ pub fn show(
                 .auto_shrink([false, false])
                 .show(&mut content_ui, |ui| match st.category {
                     Category::Account => account(ui, profile, pal, &mut out),
-                    Category::Appearance => appearance(ui, st, settings, pal, &mut out),
+                    Category::Appearance => appearance(ui, st, settings, pal, &mut out, os_dark),
                     Category::Shortcuts => shortcuts(ui, pal),
                     Category::About => about(ui, pal),
                 });
@@ -303,36 +315,113 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
     }
 }
 
-/// Appearance：主题 / 字体 / 字号，全部即时生效。
+/// Appearance（P12 Warp 版式）：Themes 组（Sync with OS + 当前主题
+/// 展示卡 + 主题画廊）+ Text 组（字体/字号），全部即时生效。
 fn appearance(
     ui: &mut egui::Ui,
     st: &mut SettingsUiState,
     settings: &mut Settings,
     pal: &Palette,
     out: &mut SettingsOutput,
+    os_dark: bool,
 ) {
     heading(ui, pal, "Appearance");
 
-    // —— 主题（P12 注册表驱动；画廊版式见下一批）——
-    ui.label(egui::RichText::new("主题").color(pal.fg));
-    let before_theme = settings.appearance.theme.clone();
-    egui::ComboBox::from_id_salt("lumen_theme_combo")
-        .width(240.0)
-        .selected_text(settings::theme_info(&settings.appearance.theme).name)
-        .show_ui(ui, |ui| {
-            for info in lumen_renderer::themes::BUILTIN {
-                if ui
-                    .selectable_label(settings.appearance.theme == info.id, info.name)
-                    .clicked()
-                {
-                    settings.appearance.theme = info.id.to_owned();
-                }
+    // —— Themes 组 ——
+    ui.label(
+        egui::RichText::new("Themes")
+            .size(14.0)
+            .strong()
+            .color(pal.fg),
+    );
+    ui.add_space(8.0);
+
+    // Sync with OS：文字左、开关右（对照 Warp 截图的行布局）。
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Sync with OS").color(pal.fg));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if toggle_switch(ui, &mut settings.appearance.sync_with_os, pal).changed() {
+                // 开/关都可能改变生效主题（手选 ↔ 槽位），交 main
+                // 重应用 + 写盘。
+                out.theme_changed = true;
             }
         });
-    if settings.appearance.theme != before_theme {
-        out.theme_changed = true;
+    });
+    ui.label(
+        egui::RichText::new("跟随系统深浅模式自动切换主题")
+            .size(11.0)
+            .color(pal.fg_dim),
+    );
+    if settings.appearance.sync_with_os {
+        let dark_name = settings::theme_info(&settings.appearance.dark_theme_id).name;
+        let light_name = settings::theme_info(&settings.appearance.light_theme_id).name;
+        ui.label(
+            egui::RichText::new(format!(
+                "深色：{dark_name} ｜ 浅色：{light_name}——点击下方深/浅色主题卡片分别指定"
+            ))
+            .size(11.0)
+            .color(pal.fg_dim),
+        );
+    }
+    ui.add_space(10.0);
+
+    // 当前主题展示卡：迷你预览 + 名字（Sync 开启时展示按系统深浅
+    // 解析后的生效主题）。
+    let eff_info = settings::theme_info(settings.effective_theme_id(os_dark));
+    egui::Frame::new()
+        .fill(pal.bg_panel)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width().min(420.0));
+            ui.horizontal(|ui| {
+                let (prect, _) =
+                    ui.allocate_exact_size(egui::vec2(96.0, 56.0), egui::Sense::hover());
+                paint_theme_preview(ui.painter(), prect, &eff_info.theme());
+                ui.painter().rect_stroke(
+                    prect,
+                    6.0,
+                    egui::Stroke::new(1.0, pal.bg_highlight),
+                    egui::StrokeKind::Inside,
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Current theme")
+                            .size(11.0)
+                            .color(pal.fg_dim),
+                    );
+                    ui.label(egui::RichText::new(eff_info.name).color(pal.fg));
+                });
+            });
+        });
+    ui.add_space(12.0);
+
+    // 主题画廊：网格卡片（迷你终端配色缩略图 + 名字），点卡片即
+    // 切换（终端 + 外壳整套即时生效）。列数随内容区宽度自适应。
+    let cols = (((ui.available_width() + THEME_CARD_GAP) / (THEME_CARD_W + THEME_CARD_GAP)).floor()
+        as usize)
+        .max(1);
+    for row in lumen_renderer::themes::BUILTIN.chunks(cols) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = THEME_CARD_GAP;
+            for info in row {
+                theme_card(ui, info, settings, pal, out, os_dark);
+            }
+        });
+        ui.add_space(THEME_CARD_GAP - 4.0);
     }
     ui.add_space(16.0);
+
+    // —— Text 组 ——
+    ui.label(
+        egui::RichText::new("Text")
+            .size(14.0)
+            .strong()
+            .color(pal.fg),
+    );
+    ui.add_space(8.0);
 
     // —— 终端字体 ——
     ui.label(egui::RichText::new("终端字体").color(pal.fg));
@@ -420,6 +509,170 @@ fn appearance(
             out.font_changed = true;
         }
     }
+}
+
+/// 一张主题画廊卡片（P12）：迷你终端预览 + 名字标签，整卡可点。
+///
+/// 点击语义：Sync with OS 关闭时设为当前主题；开启时按卡片明暗写
+/// 入对应槽位（点深色卡 = 指定深色槽，浅色同理），两个槽位卡片带
+/// 「深色/浅色」徽标。当前生效主题 accent 描边高亮。
+fn theme_card(
+    ui: &mut egui::Ui,
+    info: &lumen_renderer::themes::ThemeInfo,
+    settings: &mut Settings,
+    pal: &Palette,
+    out: &mut SettingsOutput,
+    os_dark: bool,
+) {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(THEME_CARD_W, THEME_CARD_H), egui::Sense::click());
+    let sync = settings.appearance.sync_with_os;
+    let effective = settings.effective_theme_id(os_dark) == info.id;
+    // Sync 开启时的槽位归属（徽标 + 非生效槽位的次级描边）。
+    let slot = sync.then(|| {
+        if info.light {
+            settings.appearance.light_theme_id == info.id
+        } else {
+            settings.appearance.dark_theme_id == info.id
+        }
+    });
+
+    if ui.is_rect_visible(rect) {
+        let prev =
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), THEME_CARD_PREVIEW_H));
+        paint_theme_preview(ui.painter(), prev, &info.theme());
+        // 描边：生效主题 accent 2px > 槽位/悬停 fg_dim 1px > 平时分隔灰。
+        let stroke = if effective {
+            egui::Stroke::new(2.0, pal.accent)
+        } else if slot == Some(true) || resp.hovered() {
+            egui::Stroke::new(1.0, pal.fg_dim)
+        } else {
+            egui::Stroke::new(1.0, pal.bg_highlight)
+        };
+        ui.painter()
+            .rect_stroke(prev, 6.0, stroke, egui::StrokeKind::Inside);
+        // 槽位徽标（仅 Sync 开启时）：右上角小标签。
+        if slot == Some(true) {
+            let text = if info.light { "浅色" } else { "深色" };
+            let galley = ui.painter().layout_no_wrap(
+                text.to_owned(),
+                egui::FontId::proportional(10.0),
+                pal.accent_fg,
+            );
+            let pad = egui::vec2(5.0, 2.0);
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(
+                    prev.max.x - galley.size().x - pad.x * 2.0 - 5.0,
+                    prev.min.y + 5.0,
+                ),
+                galley.size() + pad * 2.0,
+            );
+            ui.painter().rect_filled(badge, 4.0, pal.accent);
+            ui.painter().galley(badge.min + pad, galley, pal.accent_fg);
+        }
+        // 名字标签（生效主题用主文字色突出）。
+        ui.painter().text(
+            egui::pos2(rect.min.x + 2.0, rect.max.y - 10.0),
+            egui::Align2::LEFT_CENTER,
+            info.name,
+            egui::FontId::proportional(12.0),
+            if effective { pal.fg } else { pal.fg_dim },
+        );
+    }
+
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if resp.clicked() {
+        let ap = &mut settings.appearance;
+        let target = if sync {
+            if info.light {
+                &mut ap.light_theme_id
+            } else {
+                &mut ap.dark_theme_id
+            }
+        } else {
+            &mut ap.theme
+        };
+        if *target != info.id {
+            *target = info.id.to_owned();
+            out.theme_changed = true;
+        }
+    }
+}
+
+/// 在 `rect` 内画主题的迷你终端缩略图：bg 底 + 几行模拟的彩色
+/// 文字色条 + 光标块（对照 Warp 截图左栏的预览卡形态）。空间不足
+/// （小尺寸预览）时尾部行自动省略。
+fn paint_theme_preview(painter: &egui::Painter, rect: egui::Rect, t: &lumen_renderer::Theme) {
+    use super::theme::c32;
+    painter.rect_filled(rect, 6.0, c32(t.background));
+    let pad = 9.0;
+    let line_h = 12.0;
+    let bar_h = 5.0;
+    let x = rect.min.x + pad;
+    let mut y = rect.min.y + pad;
+    let fits = |y: f32, h: f32| y + h <= rect.max.y - pad + 1.0;
+    let bar = |x0: f32, y0: f32, w: f32, c: lumen_renderer::Rgb| {
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(w, bar_h)),
+            2.0,
+            c32(c),
+        );
+    };
+    // 行1：提示符（绿）+ 命令（fg）。
+    if fits(y, bar_h) {
+        bar(x, y, 8.0, t.ansi[2]);
+        bar(x + 12.0, y, 42.0, t.foreground);
+        y += line_h;
+    }
+    // 行2：路径（蓝）+ 参数（黄）。
+    if fits(y, bar_h) {
+        bar(x, y, 26.0, t.ansi[4]);
+        bar(x + 30.0, y, 18.0, t.ansi[3]);
+        y += line_h;
+    }
+    // 行3：错误（红）+ 输出（品红）+ 备注（青）。
+    if fits(y, bar_h) {
+        bar(x, y, 14.0, t.ansi[1]);
+        bar(x + 18.0, y, 22.0, t.ansi[5]);
+        bar(x + 44.0, y, 12.0, t.ansi[6]);
+        y += line_h;
+    }
+    // 行4：光标块。
+    if fits(y, 8.0) {
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(5.0, 8.0)),
+            1.0,
+            c32(t.cursor),
+        );
+    }
+}
+
+/// Warp 风格开关（egui 无内置 switch）：圆角轨道 + 滑动圆点，开 =
+/// accent 轨道（黑白化：深色板白轨黑点 / 浅色板黑轨白点）。
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, pal: &Palette) -> egui::Response {
+    let size = egui::vec2(36.0, 19.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let radius = rect.height() / 2.0;
+    let track = if *on { pal.accent } else { pal.btn_bg };
+    ui.painter().rect_filled(rect, radius, track);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0, pal.bg_highlight),
+        egui::StrokeKind::Inside,
+    );
+    let cx = egui::lerp((rect.min.x + radius)..=(rect.max.x - radius), t);
+    let knob = if *on { pal.accent_fg } else { pal.fg_dim };
+    ui.painter()
+        .circle_filled(egui::pos2(cx, rect.center().y), radius - 3.5, knob);
+    resp
 }
 
 /// Keyboard shortcuts：只读列表（表驱动）。

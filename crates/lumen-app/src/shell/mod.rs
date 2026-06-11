@@ -766,6 +766,7 @@ pub fn show(
             app_settings,
             input.profile,
             pal,
+            input.os_dark,
         );
         out.settings_font_changed = s_out.font_changed;
         out.settings_theme_changed = s_out.theme_changed;
