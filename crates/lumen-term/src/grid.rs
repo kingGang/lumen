@@ -319,9 +319,14 @@ impl Grid {
         // 每拉回一行：scrollback 少一行，cursor.row 加一——光标绝对
         // 行号保持不变（自洽性见本方法 rustdoc）。
         while self.screen.len() < rows {
-            if let Some(hist) = self.scrollback.pop_back() {
+            if let Some(mut hist) = self.scrollback.pop_back() {
                 // 拉回历史行：插入 screen 顶部，所有既有行的 screen 下标
                 // 各自向后移一位，cursor 相对行号同步增一。
+                // 历史行保存时的列数可能与新 cols 不同（同一个 resize 调用
+                // 既改行也改列），必须先把历史行的 cell 向量同步到新列数，
+                // 否则后续 fill_region / cell_mut 等按新 self.cols 寻址会
+                // 越界 panic（B3-4 根因：grid.rs:256 OOB）。
+                hist.resize(cols);
                 self.screen.push_front(hist);
                 self.cursor.row = self.cursor.row.saturating_add(1);
             } else {
@@ -619,5 +624,83 @@ mod tests {
         // 模拟 ConPTY 按 CUP(row=2) 写入 'Y'（提示符所在行）
         g.cell_mut(2, 0).ch = 'Y';
         assert_eq!(g.row(2)[0].ch, 'Y', "CUP row=2 应命中提示符行");
+    }
+
+    // ── B3-4 回归测试：扩行+扩列时历史行必须同步 resize ──
+
+    #[test]
+    fn b34_扩行扩列时历史行同步resize不越界() {
+        // B3-4 根因：Grid::resize 扩行时从 scrollback 拉回的历史行没有
+        // 调用 row.resize(cols)，历史行 cell 向量保持旧列数（如 23）。
+        // 后续 fill_region / cell_mut 按新 self.cols（如 55）寻址 → OOB
+        // panic（grid.rs:256 "index out of bounds: len is 23 but index is 23"）。
+        //
+        // 修复：push_front(hist) 前先 hist.resize(cols)。
+        // 本测试模拟「最大化后 ConPTY 重绘」路径：
+        //   1. 构造有历史的 grid（旧列数 14）；
+        //   2. resize 到更多行+更多列（18x55，模拟最大化）；
+        //   3. fill_region 全屏（ED 2 语义）——旧实现此处会 panic。
+        let mut g = Grid::new(11, 14, 1000);
+        // 构造 3 行历史（提示符行进 scrollback）
+        for _ in 0..3 {
+            g.cell_mut(0, 0).ch = 'P';
+            g.scroll_up_one(true);
+        }
+        g.cell_mut(0, 0).ch = '>'; // 当前提示符行
+        g.cursor.row = 0;
+        assert_eq!(g.scrollback_len(), 3);
+
+        // 扩行+扩列（模拟最大化 11x14 → 18x55）
+        g.resize(18, 55);
+
+        // 历史行应全部拉回（scrollback 空）且每行宽 55
+        assert_eq!(g.scrollback_len(), 0, "历史行应全部拉回");
+        assert_eq!(g.cols(), 55, "新列数应为 55");
+        // 拉回的历史行宽度必须是 55（不能还是旧的 14），否则下面的
+        // fill_region 会越界 panic
+        for r in 0..g.rows() {
+            let row = g.row(r);
+            assert_eq!(
+                row.cells().len(),
+                55,
+                "row[{r}] cell 向量长度应已 resize 到 55"
+            );
+        }
+
+        // 模拟 ConPTY 最大化后重绘：全屏擦除（ED 2）不应 panic
+        // （B3-4 核心断言：旧实现此处因历史行列数=14<55 而 OOB panic）
+        g.fill_region(0, 0, 17, 54, crate::cell::Cell::default());
+
+        // 历史行拉回时位于 screen 顶部（pop_back 取最新历史优先放顶）
+        // 三行历史均含 'P'（已被 fill_region 清空为空格，仅验证不 panic）。
+        assert_eq!(
+            g.row(0)[0].ch,
+            ' ',
+            "fill_region 后 screen[0][0] 应为空格"
+        );
+    }
+
+    #[test]
+    fn b34_仅扩行不改列时历史行宽度不变() {
+        // 边界：仅扩行（cols 不变），历史行 resize 后宽度应与 cols 一致，
+        // 且已有内容不截断。
+        let mut g = Grid::new(4, 10, 100);
+        // 构造 2 行历史
+        for ch in ['A', 'B'] {
+            g.cell_mut(0, 0).ch = ch;
+            g.scroll_up_one(true);
+        }
+        g.cursor.row = 0;
+
+        // 仅扩行（4 → 6），cols 不变（10）
+        g.resize(6, 10);
+
+        assert_eq!(g.scrollback_len(), 0, "历史行拉回后 scrollback 空");
+        // 历史行宽度仍为 10（resize(10) 对已是 10 列的行是 no-op）
+        assert_eq!(g.row(0)[0].ch, 'A', "第一条历史行内容 A");
+        assert_eq!(g.row(1)[0].ch, 'B', "第二条历史行内容 B");
+        for r in 0..6 {
+            assert_eq!(g.row(r).cells().len(), 10, "row[{r}] 宽度应为 10");
+        }
     }
 }
