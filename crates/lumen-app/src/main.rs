@@ -382,6 +382,13 @@ struct AppState {
     was_popup_open: bool,
     /// 外壳 UI 的跨帧状态（重命名编辑等）。
     shell_state: shell::ShellState,
+    /// B3-8：整窗 resize 事件（WindowEvent::Resized）已到达、等待本帧
+    /// RedrawRequested 处理。置位时 divider_resize_held 门控对所有窗格
+    /// **无效**——整窗 resize 是 OS 级行为，与分隔条拖动完全独立；
+    /// 若拖动状态因焦点/指针事件丢失未被 egui 正常清除，此标志保证
+    /// window resize 的 term/PTY resize 不被永久卡住。每帧 RedrawRequested
+    /// 处理完窗格 resize 后即清零（单次消耗）。
+    window_just_resized: bool,
 }
 
 impl AppState {
@@ -1263,6 +1270,7 @@ impl App {
             egui_repaint_at: None,
             was_popup_open: false,
             shell_state: shell::ShellState::default(),
+            window_just_resized: false,
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1705,6 +1713,10 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::Resized(size) => {
                 state.renderer.resize_surface(size.width, size.height);
+                // B3-8：整窗 resize 标志——通知下一帧 RedrawRequested
+                // 穿透 divider_resize_held 门控，确保 term/PTY resize
+                // 必达。整窗 resize 是 OS 级事件，与分隔条拖动无关。
+                state.window_just_resized = true;
                 // 终端行列数跟随 egui 布局出的终端区矩形，统一在
                 // RedrawRequested 里检测变化并 resize（离屏纹理同步重建）。
                 state.window.request_redraw();
@@ -1718,6 +1730,10 @@ impl ApplicationHandler<PtyWake> for App {
                 // RedrawRequested 的矩形/网格对照检查自动完成（与设置
                 // 页改字号同链路）；伴随的 Resized 事件已有分支处理
                 // surface 重配。
+                // B3-8：DPI 变更也是 OS 级 resize，同样需要穿透
+                // divider_resize_held 门控（伴随的 Resized 一般也会置
+                // 此标志，双保险无妨）。
+                state.window_just_resized = true;
                 state.renderer.set_scale_factor(scale_factor as f32);
                 let ap = &state.settings.appearance;
                 state
@@ -2707,11 +2723,27 @@ impl ApplicationHandler<PtyWake> for App {
                 // 混叠（症状②）的直接温床，且逐帧触发缩行。拖动中纹理
                 // 照常随矩形重建（边界视觉跟手，内容暂按旧行列呈现），
                 // 松手（drag_stopped）那一帧本判定即为 false，下方矩形
-                // 对照一次性提交 resize。拖动异常中断没等到结束事件也
-                // 无妨：下一帧 divider_drag 必为 None，照常提交，不留
-                // 永久失配。
-                let divider_resize_held =
-                    shell_out.divider_drag.is_some() && !shell_out.divider_drag_ended;
+                // 对照一次性提交 resize。
+                //
+                // B3-8 修正：整窗 resize（WindowEvent::Resized）必须穿透
+                // 此门控——整窗 resize 是 OS 级行为，与分隔条拖动完全
+                // 独立；若 egui 指针/拖动状态因窗口失焦或系统接管未被
+                // 正常清除，divider_drag 可能持续为 Some 但无法靠
+                // drag_stopped 清零，导致整窗 resize 的 term/PTY resize
+                // 被永久阻断（海风哥 B3-8 现象：拖过分隔条后放大整窗，
+                // 文字仍按旧窄宽折行）。window_just_resized 标志在
+                // WindowEvent::Resized 置位，本帧用后清零（单次消耗）。
+                let window_resized_this_frame = state.window_just_resized;
+                state.window_just_resized = false;
+                let divider_resize_held = !window_resized_this_frame
+                    && shell_out.divider_drag.is_some()
+                    && !shell_out.divider_drag_ended;
+                if window_resized_this_frame && shell_out.divider_drag.is_some() {
+                    log::debug!(
+                        "B3-8：整窗 resize 帧检测到 divider_drag.is_some()（拖动状态滞留），\
+                         强制穿透 held 门控，确保 term/PTY resize 提交"
+                    );
+                }
                 if structure_unchanged {
                     // 窗格关闭按钮命中区（F5 批2）：raw 鼠标路由的让位
                     // 判定用（mouse_on_pane_close）。
@@ -2787,6 +2819,15 @@ impl ApplicationHandler<PtyWake> for App {
                             let g = s.term.grid();
                             (g.rows(), g.cols())
                         };
+                        if divider_resize_held && (rows, cols) != (old_rows, old_cols) {
+                            // B3-8 诊断：分隔条拖动中暂缓 resize，记录被挡
+                            // 的尺寸变化，帮助取证 held 是否误触。
+                            log::debug!(
+                                "B3-8 诊断：窗格 id={} 网格变化 {old_rows}x{old_cols} → \
+                                 {rows}x{cols} 因 divider_resize_held=true 暂缓",
+                                s.id
+                            );
+                        }
                         if !divider_resize_held && (rows, cols) != (old_rows, old_cols) {
                             // 观测点（B2）：幅度可核对恢复路径估算的精度
                             // ——估算到位时首帧 resize 应为 ±1 级微调。
