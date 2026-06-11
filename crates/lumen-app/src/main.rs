@@ -101,15 +101,6 @@ struct App {
 /// - ESC（0x1b）后跟 `[`：完整 CSI 序列以 `<ESC[...终止符>` 表示；
 /// - ESC 后跟 `]`：完整 OSC 序列以 `<OSC...ST>` 表示（含 BEL/ST 终止）；
 /// - 其余控制字符以 `<XX>` 十六进制表示。
-///
-/// # Examples
-///
-/// ```
-/// # use lumen_app::dump_pty_readable; // (仅文档说明，实际为 crate 内函数)
-/// // 简单断言：ESC[1;1H 应被展示为 <ESC[1;1H>
-/// let s = dump_pty_readable(b"\x1b[1;1H");
-/// assert!(s.contains("<ESC[1;1H>"));
-/// ```
 fn dump_pty_readable(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     let mut i = 0;
