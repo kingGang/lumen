@@ -155,6 +155,10 @@ struct AppState {
     /// 一帧 egui 布局（鼠标命中/IME 候选框定位用）。tab 结构变更后
     /// 的陈旧条目按 id 解析不到窗格、自然失效。
     pane_rects_px: Vec<(SessionId, (f32, f32, f32, f32))>,
+    /// 各窗格右上角关闭按钮的命中矩形（物理像素 x/y/w/h；仅多窗格
+    /// 时非空），来自最近一帧 egui 布局。raw 鼠标路由对它让位：✕ 的
+    /// 点击由 egui 处理（pane_close 动作），按下不聚焦/不建选区。
+    pane_close_rects_px: Vec<(f32, f32, f32, f32)>,
     /// 终端是否持有键盘/IME 焦点：点击终端区 true、点击 egui 面板
     /// false。egui 不会为非控件区域持焦点，键盘与 IME 路由全靠它。
     terminal_focused: bool,
@@ -210,6 +214,11 @@ impl AppState {
     /// 矩形按会话 id 配对（来自上一帧布局）：tab 结构刚变更时陈旧
     /// 条目在当前激活 tab 里解析不到窗格，自然返回 None。
     fn pane_under_mouse(&self) -> Option<usize> {
+        // 窗格关闭按钮的命中区让位（F5 批2）：✕ 上的点击/滚轮/右键
+        // 都不算「在窗格上」，点击由 egui 侧的 pane_close 动作处理。
+        if self.mouse_on_pane_close() {
+            return None;
+        }
         let (mx, my) = self.mouse_pos;
         let (sid, _) = self.pane_rects_px.iter().find(|(_, (x, y, w, h))| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
@@ -227,6 +236,15 @@ impl AppState {
             .panes
             .iter()
             .position(|p| p.id == *sid)
+    }
+
+    /// 鼠标当前位置是否落在某个窗格关闭按钮上（上一帧布局的命中区，
+    /// 与 pane_rects_px 同源同陈旧度）。
+    fn mouse_on_pane_close(&self) -> bool {
+        let (mx, my) = self.mouse_pos;
+        self.pane_close_rects_px.iter().any(|(x, y, w, h)| {
+            mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
+        })
     }
 
     /// 焦点窗格的物理像素矩形 (x, y, w, h)。首帧布局前/结构刚变更
@@ -763,6 +781,7 @@ impl App {
             pane_textures: HashMap::new(),
             pending_tex_free: Vec::new(),
             pane_rects_px: Vec::new(),
+            pane_close_rects_px: Vec::new(),
             terminal_focused: true,
             egui_repaint_at: None,
             was_popup_open: false,
@@ -1419,6 +1438,12 @@ impl ApplicationHandler<PtyWake> for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // 点的是窗格关闭按钮：动作由 egui 侧处理（✕ →
+                    // pane_close），这里不聚焦不建选区，也不视作
+                    // 「点击面板交出焦点」——关完接着打字不该断流。
+                    if state.mouse_on_pane_close() {
+                        return;
+                    }
                     // 焦点仲裁（F5）：点击窗格聚焦该窗格 + 终端拿键盘/
                     // IME 焦点；点击 egui 面板交出焦点（路由随之切换）。
                     let Some(pi) = state.pane_under_mouse() else {
@@ -1630,6 +1655,7 @@ impl ApplicationHandler<PtyWake> for App {
                             title,
                             active: i == state.active_tab,
                             unseen: t.has_unseen(),
+                            pane_count: t.panes.len(),
                         }
                     })
                     .collect();
@@ -1742,6 +1768,23 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
 
+                // —— 窗格级动作（F5 批2）：顶栏「＋」新增 / 窗格 ✕ 关闭
+                // （语义同 Ctrl+Shift+D / Ctrl+Shift+W）。结构变更由下方
+                // layout_pane_ids 对照检测，本帧跳过矩形应用与终端渲染。
+                if shell_out.new_pane {
+                    state.new_pane();
+                }
+                if let Some(pi) = shell_out.pane_close {
+                    let ti = state.active_tab;
+                    // ✕ 仅多窗格时出现，越界/单窗格为防御（关最后一格
+                    // 即关 tab，与快捷键同语义）。
+                    if pi < state.tabs[ti].panes.len() && state.close_pane(ti, pi) {
+                        info!("最后一个会话已关闭，退出应用");
+                        event_loop.exit();
+                        return; // 不再呈现本帧（应用退出中）
+                    }
+                }
+
                 // —— 覆盖层（设置页/登录页）焦点路由：先处理关闭再处理
                 // 打开——登录页关闭时设置页可能仍开着（Account 入口的
                 // 叠层场景），后判打开保证焦点不被错误交还终端 ——
@@ -1838,13 +1881,19 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(file) = shell_out.open_file {
                     shell::filetree::open_with_default(&file);
                 }
-                // —— 文件树拖放：把路径文本插入命令行（不带回车，进
-                // 焦点窗格）——转义与 cd 注入同一套设施（弯引号同形字/
-                // 控制字符防御见 filetree::path_insert_text；空字节串 =
-                // 路径被拒绝）。
-                if let Some(path) = shell_out.insert_path {
+                // —— 文件树拖放：把路径文本插入**落点所在窗格**的命令
+                // 行（不带回车；F5 批2 拍板：拖放目标 = 鼠标落点窗格，
+                // 落点不在任何窗格时 shell 侧已过滤为 None）。先聚焦落
+                // 点窗格——插入后接着编辑命令行的就是它。转义与 cd 注
+                // 入同一套设施（弯引号同形字/控制字符防御见
+                // filetree::path_insert_text；空字节串 = 路径被拒绝）。
+                if let Some((pi, path)) = shell_out.insert_path {
                     let bytes = shell::filetree::path_insert_text(&path);
-                    if !bytes.is_empty() {
+                    // 下标对应 run_ui 时的布局；本帧结构若已被上方动作
+                    // 改变（增删窗格）则跳过本次插入（防御，拖放与增删
+                    // 同帧发生的概率可忽略）。
+                    if !bytes.is_empty() && pi < state.tabs[state.active_tab].panes.len() {
+                        state.focus_pane(pi);
                         let s = state.focused_pane_mut();
                         s.term.grid_mut().scroll_to_bottom();
                         if let Err(e) = s.pty.write(&bytes) {
@@ -1898,6 +1947,17 @@ impl ApplicationHandler<PtyWake> for App {
                             .all(|(p, id)| p.id == *id)
                 });
                 if structure_unchanged {
+                    // 窗格关闭按钮命中区（F5 批2）：raw 鼠标路由的让位
+                    // 判定用（mouse_on_pane_close）。
+                    state.pane_close_rects_px.clear();
+                    for r in &shell_out.pane_close_rects {
+                        state.pane_close_rects_px.push((
+                            r.min.x * ppp,
+                            r.min.y * ppp,
+                            r.width() * ppp,
+                            r.height() * ppp,
+                        ));
+                    }
                     state.pane_rects_px.clear();
                     for (i, r) in shell_out.pane_rects.iter().enumerate() {
                         let x0 = (r.min.x * ppp).round();

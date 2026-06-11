@@ -19,6 +19,9 @@ pub mod topbar;
 /// 左侧会话栏宽度（逻辑像素）。
 pub const SIDEBAR_WIDTH: f32 = 180.0;
 
+/// 窗格右上角关闭按钮的边长（逻辑像素，F5 批2）。
+const PANE_CLOSE_SIZE: f32 = 16.0;
+
 /// 一个 tab 在侧栏的展示数据（由 main.rs 按帧构造；M3.7 起侧栏
 /// 条目 = tab，每 tab 含 1~6 个终端窗格）。
 pub struct TabItem {
@@ -32,6 +35,8 @@ pub struct TabItem {
     pub active: bool,
     /// 后台期间 tab 内任意窗格有未读输出（条目右侧小圆点）。
     pub unseen: bool,
+    /// tab 内窗格数（>1 时条目右侧标「N 格」，F5 批2 视觉打磨）。
+    pub pane_count: usize,
 }
 
 /// 跨帧保留的外壳 UI 状态。
@@ -85,6 +90,14 @@ pub struct ShellOutput {
     pub term_clicked: bool,
     /// 点击了某个窗格（下标对应 [`ShellInput::panes`]；切换焦点窗格）。
     pub pane_clicked: Option<usize>,
+    /// 点击了某窗格右上角的 ✕（关闭该窗格；按钮仅多窗格时出现）。
+    pub pane_close: Option<usize>,
+    /// 各窗格关闭按钮的命中矩形（egui 逻辑坐标，与窗格同序；单窗格
+    /// 时为空）。main.rs 据此让 raw 鼠标路由对 ✕ 让位（不聚焦/不建
+    /// 选区/不交出终端焦点，点击由 egui 侧处理）。
+    pub pane_close_rects: Vec<egui::Rect>,
+    /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
+    pub new_pane: bool,
     /// 点击了某 tab 条目（切换激活）。
     pub activate: Option<u64>,
     /// 请求关闭某 tab（右键菜单）。
@@ -101,9 +114,10 @@ pub struct ShellOutput {
     pub cd_dir: Option<std::path::PathBuf>,
     /// 文件树：激活了文件，用系统默认程序打开。
     pub open_file: Option<std::path::PathBuf>,
-    /// 文件树：节点拖放到终端区，把路径文本插入命令行（不带回车，
-    /// 转义见 filetree::path_insert_text）。
-    pub insert_path: Option<std::path::PathBuf>,
+    /// 文件树：节点拖放到某窗格，把路径文本插入该窗格命令行（不带
+    /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
+    /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
+    pub insert_path: Option<(usize, std::path::PathBuf)>,
     /// 文件树：请求写剪贴板的文本（复制绝对/相对路径；arboard 在
     /// main 持有）。
     pub copy_text: Option<String>,
@@ -143,6 +157,9 @@ pub fn show(
         pane_rects: Vec::new(),
         term_clicked: false,
         pane_clicked: None,
+        pane_close: None,
+        pane_close_rects: Vec::new(),
+        new_pane: false,
         activate: None,
         close: None,
         rename: None,
@@ -184,7 +201,10 @@ pub fn show(
         .iter()
         .find(|e| e.active)
         .map_or("Lumen", |e| e.title.as_str());
-    let tb = topbar::show(root, active_title, input.profile, pal);
+    let tb = topbar::show(root, active_title, input.panes.len(), input.profile, pal);
+    if tb.new_pane {
+        out.new_pane = true;
+    }
     if tb.open_settings {
         out.settings_opened = true;
     }
@@ -270,16 +290,58 @@ pub fn show(
                         egui::StrokeKind::Inside,
                     );
                 }
+                // 窗格关闭按钮（F5 批2）：多窗格时悬停窗格右上角浮现
+                // 小 ✕（裁决：右键已被「有选区复制/无选区粘贴」惯例
+                // 占用，右键菜单会破坏既有交互；悬停 ✕ 是 Warp 的窗格
+                // 控件形态、成本也更低）。命中区每帧固定注册（id 稳定、
+                // 首点即响应），仅悬停本窗格时绘制；✕ 用画线而非字形
+                // （不赌字体覆盖）。raw 鼠标路由对该矩形让位见 main.rs。
+                if input.panes.len() > 1 {
+                    let close_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.max.x - PANE_CLOSE_SIZE - 6.0, rect.min.y + 6.0),
+                        egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                    );
+                    let cresp = ui.interact(
+                        close_rect,
+                        ui.id().with(("pane_close", i)),
+                        egui::Sense::click(),
+                    );
+                    if ui.rect_contains_pointer(rect) || cresp.hovered() {
+                        let painter = ui.painter();
+                        let c = close_rect.center();
+                        if cresp.hovered() {
+                            painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                        }
+                        let r = 3.5;
+                        let stroke = egui::Stroke::new(
+                            1.2,
+                            if cresp.hovered() { pal.fg } else { pal.fg_dim },
+                        );
+                        painter.line_segment(
+                            [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                            stroke,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                            stroke,
+                        );
+                    }
+                    if cresp.on_hover_text("关闭窗格 (Ctrl+Shift+W)").clicked() {
+                        out.pane_close = Some(i);
+                    }
+                    out.pane_close_rects.push(close_rect);
+                }
                 out.pane_rects.push(rect);
             }
         });
 
-    // 文件树节点拖放的落点判定：要等 CentralPanel 布局出本帧终端区
-    // 矩形，故放在面板之后。落在终端区 → 请求把路径插入命令行；
-    // 落在别处（侧栏/树内回弹）→ 静默忽略。
+    // 文件树节点拖放的落点判定：要等 CentralPanel 布局出本帧窗格
+    // 矩形，故放在面板之后。落在某窗格 → 请求把路径插入**该窗格**
+    // 的命令行（F5 批2：目标 = 鼠标落点所在窗格，main 会先聚焦它）；
+    // 落在别处（侧栏/树内回弹/窗格间隙）→ 静默忽略。
     if let Some((path, pos)) = ft.external_drop {
-        if out.term_rect.contains(pos) {
-            out.insert_path = Some(path);
+        if let Some(pi) = out.pane_rects.iter().position(|r| r.contains(pos)) {
+            out.insert_path = Some((pi, path));
         }
     }
 
@@ -409,6 +471,18 @@ fn sidebar_ui(
         if entry.unseen {
             let center = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
             ui.painter().circle_filled(center, 3.0, pal.accent);
+        }
+        // 窗格数指示（F5 批2）：多窗格 tab 在条目右侧标「N 格」
+        // （有未读点时左移让位）。
+        if entry.pane_count > 1 {
+            let x = resp.rect.right() - if entry.unseen { 18.0 } else { 8.0 };
+            ui.painter().text(
+                egui::pos2(x, resp.rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{} 格", entry.pane_count),
+                egui::FontId::proportional(10.0),
+                pal.fg_dim,
+            );
         }
     }
 

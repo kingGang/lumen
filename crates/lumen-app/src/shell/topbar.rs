@@ -1,14 +1,19 @@
-//! 顶栏（M3.5）：左侧激活会话标题 + 右侧圆形头像按钮与下拉菜单。
+//! 顶栏（M3.5）：左侧激活会话标题 + 右侧新增窗格按钮、圆形头像
+//! 按钮与下拉菜单。
 //!
 //! 规格（docs/M3应用外壳设计.md §4 第④行，参考截图
 //! docs/截图/用户头像下拉弹窗.png）：未登录头像为占位人形图标，已
 //! 登录为强调色圆底 + 展示名首字母；点击弹下拉菜单——已登录：展示名
 //! （灰字不可点）/ Settings / Keyboard shortcuts / Documentation
 //! （灰显占位）/ 分隔线 / Log out；未登录：Log in / Settings /
-//! Keyboard shortcuts。UI 只产出动作（[`TopbarOutput`]），登录/登出
-//! 与设置页打开由上层执行。
+//! Keyboard shortcuts。F5（M3.7 批2）在头像左侧加「＋」按钮：焦点
+//! tab 内新增窗格（同 Ctrl+Shift+D），满额禁用 + 悬停提示——位置
+//! 裁决：F5 规格「终端区右侧 + 按钮」，顶栏右端即终端工作区右上角，
+//! 浮于终端内容上的按钮会遮挡输出且与选区/右键粘贴冲突。UI 只产出
+//! 动作（[`TopbarOutput`]），登录/登出与设置页打开/增窗格由上层执行。
 
 use crate::profile::Profile;
+use crate::session::MAX_PANES;
 
 use super::theme::Palette;
 
@@ -31,13 +36,17 @@ pub struct TopbarOutput {
     pub open_shortcuts: bool,
     /// 点击了 Log out。
     pub log_out: bool,
+    /// 点击了「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
+    pub new_pane: bool,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
-/// `title` 为激活会话标题，与窗口标题同源（main 的 display_title）。
+/// `title` 为激活会话标题，与窗口标题同源（main 的 display_title）；
+/// `pane_count` 为激活 tab 当前窗格数（「＋」按钮满额禁用判定）。
 pub fn show(
     root: &mut egui::Ui,
     title: &str,
+    pane_count: usize,
     profile: Option<&Profile>,
     pal: &Palette,
 ) -> TopbarOutput {
@@ -52,13 +61,26 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(10, 0)),
         )
         .show_inside(root, |ui| {
-            // 头像钉在最右（right_to_left），余下空间给标题截断展示。
+            // 头像钉在最右（right_to_left），其左是「＋」新增窗格
+            // 按钮，余下空间给标题截断展示。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let resp = avatar_button(ui, profile, pal);
                 let _ = egui::Popup::menu(&resp)
                     .align(egui::RectAlign::BOTTOM_END)
                     .width(MENU_WIDTH)
                     .show(|ui| menu_ui(ui, profile, pal, &mut out));
+                ui.add_space(6.0);
+                // 「＋」新增窗格（F5）：满 MAX_PANES 时禁用 + 悬停提示。
+                let plus =
+                    egui::Button::new(egui::RichText::new("＋").size(15.0).color(pal.fg_dim))
+                        .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
+                let presp = ui
+                    .add_enabled(pane_count < MAX_PANES, plus)
+                    .on_hover_text("新增窗格 (Ctrl+Shift+D)")
+                    .on_disabled_hover_text(format!("最多 {MAX_PANES} 个窗格"));
+                if presp.clicked() {
+                    out.new_pane = true;
+                }
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(
