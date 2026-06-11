@@ -271,6 +271,26 @@ impl Grid {
     /// **优先丢弃光标行以下的纯空行**，不足时才把顶行滚入历史
     /// （alacritty/wezterm 同语义）。
     ///
+    /// # 扩行策略（B3 修复）
+    ///
+    /// 扩大行数时**优先从 scrollback 尾部拉回历史行**到 screen 顶部，
+    /// scrollback 耗尽才在底部 push_back 空行。
+    ///
+    /// 这与 Windows ConPTY 的「大缓冲+视口」模型一致：窗口放大时视口
+    /// 向上扩展，把历史行重新露出来，光标缓冲绝对位置不变，光标相对
+    /// 视口的行号增大（露出几行增加几行）。
+    ///
+    /// 绝对行号自洽性：绝对行号 = dropped_lines + scrollback.len() + screen_idx。
+    /// 拉回一行时 scrollback.len() 减 1，screen 顶部增一行（所有既有行
+    /// 的 screen_idx 各加 1），cursor.row 同步加 1 → cursor 绝对行号
+    /// 不变；其余所有 screen 行的绝对行号同理不变；dropped_lines 不动。
+    /// 命令块/选区按绝对行号标记，拉回后标记不漂移。
+    ///
+    /// 若只在底部 push_back 空行（旧行为），光标 row 不变，而 ConPTY
+    /// 已按新视口（多了 N 行历史）发 CUP 坐标——两套坐标差 N 行，
+    /// PSReadLine 行编辑持续错位，直到 DSR/CPR（回车时发）重新对齐，
+    /// 即「放大窗口后打字错乱、回车后恢复」的 B3 根因。
+    ///
     /// # 两步缩行策略
     ///
     /// 第一步（B2 修复①）：收割光标行以下的纯空行直接丢弃（不入历史）。
@@ -283,15 +303,6 @@ impl Grid {
     /// dropped_lines 同步递增（绝对行号基准，选区/命令块标记不漂移）。
     /// 光标行上移以指向相同内容。
     ///
-    /// # 关于 B3 打字错乱的真实根因（供后续排查参考）
-    ///
-    /// B3 症状（运行中新建窗格第一提示符行打字错乱）的根因**不在**
-    /// scroll-back 推入逻辑，而在 new_pane() 用「旧布局尺寸」spawn
-    /// 新 shell：新格加入后布局重排（权重均分），真实宽度完全不同；
-    /// shell 按错误宽度打印首个提示符，下一帧 resize 通知 ConPTY，
-    /// PSReadLine 坐标簿仍基于旧假设 → 首行编辑持续列错位。
-    /// 修复在 new_pane()（见 main.rs），本函数行为无需更改。
-    ///
     /// # Errors（无，文档段）
     ///
     /// 此方法不返回 `Result`，维度夹紧在内部处理。
@@ -302,8 +313,21 @@ impl Grid {
         for row in &mut self.screen {
             row.resize(cols);
         }
+        // 扩行：优先从 scrollback 尾部拉回历史行填充 screen 顶部
+        // （ConPTY「视口向上扩展露出历史」语义）；scrollback 耗尽才
+        // 在底部 push_back 空行（无历史的新鲜窗格走此分支）。
+        // 每拉回一行：scrollback 少一行，cursor.row 加一——光标绝对
+        // 行号保持不变（自洽性见本方法 rustdoc）。
         while self.screen.len() < rows {
-            self.screen.push_back(Row::new(cols));
+            if let Some(hist) = self.scrollback.pop_back() {
+                // 拉回历史行：插入 screen 顶部，所有既有行的 screen 下标
+                // 各自向后移一位，cursor 相对行号同步增一。
+                self.screen.push_front(hist);
+                self.cursor.row = self.cursor.row.saturating_add(1);
+            } else {
+                // scrollback 已空：底部补空行（无历史分支）。
+                self.screen.push_back(Row::new(cols));
+            }
         }
         // 缩小行数，第一步：收割光标行**以下**的纯空行（直接丢弃、
         // 不进历史——空行入历史会让 scrollback 凭空多出空白段）。
@@ -460,5 +484,140 @@ mod tests {
         g.scroll_display(1);
         let first: Vec<char> = g.visible_rows().map(|r| r[0].ch).collect();
         assert_eq!(first, vec!['x', 'y']);
+    }
+
+    // ── B3 专项单测：扩行拉回历史语义（ConPTY「视口向上扩展」修复）──
+
+    #[test]
+    fn b3_有历史扩行时历史行拉回顶部光标下移() {
+        // 场景：shell 跑了几条命令，3 行历史进 scrollback，当前 screen
+        // 顶行是提示符（行0='P'），光标在 screen 第 0 行（row=0）。
+        // 窗口放大：rows 3→5，扩 2 行。
+        // 期望：从 scrollback 尾部拉回 2 行到 screen 顶部，cursor.row
+        // 增加 2（光标绝对行号不变）。
+        let mut g = Grid::new(3, 4, 100);
+        // 构造 3 行历史（字符 'a','b','c'）
+        for ch in ['a', 'b', 'c'] {
+            g.cell_mut(0, 0).ch = ch;
+            g.scroll_up_one(true);
+        }
+        // screen 顶行写提示符 'P'，光标在 screen[0]
+        g.cell_mut(0, 0).ch = 'P';
+        g.cursor.row = 0;
+        let abs_before = g.absolute_cursor_line();
+
+        g.resize(5, 4);
+
+        // scrollback 3 行拉回 2 行后剩 1 行
+        assert_eq!(g.scrollback_len(), 1, "scrollback 应剩 1 行");
+        // screen 现在 5 行：顶部 2 行是历史（'b','c'），第 2 行是原 screen[0]('P')
+        assert_eq!(g.row(0)[0].ch, 'b', "screen[0] 应是历史次旧行 b");
+        assert_eq!(g.row(1)[0].ch, 'c', "screen[1] 应是历史最新行 c");
+        assert_eq!(g.row(2)[0].ch, 'P', "screen[2] 应是原提示符行 P");
+        // 光标行向下移了 2（历史拉回 2 行）
+        assert_eq!(g.cursor.row, 2, "cursor.row 应从 0 增为 2");
+        // 绝对行号不变（B3 核心断言）
+        assert_eq!(
+            g.absolute_cursor_line(),
+            abs_before,
+            "扩行后光标绝对行号必须不变"
+        );
+    }
+
+    #[test]
+    fn b3_无历史扩行底部补空行光标不动() {
+        // 场景：新鲜窗格，无历史，screen 只有提示符（顶行有 'P'），
+        // 光标在 screen[0]。窗口放大：rows 3→5，扩 2 行。
+        // 期望：底部补 2 个空行，cursor.row 不动（无历史可拉），
+        // 绝对行号不变。
+        let mut g = Grid::new(3, 4, 100);
+        g.cell_mut(0, 0).ch = 'P';
+        g.cursor.row = 0;
+        let abs_before = g.absolute_cursor_line();
+
+        g.resize(5, 4);
+
+        assert_eq!(g.scrollback_len(), 0, "无历史 scrollback 应仍为 0");
+        assert_eq!(g.row(0)[0].ch, 'P', "screen[0] 仍是提示符");
+        assert_eq!(g.row(3)[0].ch, ' ', "底部补的空行应为空白");
+        assert_eq!(g.cursor.row, 0, "无历史时 cursor.row 不动");
+        assert_eq!(g.absolute_cursor_line(), abs_before, "绝对行号不变");
+    }
+
+    #[test]
+    fn b3_缩行再扩行内容往返一致() {
+        // 场景：模拟「小窗口 → 大窗口」往返。先缩行（历史部分进
+        // scrollback），再扩回原大小，内容应能从 scrollback 拉回恢复。
+        let mut g = Grid::new(6, 4, 100);
+        // 前 4 行写入内容 'a'..'d'，光标在第 4 行，第 5 行空
+        for r in 0..4 {
+            g.cell_mut(r, 0).ch = char::from(b'a' + r as u8);
+        }
+        g.cursor.row = 3;
+
+        // 缩到 4 行（丢弃 1 个底部空行后仍需搬 1 行进历史）
+        g.resize(4, 4);
+        assert_eq!(
+            g.scrollback_len(),
+            0,
+            "底部空行丢弃应足够，无需进 scrollback"
+        );
+        // 缩到 3 行
+        g.resize(3, 4);
+        assert_eq!(g.scrollback_len(), 1, "缩到 3 行后应有 1 行在 scrollback");
+        let abs_after_shrink = g.absolute_cursor_line();
+
+        // 扩回 4 行：应从 scrollback 拉回 1 行到顶部
+        g.resize(4, 4);
+        assert_eq!(g.scrollback_len(), 0, "扩行后 scrollback 应被拉空");
+        // 绝对行号在整个缩+扩周期内不变
+        assert_eq!(
+            g.absolute_cursor_line(),
+            abs_after_shrink,
+            "缩→扩往返后绝对行号不变"
+        );
+        // 内容在 screen[0] 可见（被拉回）
+        assert_eq!(g.row(0)[0].ch, 'a', "拉回行内容应为 'a'");
+    }
+
+    #[test]
+    fn b3_扩行后cup写入落点与conpty视口语义一致() {
+        // 端到端场景：模拟 ConPTY 行为。
+        // 步骤：
+        //  1. 制造 2 行历史（scrollback 含 'H','I' 两行）。
+        //  2. screen 顶行是提示符 'P'，光标 row=0（当前可视区 3 行）。
+        //  3. resize 到 5 行（放大窗口）→ 2 历史行拉回，cursor.row 变 2。
+        //  4. ConPTY 按新视口语义：在 row=0（新视口顶部，原历史最旧行）
+        //     写 'X' 字符 → 应命中 screen[0]（即原历史行 'H' 所在行）。
+        //     在 row=2（提示符行）写 'Y' → 命中 screen[2]（原提示符行 'P'）。
+        // 验证落点正确（与 ConPTY CUP 坐标吻合）。
+        let mut g = Grid::new(3, 4, 100);
+        // 制造 2 行历史：先写 'H'，scroll 进历史；再写 'I'，scroll 进历史
+        g.cell_mut(0, 0).ch = 'H';
+        g.scroll_up_one(true);
+        g.cell_mut(0, 0).ch = 'I';
+        g.scroll_up_one(true);
+        // screen[0] 写提示符，光标在 row=0
+        g.cell_mut(0, 0).ch = 'P';
+        g.cursor.row = 0;
+
+        // 放大：3 → 5 行（ConPTY 视口向上扩展 2 行）
+        g.resize(5, 4);
+
+        // 验证 screen 布局：[0]='H', [1]='I', [2]='P', [3]=' ', [4]=' '
+        assert_eq!(g.row(0)[0].ch, 'H');
+        assert_eq!(g.row(1)[0].ch, 'I');
+        assert_eq!(g.row(2)[0].ch, 'P');
+        // cursor.row 应为 2（与提示符行对齐）
+        assert_eq!(g.cursor.row, 2);
+
+        // 模拟 ConPTY 按新视口坐标发来 CUP(row=0) 并写入 'X'
+        // （ConPTY 按新视口顶行 = screen[0] = 原历史最旧行）
+        g.cell_mut(0, 0).ch = 'X';
+        assert_eq!(g.row(0)[0].ch, 'X', "CUP row=0 应命中 screen[0]");
+
+        // 模拟 ConPTY 按 CUP(row=2) 写入 'Y'（提示符所在行）
+        g.cell_mut(2, 0).ch = 'Y';
+        assert_eq!(g.row(2)[0].ch, 'Y', "CUP row=2 应命中提示符行");
     }
 }
