@@ -32,6 +32,12 @@
 //!   （深度/结果数/枚举量三重封顶），搜索态用扁平相对路径列表替代
 //!   树；双击沿用节点语义（目录=cd、文件=系统打开），Esc/再点 🔍
 //!   收起并恢复树视图。
+//!
+//! M3.6b（需求池 P7/P8）：
+//! - 目录右键菜单增加「进入文件夹」（与双击目录同链路，树根也有）。
+//! - 鼠标双击激活在 egui_ltreeview 0.7.0 存在上游 bug（Activate 不可
+//!   达，P8「双击文件不打开」的根因），以 [`merge_double_click_activation`]
+//!   合成规避，详见该函数文档。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -158,6 +164,8 @@ enum Dialog {
 
 /// 右键菜单点选的动作（菜单闭包经 RefCell 回传，树绘制结束后处理）。
 enum MenuAction {
+    /// 进入文件夹（cd 过去，与双击目录同一条链路：忙闸门 + 提示）。
+    EnterDir(PathBuf),
     /// 在目录下新建文件/文件夹（弹输入框）。
     Create { dir: PathBuf, is_dir: bool },
     /// 删除（先弹确认，确认后移入回收站）。
@@ -763,7 +771,7 @@ fn tree_ui(
                 epoch: *epoch,
                 tx: reply_tx,
             };
-            let (_resp, actions) = TreeView::new(ui.make_persistent_id("lumen_file_tree"))
+            let (resp, actions) = TreeView::new(ui.make_persistent_id("lumen_file_tree"))
                 .allow_multi_selection(false)
                 // 拖出树外释放 → MoveExternal（拖到终端区插入路径）。
                 // 节点本身 drop_allowed(false)：树内不支持移动文件，
@@ -772,27 +780,15 @@ fn tree_ui(
                 .show_state(ui, tree, |builder| {
                     add_node(builder, &mut load, 0, pal, &menu);
                 });
+            // 本帧真实产生的 Activate 目标（回车键路径；鼠标双击因上游
+            // bug 走不到这里，见 merge_double_click_activation）。
+            let mut activated: Vec<usize> = Vec::new();
+            // 本帧的点选动作（双击合成激活的依据）。
+            let mut selected_now: Option<Vec<usize>> = None;
             for action in actions {
                 match action {
-                    // 激活动作（双击/回车）：目录 → cd（shell 空闲才
-                    // 发），文件 → 系统默认程序打开。单选模式下至多
-                    // 一个节点。
-                    Action::Activate(act) => {
-                        for id in act.selected {
-                            let Some(info) = load.nodes.get(id) else {
-                                continue;
-                            };
-                            match info.kind {
-                                NodeKind::Dir => {
-                                    activate_dir(info.path.clone(), shell_idle, hint_until, out)
-                                }
-                                NodeKind::File => out.open_file = Some(info.path.clone()),
-                                NodeKind::Overflow(_)
-                                | NodeKind::Unreadable
-                                | NodeKind::Loading => {}
-                            }
-                        }
-                    }
+                    Action::Activate(act) => activated.extend(act.selected),
+                    Action::SetSelected(sel) => selected_now = Some(sel),
                     // 拖出树外释放：把 (路径, 释放点) 交给 shell 层
                     // 判定是否落在终端区（占位行不参与拖放）。
                     Action::MoveExternal(ext) => {
@@ -807,23 +803,69 @@ fn tree_ui(
                         }
                     }
                     // 树内移动不支持（drop_allowed=false 下不应出现，
-                    // 防御忽略）；拖动过程/选中变化无需处理。
-                    Action::Move(_)
-                    | Action::Drag(_)
-                    | Action::DragExternal(_)
-                    | Action::SetSelected(_) => {}
+                    // 防御忽略）；拖动过程无需处理。
+                    Action::Move(_) | Action::Drag(_) | Action::DragExternal(_) => {}
+                }
+            }
+            // 激活语义（双击/回车）：目录 → cd（shell 空闲才发），
+            // 文件 → 系统默认程序打开。单选模式下至多一个节点。
+            for id in merge_double_click_activation(activated, resp.double_clicked(), selected_now)
+            {
+                let Some(info) = load.nodes.get(id) else {
+                    continue;
+                };
+                match info.kind {
+                    NodeKind::Dir => activate_dir(info.path.clone(), shell_idle, hint_until, out),
+                    NodeKind::File => out.open_file = Some(info.path.clone()),
+                    NodeKind::Overflow(_) | NodeKind::Unreadable | NodeKind::Loading => {}
                 }
             }
         });
     // 树绘制结束（FileTreeState 的拆借已归还），处理右键菜单动作。
     if let Some(action) = menu.into_inner() {
-        handle_menu_action(st, action, out);
+        handle_menu_action(st, action, shell_idle, out);
     }
 }
 
+/// 鼠标双击激活的合成（egui_ltreeview 0.7.0 上游 bug 规避）。
+///
+/// 上游 bug：`do_input_output` 的 Click 分支先把单槽 output 设为
+/// `SetLastclicked`，随后普通单击路径无条件覆盖为 `SelectOneNode`，
+/// `last_clicked_node` 永远不被记录 → 双击判定 `was_clicked_last`
+/// 恒 false，鼠标双击的 `Action::Activate` 不可达（回车键走独立的
+/// `CollectActivatableNodes` 路径不受影响）。P8 的「双击文件不打开」
+/// 即源于此，且自 M3.3 引入 0.7.0 起就存在，与 M3.6 拖拽改造无关。
+///
+/// 规避：本帧已有真实 Activate（回车 / 上游修复后的双击）直接采用；
+/// 否则整树 Response 判定为双击且本帧有点选动作（双击第二击必产生
+/// `SetSelected`，egui 双击要求两击同点 6px 内，点中的必是同一行）
+/// 时，把被点选的节点视为激活目标。点 closer 三角/空白处不产生
+/// `SetSelected`，不会误激活。上游修复后真实 Activate 优先，合成
+/// 路径自动让位（不会双重激活）——届时下方「上游 bug 复现」单测会
+/// 失败提醒移除本函数。
+fn merge_double_click_activation(
+    activated: Vec<usize>,
+    double_clicked: bool,
+    selected_now: Option<Vec<usize>>,
+) -> Vec<usize> {
+    if !activated.is_empty() || !double_clicked {
+        return activated;
+    }
+    selected_now.unwrap_or_default()
+}
+
 /// 处理右键菜单点选的动作。
-fn handle_menu_action(st: &mut FileTreeState, action: MenuAction, out: &mut FileTreeOutput) {
+fn handle_menu_action(
+    st: &mut FileTreeState,
+    action: MenuAction,
+    shell_idle: bool,
+    out: &mut FileTreeOutput,
+) {
     match action {
+        MenuAction::EnterDir(path) => {
+            // 与双击目录完全同一条链路：控制字符拒绝 + 忙闸门 + 提示。
+            activate_dir(path, shell_idle, &mut st.hint_until, out);
+        }
         MenuAction::Create { dir, is_dir } => {
             st.dialog = Some(Dialog::Create {
                 dir,
@@ -1200,6 +1242,13 @@ fn dir_context_menu(
     menu: &RefCell<Option<MenuAction>>,
 ) {
     ui.set_min_width(150.0);
+    // 进入文件夹 = 双击目录的菜单等价物（需求池 P7）；树根也提供
+    // ——shell 中途 cd 走了之后可借此回到树根目录。
+    if ui.button("进入文件夹").clicked() {
+        *menu.borrow_mut() = Some(MenuAction::EnterDir(path.to_path_buf()));
+        ui.close();
+    }
+    ui.separator();
     if ui.button("新建文件").clicked() {
         *menu.borrow_mut() = Some(MenuAction::Create {
             dir: path.to_path_buf(),
@@ -1776,6 +1825,96 @@ mod tests {
                 "Report.md".to_owned(),
                 "report_v2.md".to_owned()
             ]
+        );
+    }
+
+    #[test]
+    fn 双击合成激活_合并规则() {
+        // 已有真实 Activate（回车/上游修复后）：原样采用，双击不重复。
+        assert_eq!(
+            merge_double_click_activation(vec![3], true, Some(vec![3])),
+            vec![3]
+        );
+        assert_eq!(merge_double_click_activation(vec![3], false, None), vec![3]);
+        // 双击 + 本帧点选：合成激活点选节点。
+        assert_eq!(
+            merge_double_click_activation(Vec::new(), true, Some(vec![5])),
+            vec![5]
+        );
+        // 双击但本帧无点选（点了 closer 三角/空白处）：不激活。
+        assert!(merge_double_click_activation(Vec::new(), true, None).is_empty());
+        // 非双击且无 Activate：不激活。
+        assert!(merge_double_click_activation(Vec::new(), false, Some(vec![5])).is_empty());
+    }
+
+    /// egui_ltreeview 0.7.0 上游 bug 的无头复现（合成激活路径的依据）：
+    /// 鼠标双击不产生 Activate 动作，但产生 SetSelected + 整树 Response
+    /// 的 double_clicked。**若本测试失败**说明上游已修复双击 Activate，
+    /// 应移除 merge_double_click_activation 的合成分支防止双重激活。
+    #[test]
+    fn 双击激活_上游bug复现与合成信号() {
+        use egui_ltreeview::{NodeBuilder, TreeView, TreeViewState};
+        let ctx = egui::Context::default();
+        let mut tree: TreeViewState<usize> = TreeViewState::default();
+        // 跑一帧：返回 (动作列表, 整树 Response 是否双击)。
+        let frame = |tree: &mut TreeViewState<usize>, events: Vec<egui::Event>, t: f64| {
+            let mut actions = Vec::new();
+            let mut dbl = false;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 240.0),
+                )),
+                time: Some(t),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(raw, |ui| {
+                let (resp, acts) = TreeView::new(egui::Id::new("dbl_repro"))
+                    .allow_multi_selection(false)
+                    .allow_drag_and_drop(true)
+                    .show_state(ui, tree, |b| {
+                        b.node(NodeBuilder::leaf(7usize).label("目标文件"));
+                    });
+                dbl = resp.double_clicked();
+                actions = acts;
+            });
+            (actions, dbl)
+        };
+        let pos = egui::pos2(60.0, 10.0); // 根 Ui 无边距下的首行行内
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        // 帧 0：初始布局（建立行矩形与悬停）。
+        frame(&mut tree, vec![egui::Event::PointerMoved(pos)], 0.0);
+        // 第一击（按下/抬起分两帧，与真实输入一致）。
+        frame(&mut tree, vec![button(true)], 0.05);
+        let (a1, _) = frame(&mut tree, vec![button(false)], 0.10);
+        assert!(
+            a1.iter()
+                .any(|a| matches!(a, Action::SetSelected(s) if s == &vec![7])),
+            "首击应命中并点选节点（命不中说明测试坐标偏离行矩形）: {a1:?}"
+        );
+        // 第二击（双击窗口 0.3s、6px 内）。
+        frame(&mut tree, vec![button(true)], 0.15);
+        let (a2, dbl) = frame(&mut tree, vec![button(false)], 0.20);
+        assert!(dbl, "egui 应判定为双击");
+        assert!(
+            !a2.iter().any(|a| matches!(a, Action::Activate(_))),
+            "egui_ltreeview 上游已修复双击 Activate：请移除 merge_double_click_activation 合成分支"
+        );
+        // 合成路径依赖的信号组合成立：双击 + 本帧点选 → 激活点选节点。
+        let sel = a2.iter().find_map(|a| match a {
+            Action::SetSelected(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            merge_double_click_activation(Vec::new(), dbl, sel),
+            vec![7],
+            "双击第二击应产生 SetSelected，供合成激活使用"
         );
     }
 
