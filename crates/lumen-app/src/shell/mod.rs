@@ -306,6 +306,19 @@ pub fn show(
         )
         .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
     out.sidebar_width = sb_resp.response.rect.width();
+    // P16：左侧会话栏 1px 内描边——像素对齐（物理像素 1px），防分数 DPI 模糊。
+    // 用 StrokeKind::Inside 避免与相邻面板描边叠成 2px。
+    {
+        use egui::emath::GuiRounding as _;
+        let ppp = root.pixels_per_point();
+        let sr = sb_resp.response.rect.round_to_pixels(ppp);
+        root.painter().rect_stroke(
+            sr,
+            0.0,
+            egui::Stroke::new(1.0 / ppp, pal.panel_outline),
+            egui::StrokeKind::Inside,
+        );
+    }
     // 侧栏右缘的拖宽手柄命中区（与面板边线同心、向两侧各探
     // resize_grab_radius_side）：报给 main 让 raw 鼠标按下让位——
     // 拖宽期间不交出终端焦点，调完宽度接着打字不断流。
@@ -328,6 +341,18 @@ pub fn show(
         app_settings.layout.filetree_width,
     );
     out.filetree_width = ft.panel_width;
+    // P16：文件树栏（展开或窄条）1px 内描边，像素对齐。
+    if let Some(ft_rect) = ft.panel_rect {
+        use egui::emath::GuiRounding as _;
+        let ppp = root.pixels_per_point();
+        let fr = ft_rect.round_to_pixels(ppp);
+        root.painter().rect_stroke(
+            fr,
+            0.0,
+            egui::Stroke::new(1.0 / ppp, pal.panel_outline),
+            egui::StrokeKind::Inside,
+        );
+    }
     if ft.panel_width.is_some() {
         // 文件树右缘手柄探入终端区左缘数像素，必须让位（收起窄条不
         // 可拖宽，无手柄不让位）。
@@ -362,6 +387,14 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+            // P16：命令行区（CentralPanel 整体）1px 内描边，像素对齐。
+            // 在终端内容区外缘画，视觉层次：轮廓 < 分隔线 < 焦点 accent 边框。
+            ui.painter().rect_stroke(
+                area,
+                0.0,
+                egui::Stroke::new(1.0 / ppp, pal.panel_outline),
+                egui::StrokeKind::Inside,
+            );
             // 分屏布局（F5/F7③）：网格结构固定、比例可调（权重挂
             // Tab，main 传入本帧快照）；布局与窗格数不符（防御：结构
             // 刚变更的过渡帧）时退回均分。

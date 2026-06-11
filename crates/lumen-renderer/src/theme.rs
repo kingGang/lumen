@@ -64,10 +64,19 @@ pub struct Theme {
 
 impl Default for Theme {
     /// 默认主题 = Lumen Dark（注册表 id `lumen-dark`，P12）：
-    /// Tokyo Night night 终端色 + M3.7b 黑白化中性灰选区。
+    /// Tokyo Night night ANSI 16 色 + M3.7b 黑白化中性灰选区 +
+    /// P16 近黑终端底色（海风哥：「要黑色」，改 #0d0d0d）。
+    ///
+    /// 选值理由（P16）：纯黑 #000 显死板、字符边缘抗锯齿发光；
+    /// #0d0d0d 接近纯黑但保留一丝质感，与外壳近黑底 #161616 形成
+    /// 终端区更深的内凹层次——Terminal 内容在整个画面最黑，符合
+    /// 「命令行区黑底」诉求同时保持视觉协调。
+    /// 中性灰选区 #404040 在 #0d0d0d 底对比约 3.0:1（选区为装饰底，
+    /// 不要求 AA——选区内文字另有前景色保障可读性）。
     fn default() -> Self {
         Self {
-            background: Rgb(0x1a, 0x1b, 0x26),
+            // P16：终端底色改近黑（原 Tokyo Night night bg #1a1b26 是蓝紫调）。
+            background: Rgb(0x0d, 0x0d, 0x0d),
             foreground: Rgb(0xc0, 0xca, 0xf5),
             cursor: Rgb(0xc0, 0xca, 0xf5),
             // M3.7b：中性灰选区（原 Tokyo Night 蓝灰 0x2e,0x3c,0x64，

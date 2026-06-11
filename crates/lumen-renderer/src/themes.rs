@@ -118,9 +118,10 @@ pub fn find_or_default(id: &str) -> &'static ThemeInfo {
     find(id).unwrap_or(&BUILTIN[0])
 }
 
-/// Lumen Dark（默认）：Tokyo Night night 终端色 + P9 黑白化的中性灰
-/// 选区（与黑白外壳同向；亮色 ANSI 沿用 M3.4 以来的「亮=常规」简化
-/// 映射，保持现状观感不变——纯正官方版见 [`tokyo_night`]）。
+/// Lumen Dark（默认）：Tokyo Night night ANSI 16 色 + P9 黑白化的中性灰
+/// 选区 + P16 近黑终端底色（`#0d0d0d`，海风哥「要黑色」诉求；原
+/// Tokyo Night bg `#1a1b26` 是蓝紫调）。亮色 ANSI 沿用「亮=常规」简化
+/// 映射（纯正官方版见 [`tokyo_night`]）。
 fn lumen_dark() -> Theme {
     Theme::default()
 }

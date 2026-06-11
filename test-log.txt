@@ -1,0 +1,175 @@
+   Compiling lumen-term v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-term)
+   Compiling lumen-renderer v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-renderer)
+   Compiling lumen-app v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.96s
+     Running unittests src\main.rs (target\debug\deps\lumen-1ad08deb5cadfb51.exe)
+
+running 96 tests
+test profile::tests::mock校验规则 ... ok
+test profile::tests::头像首字母 ... ok
+test profile::tests::缺失文件即未登录 ... ok
+test profile::tests::bom前缀_正常解析 ... ok
+test sessions_store::tests::缺失文件降级 ... ok
+test settings::tests::生效主题id_随sync与系统深浅 ... ok
+test settings::tests::缺失文件降级默认 ... ok
+test profile::tests::空邮箱视同损坏 ... ok
+test sessions_store::tests::cwd失效回退 ... ok
+test settings::tests::默认值 ... ok
+test shell::filetree::tests::cd命令_单引号翻倍 ... ok
+test shell::filetree::tests::cd命令_弯引号同形字翻倍 ... ok
+test shell::filetree::tests::cd命令_控制字符拒绝 ... ok
+test shell::filetree::tests::cd命令_普通路径 ... ok
+test shell::filetree::tests::cd命令_空格与中文 ... ok
+test shell::filetree::tests::cd命令_美元与反引号原样 ... ok
+test settings::tests::bom前缀_正常解析 ... ok
+test shell::filetree::tests::双击合成激活_合并规则 ... ok
+test profile::tests::缺展示名由邮箱推导 ... ok
+test sessions_store::tests::下标越界与窗格超限夹紧 ... ok
+test shell::filetree::tests::后台读目录_不存在目录返回err ... ok
+test shell::filetree::tests::拖放插入_弯引号同形字翻倍 ... ok
+test shell::filetree::tests::拖放插入_控制字符拒绝 ... ok
+test sessions_store::tests::批1过渡格式_active别名与缺version ... ok
+test shell::filetree::tests::拖放插入_空格与中文包裹引号 ... ok
+test sessions_store::tests::旧v2无权重字段自动均分 ... ok
+test shell::filetree::tests::拖放插入_纯安全字符裸插 ... ok
+test shell::filetree::tests::拖放插入_美元符包裹后字面量 ... ok
+test shell::filetree::tests::新建名字校验 ... ok
+test shell::layout::tests::from_weights_合法归一化与非法回退 ... ok
+test shell::layout::tests::分隔条几何与数量 ... ok
+test sessions_store::tests::损坏文件降级 ... ok
+test shell::layout::tests::区域偏移与边界 ... ok
+test shell::layout::tests::双击恢复均分 ... ok
+test shell::layout::tests::均分一格满屏 ... ok
+test shell::layout::tests::均分三格左中右 ... ok
+test shell::layout::tests::均分两格左右 ... ok
+test shell::layout::tests::均分五格上3下2 ... ok
+test shell::layout::tests::均分六格上3下3 ... ok
+test shell::layout::tests::均分四格上2下2 ... ok
+test shell::layout::tests::增删重置均分 ... ok
+test shell::layout::tests::拖动列分隔并钳制最小宽 ... ok
+test shell::layout::tests::拖动排分隔并钳制最小高 ... ok
+test shell::layout::tests::拖动越界下标不崩 ... ok
+test shell::layout::tests::权重切分两列一比三 ... ok
+test shell::layout::tests::权重切分排高与末格贴齐 ... ok
+test shell::layout::tests::空间不足时拖动冻结 ... ok
+test shell::layout::tests::零与超限 ... ok
+test shell::tests::换位落点_命中目标窗格 ... ok
+test shell::tests::换位落点_源格与区外取消 ... ok
+test shell::theme::tests::lumen双主题走手调板不派生 ... ok
+test shell::theme::tests::工具函数_mix与contrast ... ok
+test shell::theme::tests::派生_accent保持黑白化 ... ok
+test shell::theme::tests::派生_浅色亮度阶梯单调递减 ... ok
+test shell::theme::tests::派生_对比度下限 ... ok
+test sessions_store::tests::未来版本尽力加载 ... ok
+test shell::theme::tests::派生_深色亮度阶梯单调递增 ... ok
+test single_instance::tests::multi_flag_arg ... ok
+test single_instance::tests::multi_flag_env ... ok
+test single_instance::tests::sanitize_user_strips_backslash ... ok
+test single_instance::tests::wide_null_terminated ... ok
+test tests::下标越界时退化为顺序遍历 ... ok
+test tests::单窗格与空列表 ... ok
+test tests::宽度写盘判定_正常变化才写 ... ok
+test tests::宽度写盘判定_瞬态与非法不写 ... ok
+test sessions_store::tests::空tab列表视同缺失 ... ok
+test tests::恢复估算_五格上3下2_扣标题栏 ... ok
+test tests::恢复估算_布局形状不符回退均分 ... ok
+test tests::恢复估算_最大化格按整区其余按布局 ... ok
+test tests::焦点窗格最先_激活tab次之 ... ok
+test sessions_store::tests::空白自定义名视同未命名 ... ok
+test sessions_store::tests::空窗格tab被丢弃 ... ok
+test sessions_store::tests::缺字段平滑加载 ... ok
+test profile::tests::损坏文件降级未登录 ... ok
+test settings::tests::侧栏宽度_旧文件缺节补默认 ... ok
+test settings::tests::主题id_未注册降级默认 ... ok
+test settings::tests::字段级容错_appearance非对象整节降级 ... ok
+test settings::tests::字段级容错_字号类型非法不连坐 ... ok
+test settings::tests::字段级容错_theme非法不连坐 ... ok
+test settings::tests::损坏文件降级默认 ... ok
+test settings::tests::旧文件缺字段平滑升级 ... ok
+test settings::tests::迁移_v2文件的官方tokyo_night不迁移 ... ok
+test shell::filetree::tests::双击激活_上游bug复现与合成信号 ... ok
+test settings::tests::侧栏宽度_越界与非法夹紧 ... ok
+test settings::tests::字号越界夹紧 ... ok
+test profile::tests::序列化往返 ... ok
+test shell::filetree::tests::搜索_代次作废提前退出 ... ok
+test sessions_store::tests::带布局权重往返 ... ok
+test sessions_store::tests::嵌套格式序列化往返 ... ok
+test profile::tests::登出删除后回未登录 ... ok
+test settings::tests::序列化往返 ... ok
+test shell::filetree::tests::后台读目录_排序与隐藏过滤 ... ok
+test settings::tests::迁移_旧主题值映射到lumen双主题 ... ok
+test sessions_store::tests::旧平铺格式自动迁移 ... ok
+test sessions_store::tests::最大化下标往返与夹紧 ... ok
+test shell::filetree::tests::搜索_递归匹配与隐藏过滤 ... ok
+
+test result: ok. 96 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src\lib.rs (target\debug\deps\lumen_pty-0d786d48a8b08d1e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\lumen_renderer-e74a37e69c29460e.exe)
+
+running 5 tests
+test themes::tests::lumen_dark_即现状默认主题 ... ok
+test themes::tests::明暗标志与终端底色一致 ... ok
+test themes::tests::内置主题_id唯一且非空 ... ok
+test themes::tests::默认主题约定 ... ok
+test tests::长行排版宽度与网格一致 ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running unittests src\lib.rs (target\debug\deps\lumen_term-c14fa0d8ce581e4f.exe)
+
+running 40 tests
+test grid::tests::历史超限后丢弃最旧行 ... ok
+test grid::tests::visible_rows_拼接历史与可视区 ... ok
+test grid::tests::缩行不收割带背景的空行 ... ok
+test grid::tests::用户滚动偏移夹紧在历史范围内 ... ok
+test grid::tests::缩行优先丢弃光标下方空行 ... ok
+test grid::tests::缩行历史超限时绝对行号不漂移 ... ok
+test grid::tests::缩行空行不足时顶行进历史 ... ok
+test term::tests::alt_screen下块查询用主屏坐标 ... ok
+test term::tests::osc133_d不改写已闭合块 ... ok
+test term::tests::osc133_块边界采集 ... ok
+test term::tests::osc9_9_中文路径 ... ok
+test term::tests::bracketed_paste_模式记录 ... ok
+test term::tests::osc9_其他子命令与空路径忽略 ... ok
+test term::tests::cls后行号回退使旧块失效 ... ok
+test term::tests::dsr_光标位置应答 ... ok
+test term::tests::shell等待输入判定_备用屏幕视为忙 ... ok
+test term::tests::光标定位与擦除 ... ok
+test term::tests::osc9_9_cwd上报_基础与覆盖 ... ok
+test grid::tests::滚动一行后顶行进入历史 ... ok
+test term::tests::帧尾未归位判定 ... ok
+test term::tests::osc9_9_含分号路径重新拼接 ... ok
+test term::tests::按绝对行查块与块文本提取 ... ok
+test term::tests::ris后块id不复用 ... ok
+test term::tests::sgr_256色与真彩 ... ok
+test term::tests::未闭合块下边界按调用方上限截断 ... ok
+test term::tests::sgr_基础色与重置 ... ok
+test term::tests::shell等待输入判定_完整命令周期 ... ok
+test term::tests::备用屏幕切换与恢复 ... ok
+test term::tests::宽字符占两列 ... ok
+test term::tests::osc9_9_带引号与空格路径 ... ok
+test term::tests::满屏后滚动进历史 ... ok
+test term::tests::同步更新模式切换与查询应答 ... ok
+test term::tests::滚动区内滚动不进历史 ... ok
+test term::tests::缩行后提示符仍在可视区 ... ok
+test term::tests::无结尾换行的输出不丢最后一行 ... ok
+test term::tests::普通文本写入与换行 ... ok
+test term::tests::滚动到绝对行 ... ok
+test term::tests::行尾延迟换行 ... ok
+test term::tests::未闭合块不向光标下方空白区延伸 ... ok
+test term::tests::选区文本提取_跨行与宽字符 ... ok
+
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples\replay.rs (target\debug\examples\replay-f8c8ede4171d8605.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

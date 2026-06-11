@@ -550,6 +550,9 @@ pub struct FileTreeOutput {
     /// 展开面板本帧的实际宽度（逻辑点；P10 持久化用）。收起窄条时
     /// 为 None——不覆盖已存的展开宽度。
     pub panel_width: Option<f32>,
+    /// 面板本帧实际占用矩形（含展开态与窄条；P16 描边用）。None
+    /// 仅在极端边角（面板未渲染）时出现，正常帧必有值。
+    pub panel_rect: Option<egui::Rect>,
 }
 
 /// 绘制文件树栏（位于 tab 侧栏右侧、终端区左侧）。
@@ -590,8 +593,9 @@ pub fn show(
             )
             .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, &mut out));
         out.panel_width = Some(resp.response.rect.width());
+        out.panel_rect = Some(resp.response.rect);
     } else {
-        egui::Panel::left("lumen_filetree_strip")
+        let strip_resp = egui::Panel::left("lumen_filetree_strip")
             .exact_size(STRIP_WIDTH)
             .resizable(false)
             .show_separator_line(false)
@@ -607,6 +611,7 @@ pub fn show(
                     st.visible = true;
                 }
             });
+        out.panel_rect = Some(strip_resp.response.rect);
     }
 
     // 对话框（新建输入/删除确认）：模态层，面板收起时也照常显示。

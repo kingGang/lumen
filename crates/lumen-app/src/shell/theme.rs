@@ -49,6 +49,10 @@ pub struct Palette {
     pub error: egui::Color32,
     /// 信息提示色（toast Info）：M3.7b 起中性白灰/深灰（原青色去彩）。
     pub info: egui::Color32,
+    /// 三栏面板外轮廓描边色（P16）：深色板中亮灰（比 bg_highlight 再亮一
+    /// 档），在近黑底上清晰可见；浅色板对应中深灰（比 bg_highlight 再深
+    /// 一档）。色值独立于分隔线/悬停档，专门服务「面板边界轮廓」语义。
+    pub panel_outline: egui::Color32,
 }
 
 /// 深色色板（纯黑白灰阶，Warp 深色观感）。
@@ -84,6 +88,12 @@ pub static DARK: Palette = Palette {
     error: egui::Color32::from_rgb(0xf7, 0x76, 0x8e),
     // #d6d6d6 toast Info 中性白灰（原青 #7dcfff 去彩）。
     info: egui::Color32::from_rgb(0xd6, 0xd6, 0xd6),
+    // #626262 面板外轮廓描边（P16）：比 bg_highlight #383838 明显更亮，
+    // 在近黑外壳底（#161616）和终端黑底（#0d0d0d）上均清晰可见。
+    // 选 #626262（对 #161616 底约 4.0:1）——略低于 AA 但作为装饰线足够，
+    // 比焦点 accent 白弱一档，视觉层次：轮廓 < 分隔线(bg_highlight) <
+    // 焦点 accent(white)。
+    panel_outline: egui::Color32::from_rgb(0x62, 0x62, 0x62),
 };
 
 /// 浅色色板（深色板的白底黑字反转：近黑强调、控件「越深越明显」，
@@ -118,6 +128,9 @@ pub static LIGHT: Palette = Palette {
     error: egui::Color32::from_rgb(0xc6, 0x43, 0x43),
     // #3c3c3c toast Info 中性深灰（原青 #07879d 去彩）。
     info: egui::Color32::from_rgb(0x3c, 0x3c, 0x3c),
+    // #888888 面板外轮廓描边（P16）：浅色板方向——比 bg_highlight #cccccc
+    // 更深，在浅灰外壳底（#e6e6e6）上清晰可见（对 #e6e6e6 约 4.1:1）。
+    panel_outline: egui::Color32::from_rgb(0x88, 0x88, 0x88),
 };
 
 /// 取主题对应的外壳色板（P12 外壳联动）。
@@ -185,6 +198,8 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, black),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, black),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, black),
+            // 浅色派生：比 bg_highlight 再深 0.12 档，清晰勾勒面板边界。
+            panel_outline: mix(bg_dark, black, 0.28),
         }
     } else {
         // 深色：外壳比终端 bg 略暗（终端内容区微浮起），控件递亮。
@@ -216,6 +231,8 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, white),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, white),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, white),
+            // 深色派生：比 bg_highlight 再亮 0.12 档，在暗底上清晰勾勒面板边界。
+            panel_outline: mix(bg_dark, white, 0.40),
         }
     }
 }
@@ -461,16 +478,18 @@ mod tests {
 
     #[test]
     fn lumen双主题走手调板不派生() {
-        // P9 手调值保真：与静态板逐项一致（抽查关键字段）。
+        // P9/P16 手调值保真：与静态板逐项一致（抽查关键字段）。
         let d = shell_palette(lumen_renderer::themes::find_or_default(LUMEN_DARK));
         assert_eq!(d.bg_dark, DARK.bg_dark);
         assert_eq!(d.accent, DARK.accent);
         assert_eq!(d.selection, DARK.selection);
+        assert_eq!(d.panel_outline, DARK.panel_outline);
         assert!(!d.light);
         let l = shell_palette(lumen_renderer::themes::find_or_default(LUMEN_LIGHT));
         assert_eq!(l.bg_dark, LIGHT.bg_dark);
         assert_eq!(l.accent, LIGHT.accent);
         assert_eq!(l.selection, LIGHT.selection);
+        assert_eq!(l.panel_outline, LIGHT.panel_outline);
         assert!(l.light);
     }
 
