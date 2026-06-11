@@ -92,8 +92,14 @@ impl Theme {
         Self::default()
     }
 
-    /// Tokyo Night Light（浅色备选；色板取自 tokyonight 的 day 风格
-    /// 终端色，黑/亮黑在浅底上取浅灰保证可读）。
+    /// Tokyo Night Light（浅色主题）。
+    ///
+    /// 色值对齐 folke/tokyonight.nvim 官方 **day** 风格的终端色板
+    /// （extras/lua/tokyonight_day.lua 的 `terminal` 表，与
+    /// extras/alacritty/tokyonight_day.toml 一致，2026-06 校对）：
+    /// bg = `bg`，fg/cursor = `fg`，selection = `bg_visual`，
+    /// ANSI 0-7 = normal、8-15 = bright（官方亮色为独立调亮值，
+    /// 非 normal 复用）。
     pub fn tokyo_night_light() -> Self {
         Self {
             background: Rgb(0xe1, 0xe2, 0xe7),
@@ -101,22 +107,22 @@ impl Theme {
             cursor: Rgb(0x37, 0x60, 0xbf),
             selection: Rgb(0xb7, 0xc1, 0xe3),
             ansi: [
-                Rgb(0xb4, 0xb5, 0xb9), // 黑（浅底上的浅灰）
-                Rgb(0xf5, 0x2a, 0x65), // 红
-                Rgb(0x58, 0x75, 0x39), // 绿
-                Rgb(0x8c, 0x6c, 0x3e), // 黄
-                Rgb(0x2e, 0x7d, 0xe9), // 蓝
-                Rgb(0x98, 0x54, 0xf1), // 品红
-                Rgb(0x00, 0x71, 0x97), // 青
-                Rgb(0x61, 0x72, 0xb0), // 白
-                Rgb(0xa1, 0xa6, 0xc5), // 亮黑
-                Rgb(0xf5, 0x2a, 0x65),
-                Rgb(0x58, 0x75, 0x39),
-                Rgb(0x8c, 0x6c, 0x3e),
-                Rgb(0x2e, 0x7d, 0xe9),
-                Rgb(0x98, 0x54, 0xf1),
-                Rgb(0x00, 0x71, 0x97),
-                Rgb(0x37, 0x60, 0xbf), // 亮白
+                Rgb(0xb4, 0xb5, 0xb9), // 黑 terminal.black
+                Rgb(0xf5, 0x2a, 0x65), // 红 terminal.red
+                Rgb(0x58, 0x75, 0x39), // 绿 terminal.green
+                Rgb(0x8c, 0x6c, 0x3e), // 黄 terminal.yellow
+                Rgb(0x2e, 0x7d, 0xe9), // 蓝 terminal.blue
+                Rgb(0x98, 0x54, 0xf1), // 品红 terminal.magenta
+                Rgb(0x00, 0x71, 0x97), // 青 terminal.cyan
+                Rgb(0x61, 0x72, 0xb0), // 白 terminal.white
+                Rgb(0xa1, 0xa6, 0xc5), // 亮黑 terminal.black_bright
+                Rgb(0xff, 0x47, 0x74), // 亮红 terminal.red_bright
+                Rgb(0x5c, 0x85, 0x24), // 亮绿 terminal.green_bright
+                Rgb(0xa2, 0x76, 0x29), // 亮黄 terminal.yellow_bright
+                Rgb(0x35, 0x8a, 0xff), // 亮蓝 terminal.blue_bright
+                Rgb(0xa4, 0x63, 0xff), // 亮品红 terminal.magenta_bright
+                Rgb(0x00, 0x7e, 0xa8), // 亮青 terminal.cyan_bright
+                Rgb(0x37, 0x60, 0xbf), // 亮白 terminal.white_bright
             ],
         }
     }

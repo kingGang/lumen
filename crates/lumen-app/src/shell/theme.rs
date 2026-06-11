@@ -55,20 +55,37 @@ pub static DARK: Palette = Palette {
 };
 
 /// 浅色色板（Tokyo Night Light 同源）。
+///
+/// 色值对齐 folke/tokyonight.nvim 官方 **day** 风格 UI 色
+/// （extras/lua/tokyonight_day.lua，2026-06 校对）；逐项标注来源，
+/// 无官方对应的两处（filetree_fill / extreme_bg）为手调过渡色。
 pub static LIGHT: Palette = Palette {
     light: true,
-    bg_dark: egui::Color32::from_rgb(0xd4, 0xd6, 0xe1),
-    bg_panel: egui::Color32::from_rgb(0xe6, 0xe7, 0xed),
-    bg_highlight: egui::Color32::from_rgb(0xc0, 0xc6, 0xda),
+    // day.bg_dark / bg_sidebar：侧栏比终端底色深一档。
+    bg_dark: egui::Color32::from_rgb(0xd0, 0xd5, 0xe3),
+    // day.bg：弹层/卡片取主底色（day 的 bg_float 与侧栏同为 #d0d5e3，
+    // 弹层叠在侧栏上会糊成一片，取更浅的 bg 保住层级；描边仍有）。
+    bg_panel: egui::Color32::from_rgb(0xe1, 0xe2, 0xe7),
+    // day.bg_highlight：hover/激活条目。
+    bg_highlight: egui::Color32::from_rgb(0xc4, 0xc8, 0xda),
+    // day.fg。
     fg: egui::Color32::from_rgb(0x37, 0x60, 0xbf),
+    // day.comment：次要文字。
     fg_dim: egui::Color32::from_rgb(0x84, 0x8c, 0xb5),
+    // day.blue：强调色（与终端 ANSI 蓝同源）。
     accent: egui::Color32::from_rgb(0x2e, 0x7d, 0xe9),
+    // day.bg_visual：选区（与终端选区一致）。
     selection: egui::Color32::from_rgb(0xb7, 0xc1, 0xe3),
-    filetree_fill: egui::Color32::from_rgb(0xdc, 0xde, 0xe8),
+    // 手调：bg_dark(#d0d5e3) 与 bg(#e1e2e7) 的中间过渡，区分两栏。
+    filetree_fill: egui::Color32::from_rgb(0xd9, 0xdc, 0xe5),
+    // 手调：比 bg 再亮一档作输入框底（day 无 extreme 档）。
     extreme_bg: egui::Color32::from_rgb(0xf0, 0xf1, 0xf5),
+    // day.warning（= yellow）。
     warn: egui::Color32::from_rgb(0x8c, 0x6c, 0x3e),
-    error: egui::Color32::from_rgb(0x8c, 0x43, 0x51),
-    info: egui::Color32::from_rgb(0x00, 0x71, 0x97),
+    // day.error（= red1，比 red #f52a65 沉稳，浅底文字可读性更好）。
+    error: egui::Color32::from_rgb(0xc6, 0x43, 0x43),
+    // day.info。
+    info: egui::Color32::from_rgb(0x07, 0x87, 0x9d),
 };
 
 /// 按明暗取色板。
