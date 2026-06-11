@@ -442,9 +442,7 @@ impl TermInner {
                     } else {
                         let mode = iter.next().map(|g| g[0]);
                         match mode {
-                            Some(5) => iter
-                                .next()
-                                .map(|g| Color::Indexed(g[0].min(255) as u8)),
+                            Some(5) => iter.next().map(|g| Color::Indexed(g[0].min(255) as u8)),
                             Some(2) => {
                                 let r = iter.next().map(|g| g[0]).unwrap_or(0);
                                 let g = iter.next().map(|g| g[0]).unwrap_or(0);
@@ -473,7 +471,11 @@ impl TermInner {
             5 => Some(Color::Indexed((*sub.get(1)?).min(255) as u8)),
             2 => {
                 // CSI 38:2:<colorspace>:r:g:b 与 38:2:r:g:b 两种都存在。
-                let rgb = if sub.len() >= 5 { &sub[2..5] } else { sub.get(1..4)? };
+                let rgb = if sub.len() >= 5 {
+                    &sub[2..5]
+                } else {
+                    sub.get(1..4)?
+                };
                 Some(Color::Rgb(
                     (*rgb.first()?) as u8,
                     (*rgb.get(1)?) as u8,
@@ -644,8 +646,16 @@ impl Perform for TermInner {
             'd' => self.grid.cursor.row = (n - 1).min(rows - 1),
             'H' | 'f' => {
                 let mut it = params.iter();
-                let r = it.next().and_then(|g| g.first().copied()).unwrap_or(1).max(1) as usize;
-                let c = it.next().and_then(|g| g.first().copied()).unwrap_or(1).max(1) as usize;
+                let r = it
+                    .next()
+                    .and_then(|g| g.first().copied())
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let c = it
+                    .next()
+                    .and_then(|g| g.first().copied())
+                    .unwrap_or(1)
+                    .max(1) as usize;
                 self.grid.cursor.row = (r - 1).min(rows - 1);
                 self.grid.cursor.col = (c - 1).min(cols - 1);
             }
@@ -654,9 +664,11 @@ impl Perform for TermInner {
                 let blank = self.blank();
                 match mode {
                     0 => {
-                        self.grid.fill_region(cur.row, cur.col, cur.row, cols - 1, blank);
+                        self.grid
+                            .fill_region(cur.row, cur.col, cur.row, cols - 1, blank);
                         if cur.row + 1 < rows {
-                            self.grid.fill_region(cur.row + 1, 0, rows - 1, cols - 1, blank);
+                            self.grid
+                                .fill_region(cur.row + 1, 0, rows - 1, cols - 1, blank);
                         }
                     }
                     1 => {
@@ -673,7 +685,9 @@ impl Perform for TermInner {
                 let mode = p0.unwrap_or(0);
                 let blank = self.blank();
                 match mode {
-                    0 => self.grid.fill_region(cur.row, cur.col, cur.row, cols - 1, blank),
+                    0 => self
+                        .grid
+                        .fill_region(cur.row, cur.col, cur.row, cols - 1, blank),
                     1 => self.grid.fill_region(cur.row, 0, cur.row, cur.col, blank),
                     2 => self.grid.fill_region(cur.row, 0, cur.row, cols - 1, blank),
                     _ => {}
@@ -714,12 +728,20 @@ impl Perform for TermInner {
                 let blank = self.blank();
                 self.grid.fill_region(cur.row, cur.col, cur.row, end, blank);
             }
-            'S' => self.grid.scroll_region_up(self.scroll_top, self.scroll_bottom, n),
-            'T' => self.grid.scroll_region_down(self.scroll_top, self.scroll_bottom, n),
+            'S' => self
+                .grid
+                .scroll_region_up(self.scroll_top, self.scroll_bottom, n),
+            'T' => self
+                .grid
+                .scroll_region_down(self.scroll_top, self.scroll_bottom, n),
             'm' => self.apply_sgr(params),
             'r' => {
                 let mut it = params.iter();
-                let top = it.next().and_then(|g| g.first().copied()).unwrap_or(1).max(1) as usize;
+                let top = it
+                    .next()
+                    .and_then(|g| g.first().copied())
+                    .unwrap_or(1)
+                    .max(1) as usize;
                 let bottom = it
                     .next()
                     .and_then(|g| g.first().copied())
@@ -757,8 +779,7 @@ impl Perform for TermInner {
                             }
                             1048 => {
                                 if on {
-                                    self.saved_cursor =
-                                        Some((cur.row, cur.col, self.pen));
+                                    self.saved_cursor = Some((cur.row, cur.col, self.pen));
                                 } else if let Some((r, c, pen)) = self.saved_cursor.take() {
                                     self.grid.cursor.row = r.min(rows - 1);
                                     self.grid.cursor.col = c.min(cols - 1);
@@ -845,8 +866,7 @@ impl Perform for TermInner {
         }
         match byte {
             b'7' => {
-                self.saved_cursor =
-                    Some((self.grid.cursor.row, self.grid.cursor.col, self.pen));
+                self.saved_cursor = Some((self.grid.cursor.row, self.grid.cursor.col, self.pen));
             }
             b'8' => {
                 if let Some((r, c, pen)) = self.saved_cursor.take() {
@@ -1105,7 +1125,10 @@ mod tests {
         t.advance(b"\x1b[?1049h\x1b[HALT-CONTENT");
         assert!(t.is_alt_screen());
         let text_during = t.block_output_text(t.block_by_id(id).unwrap());
-        assert_eq!(text_before, text_during, "alt screen 期间块文本必须取自主屏");
+        assert_eq!(
+            text_before, text_during,
+            "alt screen 期间块文本必须取自主屏"
+        );
     }
 
     #[test]

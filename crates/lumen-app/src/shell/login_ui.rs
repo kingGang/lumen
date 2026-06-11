@@ -64,17 +64,21 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
 
             // 右上 ✕（独立一行右对齐，不挤压标题居中）。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let close = egui::Button::new(
-                    egui::RichText::new("✕").size(14.0).color(pal.fg_dim),
-                )
-                .fill(egui::Color32::TRANSPARENT);
+                let close =
+                    egui::Button::new(egui::RichText::new("✕").size(14.0).color(pal.fg_dim))
+                        .fill(egui::Color32::TRANSPARENT);
                 if ui.add(close).clicked() {
                     out.closed = true;
                 }
             });
 
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Lumen").size(22.0).strong().color(pal.fg));
+                ui.label(
+                    egui::RichText::new("Lumen")
+                        .size(22.0)
+                        .strong()
+                        .color(pal.fg),
+                );
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new("登录（本地模拟，真账号后续版本接入）")
@@ -105,11 +109,10 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
             // 任一输入框内按 Enter 等同点击登录按钮。
             let submitted = (email_edit.lost_focus() || pwd_edit.lost_focus())
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let login_btn = egui::Button::new(
-                egui::RichText::new("登录").size(13.0).color(pal.bg_dark),
-            )
-            .fill(pal.accent)
-            .min_size(egui::vec2(ui.available_width(), 32.0));
+            let login_btn =
+                egui::Button::new(egui::RichText::new("登录").size(13.0).color(pal.bg_dark))
+                    .fill(pal.accent)
+                    .min_size(egui::vec2(ui.available_width(), 32.0));
             if ui.add(login_btn).clicked() || submitted {
                 match profile::mock_login(&st.email, &st.password) {
                     Ok(p) => {

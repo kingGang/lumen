@@ -78,7 +78,11 @@ impl PtySession {
             .name("lumen-pty-writer".into())
             .spawn(move || {
                 for data in write_rx {
-                    if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+                    if writer
+                        .write_all(&data)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
                         break;
                     }
                 }

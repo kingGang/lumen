@@ -200,7 +200,8 @@ pub fn show(
     if ft.busy_hint {
         // shell 忙未注入 cd：树内轻提示之外再弹 toast（更醒目，树栏
         // 收窄/视线在终端区时也能看到）。
-        st.toast.push(toast::ToastKind::Warn, "Shell 正忙，未执行 cd");
+        st.toast
+            .push(toast::ToastKind::Warn, "Shell 正忙，未执行 cd");
     }
     // 文件操作/搜索的结果反馈（egui 帧内 push，当帧即可见）。
     for (kind, text) in ft.toasts {
@@ -246,8 +247,13 @@ pub fn show(
         st.settings.open_with(app_settings);
     }
     if st.settings.open {
-        let s_out =
-            settings_ui::show(root.ctx(), &mut st.settings, app_settings, input.profile, pal);
+        let s_out = settings_ui::show(
+            root.ctx(),
+            &mut st.settings,
+            app_settings,
+            input.profile,
+            pal,
+        );
         out.settings_font_changed = s_out.font_changed;
         out.settings_theme_changed = s_out.theme_changed;
         if s_out.log_out {
@@ -304,9 +310,7 @@ fn sidebar_ui(
         let is_renaming = st.renaming.as_ref().is_some_and(|(id, _)| *id == entry.id);
         if is_renaming {
             if let Some((_, buf)) = st.renaming.as_mut() {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buf).desired_width(f32::INFINITY),
-                );
+                let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
                 if st.rename_focus {
                     resp.request_focus();
                     st.rename_focus = false;
@@ -335,12 +339,11 @@ fn sidebar_ui(
         } else {
             egui::Color32::TRANSPARENT
         };
-        let btn = egui::Button::new(
-            egui::RichText::new(format!("● {}", entry.title)).color(pal.fg),
-        )
-        .fill(fill)
-        .wrap_mode(egui::TextWrapMode::Truncate)
-        .min_size(egui::vec2(ui.available_width(), 30.0));
+        let btn =
+            egui::Button::new(egui::RichText::new(format!("● {}", entry.title)).color(pal.fg))
+                .fill(fill)
+                .wrap_mode(egui::TextWrapMode::Truncate)
+                .min_size(egui::vec2(ui.available_width(), 30.0));
         let resp = ui.add(btn);
         if resp.clicked() {
             out.activate = Some(entry.id);

@@ -145,10 +145,7 @@ pub fn show(
             let full = ui.min_rect();
 
             // —— 顶栏：居中 Settings 标题 + 右上 ✕ ——
-            let bar = egui::Rect::from_min_size(
-                full.min,
-                egui::vec2(full.width(), TOP_BAR_HEIGHT),
-            );
+            let bar = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), TOP_BAR_HEIGHT));
             ui.painter().text(
                 bar.center(),
                 egui::Align2::CENTER_CENTER,
@@ -160,10 +157,9 @@ pub fn show(
                 egui::pos2(bar.right() - 26.0, bar.center().y),
                 egui::vec2(26.0, 26.0),
             );
-            let close_btn = egui::Button::new(
-                egui::RichText::new("✕").size(14.0).color(pal.fg_dim),
-            )
-            .fill(egui::Color32::TRANSPARENT);
+            let close_btn =
+                egui::Button::new(egui::RichText::new("✕").size(14.0).color(pal.fg_dim))
+                    .fill(egui::Color32::TRANSPARENT);
             if ui.put(close_rect, close_btn).clicked() {
                 out.closed = true;
             }
@@ -179,11 +175,9 @@ pub fn show(
                 egui::Stroke::new(1.0, pal.bg_highlight),
             );
 
-            let nav_rect = egui::Rect::from_min_max(
-                body.min,
-                egui::pos2(body.min.x + NAV_WIDTH, body.max.y),
-            )
-            .shrink2(egui::vec2(12.0, 8.0));
+            let nav_rect =
+                egui::Rect::from_min_max(body.min, egui::pos2(body.min.x + NAV_WIDTH, body.max.y))
+                    .shrink2(egui::vec2(12.0, 8.0));
             let mut nav_ui = ui.new_child(egui::UiBuilder::new().max_rect(nav_rect));
             nav(&mut nav_ui, st, pal);
 
@@ -244,8 +238,7 @@ fn heading(ui: &mut egui::Ui, pal: &Palette, text: &str) {
 fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mut SettingsOutput) {
     heading(ui, pal, "Account");
     ui.horizontal(|ui| {
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
         match profile {
             Some(p) => {
                 // 已登录头像：强调色圆底 + 展示名首字母（与顶栏一致）。
@@ -276,9 +269,7 @@ fn account(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
             match profile {
                 Some(p) => {
                     ui.label(egui::RichText::new(&p.display_name).color(pal.fg));
-                    ui.label(
-                        egui::RichText::new(&p.email).size(11.0).color(pal.fg_dim),
-                    );
+                    ui.label(egui::RichText::new(&p.email).size(11.0).color(pal.fg_dim));
                 }
                 None => {
                     ui.label(egui::RichText::new("未登录").color(pal.fg));
@@ -350,9 +341,11 @@ fn appearance(
         .width(240.0)
         .selected_text(selected_label)
         .show_ui(ui, |ui| {
-            let auto_active =
-                !st.custom_font_mode && settings.appearance.font_family.is_empty();
-            if ui.selectable_label(auto_active, "自动（系统等宽）").clicked() {
+            let auto_active = !st.custom_font_mode && settings.appearance.font_family.is_empty();
+            if ui
+                .selectable_label(auto_active, "自动（系统等宽）")
+                .clicked()
+            {
                 st.custom_font_mode = false;
                 settings.appearance.font_family.clear();
             }
@@ -363,7 +356,10 @@ fn appearance(
                     settings.appearance.font_family = (*f).to_owned();
                 }
             }
-            if ui.selectable_label(st.custom_font_mode, "自定义…").clicked() {
+            if ui
+                .selectable_label(st.custom_font_mode, "自定义…")
+                .clicked()
+            {
                 st.custom_font_mode = true;
                 st.custom_font_buf = settings.appearance.font_family.clone();
             }
@@ -375,8 +371,7 @@ fn appearance(
                     .hint_text("字体家族名，如 Sarasa Mono SC")
                     .desired_width(240.0),
             );
-            let submitted =
-                edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let submitted = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if ui.button("应用").clicked() || submitted {
                 settings.appearance.font_family = st.custom_font_buf.trim().to_owned();
             }
@@ -398,9 +393,12 @@ fn appearance(
     ui.label(egui::RichText::new("终端字号").color(pal.fg));
     let mut preview = st.font_size_drag.unwrap_or(settings.appearance.font_size);
     let resp = ui.add(
-        egui::Slider::new(&mut preview, settings::FONT_SIZE_MIN..=settings::FONT_SIZE_MAX)
-            .step_by(1.0)
-            .fixed_decimals(0),
+        egui::Slider::new(
+            &mut preview,
+            settings::FONT_SIZE_MIN..=settings::FONT_SIZE_MAX,
+        )
+        .step_by(1.0)
+        .fixed_decimals(0),
     );
     if resp.dragged() {
         // 拖动进行中：暂存预览值（下一帧滑块继续显示它）。
@@ -435,11 +433,13 @@ fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
 /// About：产品名 / 版本 / 技术栈。
 fn about(ui: &mut egui::Ui, pal: &Palette) {
     heading(ui, pal, "About");
-    ui.label(egui::RichText::new("Lumen").size(16.0).strong().color(pal.fg));
     ui.label(
-        egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
-            .color(pal.fg_dim),
+        egui::RichText::new("Lumen")
+            .size(16.0)
+            .strong()
+            .color(pal.fg),
     );
+    ui.label(egui::RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION"))).color(pal.fg_dim));
     ui.add_space(8.0);
     ui.label(
         egui::RichText::new("Rust · winit · wgpu · egui · glyphon · ConPTY")

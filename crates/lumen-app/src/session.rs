@@ -93,12 +93,8 @@ impl Session {
         proxy: EventLoopProxy<PtyWake>,
     ) -> Result<Self> {
         let term = Terminal::new(rows, cols, scrollback);
-        let (pty, pty_rx) = PtySession::spawn(
-            None,
-            &shell_integration_args(),
-            rows as u16,
-            cols as u16,
-        )?;
+        let (pty, pty_rx) =
+            PtySession::spawn(None, &shell_integration_args(), rows as u16, cols as u16)?;
         // per-session 有界通道：主循环持接收端，转发线程持发送端。
         let (tx, rx) = crossbeam_channel::bounded::<PtyEvent>(SESSION_EVENT_CAP);
         std::thread::Builder::new()

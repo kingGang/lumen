@@ -179,12 +179,8 @@ impl Renderer {
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer = TextRenderer::new(
-            &mut atlas,
-            &device,
-            wgpu::MultisampleState::default(),
-            None,
-        );
+        let text_renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let rects = rect::RectRenderer::new(&device, format);
 
         let font_size = FONT_SIZE * scale_factor;
@@ -466,8 +462,7 @@ impl Renderer {
                     cw
                 };
                 let (x, y) = (pad + c as f32 * cw, pad + vr as f32 * ch);
-                let selected = selection
-                    .is_some_and(|s| !s.is_empty() && s.contains(abs_line, c));
+                let selected = selection.is_some_and(|s| !s.is_empty() && s.contains(abs_line, c));
                 if selected {
                     instances.push(rect::RectInstance {
                         pos: [x, y],
@@ -510,10 +505,7 @@ impl Renderer {
                     .get(cur_col)
                     .is_some_and(|c| c.flags.contains(CellFlags::WIDE));
                 instances.push(rect::RectInstance {
-                    pos: [
-                        pad + cur_col as f32 * cw,
-                        pad + cursor_view_row as f32 * ch,
-                    ],
+                    pos: [pad + cur_col as f32 * cw, pad + cursor_view_row as f32 * ch],
                     size: [if on_wide { cw * 2.0 } else { cw }, ch],
                     color: self.theme.cursor.to_linear_f32(0.55),
                 });
@@ -578,7 +570,11 @@ impl Renderer {
                 if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
                     line.push(cell.ch);
                     spans.push((0, line.len(), cell_attrs(cell)));
-                    c += if cell.flags.contains(CellFlags::WIDE) { 2 } else { 1 };
+                    c += if cell.flags.contains(CellFlags::WIDE) {
+                        2
+                    } else {
+                        1
+                    };
                 } else {
                     let mut run_start = 0usize;
                     let mut run_attrs: Option<Attrs> = None;

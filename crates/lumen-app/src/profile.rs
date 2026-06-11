@@ -43,8 +43,7 @@ impl Profile {
     /// 档案文件路径：`%LOCALAPPDATA%/Lumen/profile.json`。
     /// 环境变量缺失（极端定制环境）返回 None，登录态仅在内存生效。
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|d| Path::new(&d).join("Lumen").join("profile.json"))
+        std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Lumen").join("profile.json"))
     }
 
     /// 启动加载：缺失 = 未登录；损坏 = 未登录 + 日志警告，不 panic。
@@ -264,7 +263,10 @@ mod tests {
     #[test]
     fn mock校验规则() {
         assert!(mock_login("jimhy@example.com", "x").is_ok());
-        assert!(mock_login("  jimhy@example.com  ", "x").is_ok(), "邮箱应去首尾空白");
+        assert!(
+            mock_login("  jimhy@example.com  ", "x").is_ok(),
+            "邮箱应去首尾空白"
+        );
         assert!(mock_login("no-at-sign", "x").is_err(), "无 @ 应拒绝");
         assert!(mock_login("@host", "x").is_err(), "@ 前段为空应拒绝");
         assert!(mock_login("user@", "x").is_err(), "@ 后段为空应拒绝");

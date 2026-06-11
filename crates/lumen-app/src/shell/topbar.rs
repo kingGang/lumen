@@ -62,10 +62,8 @@ pub fn show(
                 ui.add_space(4.0);
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(title).size(12.0).color(pal.fg_dim),
-                        )
-                        .truncate(),
+                        egui::Label::new(egui::RichText::new(title).size(12.0).color(pal.fg_dim))
+                            .truncate(),
                     );
                 });
             });
@@ -116,9 +114,7 @@ fn menu_ui(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
             // 首行展示名：灰字不可点（参照截图 Jimhy Liu 行）。
             ui.add_enabled(
                 false,
-                egui::Button::new(
-                    egui::RichText::new(&p.display_name).color(pal.fg_dim),
-                ),
+                egui::Button::new(egui::RichText::new(&p.display_name).color(pal.fg_dim)),
             );
             if ui.button("Settings").clicked() {
                 out.open_settings = true;

@@ -166,8 +166,7 @@ impl AppState {
     fn mouse_in_term(&self) -> bool {
         let (x, y, w, h) = self.term_rect_px;
         let (mx, my) = self.mouse_pos;
-        let inside =
-            mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64;
+        let inside = mx >= x as f64 && my >= y as f64 && mx < (x + w) as f64 && my < (y + h) as f64;
         if !inside {
             return false;
         }
@@ -335,7 +334,12 @@ impl App {
         // 字体回退提示（设置页 Appearance 展示）。
         let font_hint = (!ap.font_family.is_empty()
             && !actual_family.eq_ignore_ascii_case(&ap.font_family))
-        .then(|| format!("系统中未找到「{}」，已回退「{actual_family}」", ap.font_family));
+        .then(|| {
+            format!(
+                "系统中未找到「{}」，已回退「{actual_family}」",
+                ap.font_family
+            )
+        });
         // 首次启动（无设置文件）落盘默认值，方便用户直接手改；
         // 文件存在但损坏时不在此覆盖（保留现场，变更时才写）。
         // 此刻 UI 尚未建立，失败只记日志（save 内部已记）不弹 toast。
@@ -671,8 +675,7 @@ impl ApplicationHandler<PtyWake> for App {
         if term_due.is_some_and(|t| now >= t)
             && s.term.is_synchronized()
             && s.redraw_abs_at.is_some_and(|a| now < a)
-            && s
-                .term_frame_due_since
+            && s.term_frame_due_since
                 .is_none_or(|d| now.duration_since(d) < REDRAW_ABS_CAP)
         {
             event_loop.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(2)));
@@ -741,8 +744,7 @@ impl ApplicationHandler<PtyWake> for App {
                     .filter(|t| now.duration_since(*t) < Duration::from_millis(8));
                 if let Some(last) = recent {
                     let at = last + Duration::from_millis(8);
-                    state.egui_repaint_at =
-                        Some(state.egui_repaint_at.map_or(at, |e| e.min(at)));
+                    state.egui_repaint_at = Some(state.egui_repaint_at.map_or(at, |e| e.min(at)));
                 } else {
                     state.window.request_redraw();
                 }
@@ -769,7 +771,9 @@ impl ApplicationHandler<PtyWake> for App {
                 // surface 重配。
                 state.renderer.set_scale_factor(scale_factor as f32);
                 let ap = &state.settings.appearance;
-                state.renderer.reconfigure_font(&ap.font_family, ap.font_size);
+                state
+                    .renderer
+                    .reconfigure_font(&ap.font_family, ap.font_size);
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -789,8 +793,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // Ctrl+, 关不掉已打开的设置页（开关不对称，按键被静默
                 // 吞掉）。match 内部的 login/settings 守卫臂保证放行后
                 // 唯一新增的行为就是 Ctrl+, 的关闭路径。
-                let overlay_open =
-                    state.shell_state.settings.open || state.shell_state.login.open;
+                let overlay_open = state.shell_state.settings.open || state.shell_state.login.open;
                 if pressed
                     && state.modifiers.control_key()
                     && (overlay_open
@@ -861,8 +864,7 @@ impl ApplicationHandler<PtyWake> for App {
                     if state.sessions[active].term.win32_input()
                         && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
                     {
-                        if let Some(bytes) =
-                            input::encode_key_win32(&event, state.modifiers, false)
+                        if let Some(bytes) = input::encode_key_win32(&event, state.modifiers, false)
                         {
                             if let Err(e) = state.sessions[active].pty.write(&bytes) {
                                 error!("写入 PTY 失败: {e:#}");
@@ -876,7 +878,10 @@ impl ApplicationHandler<PtyWake> for App {
                     let rows = state.sessions[active].term.grid().rows() as isize;
                     let scrolled = match event.logical_key {
                         Key::Named(NamedKey::PageUp) => {
-                            state.sessions[active].term.grid_mut().scroll_display(rows - 1);
+                            state.sessions[active]
+                                .term
+                                .grid_mut()
+                                .scroll_display(rows - 1);
                             true
                         }
                         Key::Named(NamedKey::PageDown) => {
@@ -935,8 +940,7 @@ impl ApplicationHandler<PtyWake> for App {
                             // 复制失败（空输出/块已淘汰）也只清选中、绝不
                             // 下穿成中断——误发 ^C 会取消用户输入的命令行。
                             if state.sessions[active].selected_block.is_some() {
-                                state.sessions[active]
-                                    .copy_selected_block(&mut state.clipboard);
+                                state.sessions[active].copy_selected_block(&mut state.clipboard);
                                 state.sessions[active].selected_block = None;
                                 state.window.request_redraw();
                                 return;
@@ -969,10 +973,7 @@ impl ApplicationHandler<PtyWake> for App {
                         error!("写入 PTY 失败: {e:#}");
                     }
                     state.last_key_at = Some(write_t0);
-                    state.perf_log(format_args!(
-                        "key 写入耗时 {:?}",
-                        write_t0.elapsed()
-                    ));
+                    state.perf_log(format_args!("key 写入耗时 {:?}", write_t0.elapsed()));
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1053,7 +1054,10 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 与按键路径一致：输入即回滚到底部——翻看历史时提交
                 // 中文，视图不跳回底部会看不到自己的回显。
-                state.sessions[state.active].term.grid_mut().scroll_to_bottom();
+                state.sessions[state.active]
+                    .term
+                    .grid_mut()
+                    .scroll_to_bottom();
                 if let Err(e) = state.sessions[state.active].pty.write(text.as_bytes()) {
                     error!("写入 PTY 失败: {e:#}");
                 }
@@ -1111,8 +1115,7 @@ impl ApplicationHandler<PtyWake> for App {
                     let s = &state.sessions[state.active];
                     s.term.is_synchronized()
                         && s.redraw_abs_at.is_some_and(|a| render_t0 < a)
-                        && s
-                            .term_frame_due_since
+                        && s.term_frame_due_since
                             .is_none_or(|d| render_t0.duration_since(d) < REDRAW_ABS_CAP)
                 };
 
@@ -1284,7 +1287,9 @@ impl ApplicationHandler<PtyWake> for App {
                     // 失效）；cell 尺寸变化引发的行列数重算与全会话
                     // resize 在下方矩形检查统一处理（同一帧内完成）。
                     let ap = &state.settings.appearance;
-                    let actual = state.renderer.reconfigure_font(&ap.font_family, ap.font_size);
+                    let actual = state
+                        .renderer
+                        .reconfigure_font(&ap.font_family, ap.font_size);
                     state.shell_state.settings.font_hint = (!ap.font_family.is_empty()
                         && !actual.eq_ignore_ascii_case(&ap.font_family))
                     .then(|| format!("系统中未找到「{}」，已回退「{actual}」", ap.font_family));
@@ -1318,10 +1323,10 @@ impl ApplicationHandler<PtyWake> for App {
                     // mock 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
                     p.save();
                     info!("登录成功（mock）：{} <{}>", p.display_name, p.email);
-                    state
-                        .shell_state
-                        .toast
-                        .push(shell::toast::ToastKind::Info, format!("已登录：{}", p.display_name));
+                    state.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        format!("已登录：{}", p.display_name),
+                    );
                     // push 发生在本帧 egui 布局之后：请求下一帧立即显示。
                     state.window.request_redraw();
                     state.profile = Some(p);
@@ -1466,11 +1471,9 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.set_ime_allowed(true);
                     let s = &state.sessions[state.active];
                     let g = s.term.grid();
-                    let view_row = (g.display_offset() + s.cursor_displayed.0)
-                        .min(g.rows().saturating_sub(1));
-                    let (cx, cy) = state
-                        .renderer
-                        .cell_origin(view_row, s.cursor_displayed.1);
+                    let view_row =
+                        (g.display_offset() + s.cursor_displayed.0).min(g.rows().saturating_sub(1));
+                    let (cx, cy) = state.renderer.cell_origin(view_row, s.cursor_displayed.1);
                     let (cw, ch) = state.renderer.cell_size();
                     state.window.set_ime_cursor_area(
                         winit::dpi::PhysicalPosition::new(

@@ -96,8 +96,7 @@ impl Settings {
     /// 设置文件路径：`%LOCALAPPDATA%/Lumen/settings.json`。
     /// 环境变量缺失（极端定制环境）返回 None，设置仅在内存生效。
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|d| Path::new(&d).join("Lumen").join("settings.json"))
+        std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Lumen").join("settings.json"))
     }
 
     /// 启动加载：缺失/损坏降级默认值（记日志），不 panic。
@@ -149,20 +148,31 @@ impl Settings {
     fn from_value_lenient(root: &serde_json::Value, path: &Path) -> Self {
         let mut s = Self::default();
         if !root.is_object() {
-            log::warn!("设置文件顶层不是 JSON 对象，使用默认设置: {}", path.display());
+            log::warn!(
+                "设置文件顶层不是 JSON 对象，使用默认设置: {}",
+                path.display()
+            );
             return s;
         }
         let Some(ap) = root.get("appearance") else {
             return s;
         };
         if !ap.is_object() {
-            log::warn!("设置节 appearance 不是对象，整节降级默认值: {}", path.display());
+            log::warn!(
+                "设置节 appearance 不是对象，整节降级默认值: {}",
+                path.display()
+            );
             return s;
         }
         let d = AppearanceSettings::default();
         s.appearance.theme = lenient_field(ap, "theme", "appearance.theme", d.theme, path);
-        s.appearance.font_family =
-            lenient_field(ap, "font_family", "appearance.font_family", d.font_family, path);
+        s.appearance.font_family = lenient_field(
+            ap,
+            "font_family",
+            "appearance.font_family",
+            d.font_family,
+            path,
+        );
         s.appearance.font_size =
             lenient_field(ap, "font_size", "appearance.font_size", d.font_size, path);
         s
@@ -292,8 +302,7 @@ mod tests {
     #[test]
     fn 旧文件缺字段平滑升级() {
         let p = temp_path("partial");
-        std::fs::write(&p, r#"{ "appearance": { "font_size": 20.0 } }"#)
-            .expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 20.0 } }"#).expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded.appearance.font_size, 20.0);
@@ -304,11 +313,9 @@ mod tests {
     #[test]
     fn 字号越界夹紧() {
         let p = temp_path("clamp");
-        std::fs::write(&p, r#"{ "appearance": { "font_size": 100.0 } }"#)
-            .expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 100.0 } }"#).expect("写测试文件失败");
         assert_eq!(Settings::load_from(&p).appearance.font_size, FONT_SIZE_MAX);
-        std::fs::write(&p, r#"{ "appearance": { "font_size": 1.0 } }"#)
-            .expect("写测试文件失败");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 1.0 } }"#).expect("写测试文件失败");
         assert_eq!(Settings::load_from(&p).appearance.font_size, FONT_SIZE_MIN);
         let _ = std::fs::remove_file(&p);
     }
@@ -324,8 +331,15 @@ mod tests {
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
-        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNight, "坏字段降级默认");
-        assert_eq!(loaded.appearance.font_family, "JetBrains Mono", "好字段应保留");
+        assert_eq!(
+            loaded.appearance.theme,
+            ThemeChoice::TokyoNight,
+            "坏字段降级默认"
+        );
+        assert_eq!(
+            loaded.appearance.font_family, "JetBrains Mono",
+            "好字段应保留"
+        );
         assert_eq!(loaded.appearance.font_size, 18.0, "好字段应保留");
     }
 
@@ -340,8 +354,15 @@ mod tests {
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
-        assert_eq!(loaded.appearance.theme, ThemeChoice::TokyoNightLight, "好字段应保留");
-        assert_eq!(loaded.appearance.font_size, FONT_SIZE_DEFAULT, "坏字段降级默认");
+        assert_eq!(
+            loaded.appearance.theme,
+            ThemeChoice::TokyoNightLight,
+            "好字段应保留"
+        );
+        assert_eq!(
+            loaded.appearance.font_size, FONT_SIZE_DEFAULT,
+            "坏字段降级默认"
+        );
     }
 
     #[test]
