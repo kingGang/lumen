@@ -438,7 +438,10 @@ impl AppState {
             return;
         }
 
-        let path_str = path.as_deref().unwrap_or("");
+        // should_load 已保证 path.is_some()（第 427 行），此处不可为 None。
+        let path_str = path
+            .as_deref()
+            .expect("path is Some: checked by should_load above");
         match background::load_background_texture(
             path_str,
             self.renderer.device(),
@@ -2352,13 +2355,20 @@ impl ApplicationHandler<PtyWake> for App {
                     .map(std::path::Path::to_path_buf);
                 let shell_idle = tab.focused_pane().term.shell_waiting_input();
                 // 背景图参数（P13）：仅当纹理已加载且 settings 启用时传入。
-                let bg_image = state.bg_texture.as_ref().map(|tex| shell::BgImageInput {
-                    texture_id: tex.texture_id,
-                    width: tex.width,
-                    height: tex.height,
-                    opacity: state.settings.appearance.background.opacity,
-                    dim: state.settings.appearance.background.dim,
-                });
+                // 同时检查 enabled：用户本帧拨动开关关闭后，bg_texture 清空在
+                // apply_background_image（run_ui 之后）才执行；提前在此过滤
+                // 可保证关闭语义对 egui 层当帧即时生效，避免一帧闪烁。
+                let bg_image = state
+                    .bg_texture
+                    .as_ref()
+                    .filter(|_| state.settings.appearance.background.enabled)
+                    .map(|tex| shell::BgImageInput {
+                        texture_id: tex.texture_id,
+                        width: tex.width,
+                        height: tex.height,
+                        opacity: state.settings.appearance.background.opacity,
+                        dim: state.settings.appearance.background.dim,
+                    });
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),

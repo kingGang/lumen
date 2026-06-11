@@ -7,9 +7,11 @@
 //!
 //! 本模块纯 CPU 解码（`image` crate），无 GPU 解码。jpeg 全不透明，
 //! premultiply 转换无损；png/webp/bmp 带 alpha 时按标准公式转换：
-//! `premul = src_linear * alpha`（在 sRGB 字节域近似：out = round(c * a / 255)）。
+//! `premul = round(c * a / 255)`（在 sRGB 字节域执行，与纹理格式 Rgba8Unorm 配合
+//! ——GPU 不对 Rgba8Unorm 自动反伽马，egui 着色器期望非 sRGB-aware 输入）。
 //!
-//! wgpu 纹理格式：`Rgba8UnormSrgb`（egui 期望 sRGB 采样）。
+//! wgpu 纹理格式：`Rgba8Unorm`（egui 着色器注释："We expect normal textures
+//! that are NOT sRGB-aware"，`register_native_texture` 同样要求 Rgba8Unorm）。
 //! FilterMode：`Linear`（图片缩放抗锯齿）。
 
 use lumen_renderer::wgpu;
@@ -86,7 +88,9 @@ fn load_inner(
     // png/webp/bmp 带 alpha 时按公式转换。
     let premul = premultiply_rgba8(img.as_raw(), w, h);
 
-    // 上传 wgpu 纹理（Rgba8UnormSrgb：egui 着色器期望 sRGB 输入）。
+    // 上传 wgpu 纹理（Rgba8Unorm：egui 着色器期望非 sRGB-aware 输入，
+    // register_native_texture 文档要求此格式；使用 Rgba8UnormSrgb 会导致
+    // GPU 自动反伽马与 egui 着色器的 gamma→linear 转换叠加，画面整体偏暗）。
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("lumen bg texture"),
         size: wgpu::Extent3d {
@@ -97,7 +101,7 @@ fn load_inner(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -136,8 +140,9 @@ fn load_inner(
 /// `out_r = round(in_r * alpha / 255)`，GB 同理，A 不变。
 /// jpeg 全不透明（alpha=255），out == in；png/webp 带 alpha 时转换有效。
 ///
-/// 在 sRGB 字节域做近似（而非先 linearize 再 premultiply）：
-/// 误差 ≤ 1 LSB（8 bit），对于非极端半透明场景视觉无差。
+/// 配合 `Rgba8Unorm` 纹理格式使用：GPU 不对 Rgba8Unorm 自动反伽马，
+/// 因此在 sRGB 字节域直接执行 `round(c * a / 255)` 是正确的——
+/// 存入纹理的 sRGB 字节与 egui 着色器期望的"gamma 编码 premultiplied"完全一致。
 ///
 /// # 示例
 ///

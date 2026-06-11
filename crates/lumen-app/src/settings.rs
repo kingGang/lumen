@@ -786,24 +786,49 @@ mod tests {
     }
 
     #[test]
-    fn 背景图_opacity_零值夹到下限() {
-        // opacity=0.0 小于 BACKGROUND_OPACITY_MIN，加载时应夹到下限。
-        // （NaN/Inf 无法写入合法 JSON，通过越界测试覆盖夹紧逻辑即可。）
-        let p = temp_path("bg_opacity_zero");
+    fn 背景图_opacity_dim_边界值不被过度夹紧() {
+        // 恰好等于下限/上限的合法值，加载后应原值保留，不被继续夹紧。
+        // 替换原重叠测试（opacity=0.0 + dim=-0.5 已由 背景图_opacity_dim_夹紧 覆盖）。
+        let p = temp_path("bg_boundary");
         std::fs::write(
             &p,
-            r#"{ "appearance": { "background": { "enabled": true, "opacity": 0.0, "dim": -0.5 } } }"#,
+            format!(
+                r#"{{ "appearance": {{ "background": {{ "opacity": {opacity_min}, "dim": {dim_min} }} }} }}"#,
+                opacity_min = BACKGROUND_OPACITY_MIN,
+                dim_min = BACKGROUND_DIM_MIN,
+            ),
         )
         .expect("写测试文件失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(
             loaded.appearance.background.opacity, BACKGROUND_OPACITY_MIN,
-            "0.0 夹到下限"
+            "下限值不被进一步夹紧"
         );
         assert_eq!(
             loaded.appearance.background.dim, BACKGROUND_DIM_MIN,
-            "负值夹到下限"
+            "dim 下限值不被进一步夹紧"
+        );
+        // 上限同样守恒。
+        let p2 = temp_path("bg_boundary_max");
+        std::fs::write(
+            &p2,
+            format!(
+                r#"{{ "appearance": {{ "background": {{ "opacity": {opacity_max}, "dim": {dim_max} }} }} }}"#,
+                opacity_max = BACKGROUND_OPACITY_MAX,
+                dim_max = BACKGROUND_DIM_MAX,
+            ),
+        )
+        .expect("写测试文件失败");
+        let loaded2 = Settings::load_from(&p2);
+        let _ = std::fs::remove_file(&p2);
+        assert_eq!(
+            loaded2.appearance.background.opacity, BACKGROUND_OPACITY_MAX,
+            "上限值不被进一步夹紧"
+        );
+        assert_eq!(
+            loaded2.appearance.background.dim, BACKGROUND_DIM_MAX,
+            "dim 上限值不被进一步夹紧"
         );
     }
 

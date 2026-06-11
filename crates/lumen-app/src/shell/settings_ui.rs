@@ -117,6 +117,8 @@ impl SettingsUiState {
         self.custom_font_buf = fam.to_owned();
         // 上次会话可能在拖动中途关页，残留预览值作废。
         self.font_size_drag = None;
+        self.bg_opacity_drag = None;
+        self.bg_dim_drag = None;
     }
 
     /// 打开设置页并定位到 Keyboard shortcuts 分类（头像菜单入口）。
@@ -609,68 +611,75 @@ fn background_group(
     });
     ui.add_space(10.0);
 
-    // —— 不透明度滑块 ——
-    // 拖动中预览（settings 字段实时更新），松手才写盘（background_params_changed）。
-    ui.label(egui::RichText::new("不透明度").color(pal.fg));
-    let before_opacity = settings.appearance.background.opacity;
-    let mut opacity_preview = st
-        .bg_opacity_drag
-        .unwrap_or(settings.appearance.background.opacity);
-    let resp_opacity = ui.add(
-        egui::Slider::new(
-            &mut opacity_preview,
-            settings::BACKGROUND_OPACITY_MIN..=settings::BACKGROUND_OPACITY_MAX,
-        )
-        .step_by(0.05)
-        .fixed_decimals(2),
-    );
-    if resp_opacity.dragged() {
-        st.bg_opacity_drag = Some(opacity_preview);
-        // 拖动中即时预览（不写盘）。
-        settings.appearance.background.opacity = opacity_preview;
-    }
-    let opacity_committed =
-        resp_opacity.drag_stopped() || (resp_opacity.changed() && !resp_opacity.dragged());
-    if opacity_committed {
-        st.bg_opacity_drag = None;
-        settings.appearance.background.opacity = opacity_preview;
-        if (before_opacity - opacity_preview).abs() > f32::EPSILON {
-            out.background_params_changed = true;
+    // —— 不透明度 / 暗化滑块（enabled=false 时整体置灰不可交互）——
+    // 置灰原因：背景图关闭时拖动滑块虽会写盘（值保留供启用后使用），
+    // 但用户看不到任何视觉效果，缺乏操作有效的反馈；灰化与关闭语义
+    // 保持一致，防止用户误以为操作无效或 UI 故障。
+    let sliders_enabled = settings.appearance.background.enabled;
+    ui.add_enabled_ui(sliders_enabled, |ui| {
+        // —— 不透明度滑块 ——
+        // 拖动中预览（settings 字段实时更新），松手才写盘（background_params_changed）。
+        ui.label(egui::RichText::new("不透明度").color(pal.fg));
+        let before_opacity = settings.appearance.background.opacity;
+        let mut opacity_preview = st
+            .bg_opacity_drag
+            .unwrap_or(settings.appearance.background.opacity);
+        let resp_opacity = ui.add(
+            egui::Slider::new(
+                &mut opacity_preview,
+                settings::BACKGROUND_OPACITY_MIN..=settings::BACKGROUND_OPACITY_MAX,
+            )
+            .step_by(0.05)
+            .fixed_decimals(2),
+        );
+        if resp_opacity.dragged() {
+            st.bg_opacity_drag = Some(opacity_preview);
+            // 拖动中即时预览（不写盘）。
+            settings.appearance.background.opacity = opacity_preview;
         }
-    }
-
-    ui.add_space(8.0);
-
-    // —— 暗化滑块 ——
-    ui.label(egui::RichText::new("暗化").color(pal.fg));
-    let before_dim = settings.appearance.background.dim;
-    let mut dim_preview = st.bg_dim_drag.unwrap_or(settings.appearance.background.dim);
-    let resp_dim = ui.add(
-        egui::Slider::new(
-            &mut dim_preview,
-            settings::BACKGROUND_DIM_MIN..=settings::BACKGROUND_DIM_MAX,
-        )
-        .step_by(0.05)
-        .fixed_decimals(2),
-    );
-    if resp_dim.dragged() {
-        st.bg_dim_drag = Some(dim_preview);
-        settings.appearance.background.dim = dim_preview;
-    }
-    let dim_committed = resp_dim.drag_stopped() || (resp_dim.changed() && !resp_dim.dragged());
-    if dim_committed {
-        st.bg_dim_drag = None;
-        settings.appearance.background.dim = dim_preview;
-        if (before_dim - dim_preview).abs() > f32::EPSILON {
-            out.background_params_changed = true;
+        let opacity_committed =
+            resp_opacity.drag_stopped() || (resp_opacity.changed() && !resp_opacity.dragged());
+        if opacity_committed {
+            st.bg_opacity_drag = None;
+            settings.appearance.background.opacity = opacity_preview;
+            if (before_opacity - opacity_preview).abs() > f32::EPSILON {
+                out.background_params_changed = true;
+            }
         }
-    }
 
-    ui.label(
-        egui::RichText::new("0% = 不暗化；90% = 最暗（可增强文字可读性）")
-            .size(11.0)
-            .color(pal.fg_dim),
-    );
+        ui.add_space(8.0);
+
+        // —— 暗化滑块 ——
+        ui.label(egui::RichText::new("暗化").color(pal.fg));
+        let before_dim = settings.appearance.background.dim;
+        let mut dim_preview = st.bg_dim_drag.unwrap_or(settings.appearance.background.dim);
+        let resp_dim = ui.add(
+            egui::Slider::new(
+                &mut dim_preview,
+                settings::BACKGROUND_DIM_MIN..=settings::BACKGROUND_DIM_MAX,
+            )
+            .step_by(0.05)
+            .fixed_decimals(2),
+        );
+        if resp_dim.dragged() {
+            st.bg_dim_drag = Some(dim_preview);
+            settings.appearance.background.dim = dim_preview;
+        }
+        let dim_committed = resp_dim.drag_stopped() || (resp_dim.changed() && !resp_dim.dragged());
+        if dim_committed {
+            st.bg_dim_drag = None;
+            settings.appearance.background.dim = dim_preview;
+            if (before_dim - dim_preview).abs() > f32::EPSILON {
+                out.background_params_changed = true;
+            }
+        }
+
+        ui.label(
+            egui::RichText::new("0% = 不暗化；90% = 最暗（可增强文字可读性）")
+                .size(11.0)
+                .color(pal.fg_dim),
+        );
+    });
 }
 
 /// 一张主题画廊卡片（P12）：迷你终端预览 + 名字标签，整卡可点。
