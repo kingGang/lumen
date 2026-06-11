@@ -725,6 +725,20 @@ impl AppState {
     /// 满 [`MAX_PANES`] 时 toast 提示。新窗格继承焦点窗格的 cwd
     /// （Warp/Windows Terminal 分屏惯例；OSC 9;9 未上报时退恢复时的
     /// 初始目录，目录已失效则回默认），并自动成为焦点。
+    ///
+    /// # B3 根治：spawn 前预计算新窗格真实尺寸
+    ///
+    /// 旧实现用「焦点窗格当前行列」spawn，但新格加入后布局从 N 变
+    /// N+1 格均分，各格真实尺寸完全不同。时序：
+    ///   shell 按错误宽度打印首个提示符
+    ///   → 下一帧 egui 出真实矩形 → resize
+    ///   → ConPTY 按新列宽 reflow，PSReadLine 坐标簿仍按旧假设
+    ///   → 该行后续编辑持续列错位（截图混叠形态）
+    ///   → 回车开新行 PSReadLine 重新定位 → 正常
+    ///
+    /// 修复：spawn 前按「加入后布局」预计算新格矩形，复用
+    /// [`estimate_restored_pane_px`] 同源逻辑（n+1 均分、扣标题栏、
+    /// 换算行列），spawn 即终态尺寸，首帧零 resize。
     fn new_pane(&mut self) {
         if self.tabs[self.active_tab].panes.len() >= MAX_PANES {
             self.shell_state.toast.push(
@@ -735,14 +749,50 @@ impl AppState {
             self.window.request_redraw();
             return;
         }
-        let focused = self.focused_pane();
-        let g = focused.term.grid();
-        let (rows, cols) = (g.rows(), g.cols());
-        let cwd = focused
+
+        // —— 预计算新窗格真实尺寸（B3 根治）——
+        // 新格加入后共 n+1 格，布局均分，新格是最后一个（index=n）。
+        // area 估算与 estimate_restored_pane_px 同源：扣侧栏/顶栏/文件树。
+        let n = self.tabs[self.active_tab].panes.len();
+        let scale = self.egui_ctx.pixels_per_point();
+        let inner = self.window.inner_size();
+        let sidebar_px = (self.settings.layout.sidebar_width * scale).round();
+        let topbar_px = (shell::topbar::HEIGHT * scale).round();
+        let ft_width = self
+            .shell_state
+            .filetree
+            .effective_width(self.settings.layout.filetree_width);
+        let ft_px = (ft_width * scale).round();
+        let term_w_px = (inner.width as f32 - sidebar_px).max(1.0);
+        let term_h_px = (inner.height as f32 - topbar_px).max(1.0);
+        // est_area 为逻辑点（与 estimate_restored_pane_px 入参单位一致）。
+        let est_area = egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2((term_w_px - ft_px).max(1.0) / scale, term_h_px / scale),
+        );
+        // n+1 格均分，取第 n 个矩形（新格）。
+        let new_pane_layout = PaneLayout::uniform(n + 1);
+        let est_px = estimate_restored_pane_px(est_area, &new_pane_layout, n + 1, None, scale);
+        // 估算不可用时兜底焦点窗格当前尺寸（防御，不应发生）。
+        let (rows, cols) = est_px
+            .get(n)
+            .map(|&(w, h)| self.renderer.grid_size_for(w, h))
+            .unwrap_or_else(|| {
+                let g = self.focused_pane().term.grid();
+                (g.rows(), g.cols())
+            });
+        info!(
+            "new_pane 预计算：n+1={} 格，新格 rows={rows} cols={cols}（est_area={:?}）",
+            n + 1,
+            est_area,
+        );
+
+        let cwd = self
+            .focused_pane()
             .term
             .cwd()
             .map(std::path::Path::to_path_buf)
-            .or_else(|| focused.initial_cwd.clone())
+            .or_else(|| self.focused_pane().initial_cwd.clone())
             // spawn 约定由调用方先验证目录仍存在。
             .filter(|p| p.is_dir());
         let id = self.next_session_id;

@@ -276,6 +276,17 @@ impl FileTreeState {
         self.dialog.is_some()
     }
 
+    /// 文件树栏当前实际占用宽度（逻辑点）：展开时为用户设置的展开宽度，
+    /// 收起时为窄条固定宽度 [`STRIP_WIDTH`]。new_pane() 预计算新窗格
+    /// 尺寸时用此值估算终端工作区，保证 spawn 尺寸与首帧布局一致。
+    pub fn effective_width(&self, expanded_width: f32) -> f32 {
+        if self.visible {
+            expanded_width
+        } else {
+            STRIP_WIDTH
+        }
+    }
+
     /// 树根跟随激活会话 cwd：变化（切 tab / cd / 首次上报）时整树重置
     /// ——节点表、目录缓存、展开与选中状态全部重建（规格：根变化时
     /// 重置展开状态）；搜索态一并退出（旧根的结果已无意义）。
