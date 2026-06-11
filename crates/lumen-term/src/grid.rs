@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use crate::cell::Cell;
+use crate::cell::{Cell, CellFlags, Color};
 
 /// 一行单元格。
 #[derive(Debug, Clone)]
@@ -28,6 +28,19 @@ impl Row {
 
     fn fill(&mut self, cell: Cell) {
         self.cells.fill(cell);
+    }
+
+    /// 整行是否纯空白（resize 缩行的收割判定）：所有格子无字符、无
+    /// 背景色、无会上屏的样式（反显/下划线/删除线）。空格带前景色
+    /// 视为空白——空格不渲染字形，前景色无可视效果。
+    fn is_blank(&self) -> bool {
+        self.cells.iter().all(|c| {
+            c.ch == ' '
+                && c.bg == Color::Default
+                && !c
+                    .flags
+                    .intersects(CellFlags::INVERSE | CellFlags::UNDERLINE | CellFlags::STRIKE)
+        })
     }
 }
 
@@ -254,7 +267,19 @@ impl Grid {
         self.dirty = true;
     }
 
-    /// 调整可视区尺寸。M1 用简单策略：行列直接截断/扩展，不做 reflow。
+    /// 调整可视区尺寸。列直接截断/扩展，不做 reflow；缩小行数时
+    /// **优先丢弃光标行以下的纯空行**，不足时才把顶行滚入历史
+    /// （alacritty/wezterm 同语义）。
+    ///
+    /// 收割空行这一步是 B2 多窗格回归（症状①「窗格只剩左缘两根竖
+    /// 条、提示符消失」）的根治：旧实现无条件从顶搬行进 scrollback，
+    /// 新鲜提示符窗格（内容只有顶部一行、下方全空）缩行后提示符行
+    /// 被搬进历史、可视区只剩空行——而命令块状态条与光标是按元数据
+    /// 另行绘制的，画面就退化成「两根竖条 + 正文全空」；shell 空闲
+    /// 不重印提示符，若 ConPTY 的 resize 重绘缺失/被后续缩行打断，
+    /// 空屏便永久定格。M3.7c/d 的窗格标题栏占高、恢复路径整区估算
+    /// spawn、分隔条逐帧 resize 把缩行从罕见事件变成常态，引爆了该
+    /// M1 时代的潜伏缺陷。
     pub fn resize(&mut self, rows: usize, cols: usize) {
         if rows == self.rows && cols == self.cols {
             return;
@@ -265,12 +290,24 @@ impl Grid {
         while self.screen.len() < rows {
             self.screen.push_back(Row::new(cols));
         }
-        // 缩小行数时，顶行滚入历史，尽量保留光标附近内容。
+        // 缩小行数，第一步：收割光标行**以下**的纯空行（直接丢弃、
+        // 不进历史——空行入历史会让 scrollback 凭空多出空白段）。
+        while self.screen.len() > rows
+            && self.screen.len() - 1 > self.cursor.row
+            && self.screen.back().is_some_and(Row::is_blank)
+        {
+            self.screen.pop_back();
+        }
+        // 第二步：仍超出时顶行滚入历史，尽量保留光标附近内容。超限
+        // 丢弃必须同步推进 dropped_lines（绝对行号基准，与
+        // scroll_up_one 一致）——漏计会让命令块/选区的绝对行号整体
+        // 错位一行。
         while self.screen.len() > rows {
             if let Some(top) = self.screen.pop_front() {
                 self.scrollback.push_back(top);
                 if self.scrollback.len() > self.scrollback_limit {
                     self.scrollback.pop_front();
+                    self.dropped_lines += 1;
                 }
             }
             if self.cursor.row > 0 {
@@ -327,6 +364,72 @@ mod tests {
         assert_eq!(g.display_offset(), 2);
         g.scroll_display(-99);
         assert_eq!(g.display_offset(), 0);
+    }
+
+    #[test]
+    fn 缩行优先丢弃光标下方空行() {
+        // B2 症状① 回归测试。模拟新鲜提示符窗格：提示符在顶行、
+        // 光标停在同行、下方全空——缩行必须收割下方空行，而不是
+        // 把提示符行搬进历史（旧实现的行为，可视区只剩空行）。
+        let mut g = Grid::new(30, 20, 100);
+        for (i, ch) in "PS>".chars().enumerate() {
+            g.cell_mut(0, i).ch = ch;
+        }
+        g.cursor.row = 0;
+        g.cursor.col = 4;
+        g.resize(12, 20);
+        assert_eq!(g.scrollback_len(), 0);
+        assert_eq!(g.row(0)[0].ch, 'P');
+        assert_eq!((g.cursor.row, g.cursor.col), (0, 4));
+        // 绝对行号不漂移（命令块标记按绝对行号定位）。
+        assert_eq!(g.absolute_cursor_line(), 0);
+    }
+
+    #[test]
+    fn 缩行空行不足时顶行进历史() {
+        // 0..=4 行有内容、光标在第 4 行、第 5 行空：缩到 3 行时先
+        // 收割末尾空行，剩余超出从顶滚入历史，光标行内容保留。
+        let mut g = Grid::new(6, 4, 100);
+        for r in 0..5 {
+            g.cell_mut(r, 0).ch = char::from(b'a' + r as u8);
+        }
+        g.cursor.row = 4;
+        g.resize(3, 4);
+        assert_eq!(g.scrollback_len(), 2);
+        assert_eq!(g.cursor.row, 2);
+        assert_eq!(g.row(2)[0].ch, 'e');
+        // 绝对行号不漂移：2(历史) + 2(行) = 缩行前的第 4 行。
+        assert_eq!(g.absolute_cursor_line(), 4);
+    }
+
+    #[test]
+    fn 缩行不收割带背景的空行() {
+        // 末行无字符但有背景色（TUI 留下的色块）：不算空行、不可
+        // 丢弃，照旧从顶搬行进历史。
+        let mut g = Grid::new(3, 2, 100);
+        g.cell_mut(0, 0).ch = 'x';
+        g.cursor.row = 0;
+        g.cell_mut(2, 0).bg = Color::Indexed(1);
+        g.resize(2, 2);
+        assert_eq!(g.scrollback_len(), 1);
+        assert_eq!(g.row(1)[0].bg, Color::Indexed(1));
+    }
+
+    #[test]
+    fn 缩行历史超限时绝对行号不漂移() {
+        // scrollback 容量 1：缩行搬入 3 行触发 2 次超限丢弃，
+        // dropped_lines 必须同步递增（旧实现漏计，命令块/选区的
+        // 绝对行号会整体错位）。
+        let mut g = Grid::new(4, 2, 1);
+        for r in 0..4 {
+            g.cell_mut(r, 0).ch = 'x';
+        }
+        g.cursor.row = 3;
+        let before = g.absolute_cursor_line();
+        g.resize(1, 2);
+        assert_eq!(g.scrollback_len(), 1);
+        assert_eq!(g.cursor.row, 0);
+        assert_eq!(g.absolute_cursor_line(), before);
     }
 
     #[test]

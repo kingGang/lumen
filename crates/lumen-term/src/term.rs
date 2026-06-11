@@ -951,6 +951,25 @@ mod tests {
     }
 
     #[test]
+    fn 缩行后提示符仍在可视区() {
+        // B2 症状① 回归测试：spawn 大网格 → shell 打印提示符 →
+        // 首帧布局按真实窗格矩形缩行。提示符必须留在可视区首行
+        // （旧 Grid::resize 把顶行无条件搬进历史，可视区只剩命令块
+        // 状态条与光标「两根竖条」）。
+        let mut t = Terminal::new(30, 80, 100);
+        t.advance(b"PS C:\\ClaudeWorkspaces\\engram>");
+        t.resize(10, 40);
+        let s = screen_text(&t);
+        assert!(
+            s[0].starts_with("PS C:\\ClaudeWorkspaces\\engram>"),
+            "提示符应留在首行，实际: {:?}",
+            s[0]
+        );
+        assert_eq!(t.grid().cursor.row, 0);
+        assert_eq!(t.grid().scrollback_len(), 0);
+    }
+
+    #[test]
     fn 光标定位与擦除() {
         let mut t = term();
         t.advance(b"hello\x1b[1;1Hx\x1b[K");
