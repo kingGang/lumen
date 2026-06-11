@@ -6,7 +6,7 @@
 //! 关闭后焦点与 IME 复位链路与设置页同款。真账号后端 M5 接入。
 
 use crate::i18n;
-use crate::profile::{self, Profile};
+use crate::profile::{self, LoginError, Profile};
 
 use super::theme::Palette;
 
@@ -22,8 +22,9 @@ pub struct LoginUiState {
     email: String,
     /// 密码输入缓冲（仅内存，关闭即清空，绝不落盘）。
     password: String,
-    /// 校验失败的红字提示。
-    error: Option<String>,
+    /// 校验失败枚举（F6）：渲染时调 `.message()` 动态取当前语言文案，
+    /// 语言切换后下一帧自动显示新语言文案。
+    error: Option<LoginError>,
     /// 刚打开：本帧把焦点交给邮箱输入框。
     focus_email: bool,
 }
@@ -126,13 +127,14 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
                         st.error = None;
                         out.logged_in = Some(p);
                     }
-                    // 错误枚举化（F6）：UI 侧调 message() 取当前语言文案。
-                    Err(e) => st.error = Some(e.message().to_owned()),
+                    // 错误枚举化（F6）：保留枚举值，渲染时调 message() 动态取当前语言文案。
+                    Err(e) => st.error = Some(e),
                 }
             }
-            if let Some(err) = &st.error {
+            if let Some(e) = st.error {
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new(err).size(11.5).color(pal.error));
+                // 每帧渲染时动态调用 message()，语言切换后下一帧自动更新。
+                ui.label(egui::RichText::new(e.message()).size(11.5).color(pal.error));
             }
         });
     // Esc（顶层 modal 时）或 backdrop 点击 → 关闭；登录成功也关闭。

@@ -126,7 +126,7 @@ pub static STRINGS: Strings = Strings {
     toast_bg_load_failed_fmt: "背景圖片載入失敗：{}",
     toast_max_panes_fmt: "每個工作階段最多 {} 個窗格",
     toast_new_pane_failed_fmt: "新增窗格失敗：{}",
-    toast_stale_cwd_fmt: "{} 個工作階段的儲存目錄已失效，已回退預設目錄",
+    toast_stale_cwd_fmt: "{} 個工作階段的儲存目錄已失效，已還原為預設目錄",
     toast_font_fallback_fmt: "系統中未找到「{0}」，已回退「{1}」",
     toast_settings_save_failed_fmt: "設定儲存失敗：{}",
     toast_logged_in_fmt: "已登入：{}",

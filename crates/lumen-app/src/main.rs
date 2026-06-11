@@ -1089,12 +1089,15 @@ impl App {
             }
         );
         // 字体回退提示（设置页 Appearance 展示）。
+        // F6：启动时语言已由第 1069 行 i18n::set_language 设置完毕，
+        // 此处必须走 i18n 表而非硬编码简体中文。
         let font_hint = (!ap.font_family.is_empty()
             && !actual_family.eq_ignore_ascii_case(&ap.font_family))
         .then(|| {
-            format!(
-                "系统中未找到「{}」，已回退「{actual_family}」",
-                ap.font_family
+            i18n::fmt2(
+                i18n::strings().toast_font_fallback_fmt,
+                &ap.font_family,
+                &actual_family,
             )
         });
         // 首次启动（无设置文件）落盘默认值，方便用户直接手改；
@@ -2785,7 +2788,8 @@ impl ApplicationHandler<PtyWake> for App {
                         if let Some(err) = state.settings.save() {
                             state.shell_state.toast.push(
                                 shell::toast::ToastKind::Error,
-                                format!("设置保存失败：{err}"),
+                                // F6：与 L2636 字体/主题/语言写盘失败路径保持一致。
+                                i18n::fmt1(i18n::strings().toast_settings_save_failed_fmt, &err),
                             );
                             state.window.request_redraw();
                         }
