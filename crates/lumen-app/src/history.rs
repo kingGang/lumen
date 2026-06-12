@@ -146,9 +146,9 @@ impl HistoryStore {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<HistoryEntry>(&line) {
-                Ok(e) => raw.push(e),
-                Err(_) => {} // 损坏行静默跳过
+            if let Ok(e) = serde_json::from_str::<HistoryEntry>(&line) {
+                raw.push(e);
+                // 损坏行（Err）静默跳过
             }
         }
         self.entries = deduplicate(raw, MAX_ENTRIES);
@@ -417,24 +417,6 @@ impl HistoryStore {
     pub fn entries(&self) -> &[HistoryEntry] {
         &self.entries
     }
-
-    /// 内存条目数（用于测试断言）。
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// 第 i 条条目文本（0-indexed，按插入升序；用于测试断言）。
-    #[cfg(test)]
-    pub fn entry_text(&self, i: usize) -> &str {
-        &self.entries[i].text
-    }
-
-    /// 最新条目文本（用于测试断言）。
-    #[cfg(test)]
-    pub fn last_entry_text(&self) -> Option<&str> {
-        self.entries.last().map(|e| e.text.as_str())
-    }
 }
 
 /// 去重并保留最近 `max` 条：同 text 的条目合并（保留 exit_code 非 None 的，
@@ -472,6 +454,39 @@ fn deduplicate(mut raw: Vec<HistoryEntry>, max: usize) -> Vec<HistoryEntry> {
     deduped.reverse();
     let start = deduped.len().saturating_sub(max);
     deduped[start..].to_vec()
+}
+
+/// 增高防抖纯函数（设计稿 §7.1 防 resize 风暴，M4.1 批D2）。
+///
+/// - 目标高 > 当前高（增高）：需稳定 [`DEBOUNCE_MS`] 毫秒才提交。
+/// - 目标高 < 当前高（缩回）：立即提交（回 1 行无风暴风险且体感跟手）。
+/// - 目标高 == 当前高：不提交（无变化）。
+///
+/// # Arguments
+/// * `current_h` - 当前 footer 像素高度。
+/// * `target_h`  - 目标 footer 像素高度。
+/// * `changed_at` - 上次高度变化的时刻。
+/// * `now`       - 当前时刻。
+///
+/// # Returns
+/// `true` = 应提交新高度（走 footer_height 链路）；`false` = 继续等待。
+pub fn footer_height_debounce(
+    current_h: f32,
+    target_h: f32,
+    changed_at: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    const DEBOUNCE_MS: u64 = 100;
+    if target_h < current_h {
+        // 缩回：立即提交。
+        return true;
+    }
+    if (target_h - current_h).abs() < 0.5 {
+        // 等高：无变化，不提交。
+        return false;
+    }
+    // 增高：稳定 DEBOUNCE_MS 后才提交。
+    now.duration_since(changed_at).as_millis() >= DEBOUNCE_MS as u128
 }
 
 // ── 临时文件清理（测试辅助）────────────────────────────────────────
@@ -700,37 +715,4 @@ mod tests {
         let result = footer_height_debounce(30.0, 30.0, changed_at, now);
         assert!(!result, "等高时不应提交（无变化）");
     }
-}
-
-/// 增高防抖纯函数（设计稿 §7.1 防 resize 风暴，M4.1 批D2）。
-///
-/// - 目标高 > 当前高（增高）：需稳定 [`DEBOUNCE_MS`] 毫秒才提交。
-/// - 目标高 < 当前高（缩回）：立即提交（回 1 行无风暴风险且体感跟手）。
-/// - 目标高 == 当前高：不提交（无变化）。
-///
-/// # Arguments
-/// * `current_h` - 当前 footer 像素高度。
-/// * `target_h`  - 目标 footer 像素高度。
-/// * `changed_at` - 上次高度变化的时刻。
-/// * `now`       - 当前时刻。
-///
-/// # Returns
-/// `true` = 应提交新高度（走 footer_height 链路）；`false` = 继续等待。
-pub fn footer_height_debounce(
-    current_h: f32,
-    target_h: f32,
-    changed_at: std::time::Instant,
-    now: std::time::Instant,
-) -> bool {
-    const DEBOUNCE_MS: u64 = 100;
-    if target_h < current_h {
-        // 缩回：立即提交。
-        return true;
-    }
-    if (target_h - current_h).abs() < 0.5 {
-        // 等高：无变化，不提交。
-        return false;
-    }
-    // 增高：稳定 DEBOUNCE_MS 后才提交。
-    now.duration_since(changed_at).as_millis() >= DEBOUNCE_MS as u128
 }
