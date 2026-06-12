@@ -24,7 +24,7 @@ pub enum FooterKind {
     Hidden,
 }
 
-/// app 组装、renderer 消费的 footer 只读视图（M4.1 批C/D2）。
+/// app 组装、renderer 消费的 footer 只读视图（M4.1 批C/D2/E）。
 ///
 /// renderer 仅读本结构，不感知 lumen-editor 内部状态。
 ///
@@ -35,6 +35,8 @@ pub enum FooterKind {
 /// - `label`：模式提示标签（如 "Compose" / "直通中" / 空串）。
 /// - `preedit`：IME 预编辑文本（Compose 态；None 表示无预编辑）。M4.1 批D2。
 /// - `exit_badge`：退出码角标（None 表示无需显示）。M4.1 批D2。
+/// - `placeholder`：占位提示文字（Compose 态 lines 全空时以 fg_dim 色显示）。M4.1 批E。
+/// - `ghost`：历史联想 ghost text（光标在文末时追加渲染，fg_dim 色，→/End 接受）。M4.1 批E。
 #[derive(Debug, Clone)]
 pub struct ComposerView {
     /// footer 形态。
@@ -50,6 +52,14 @@ pub struct ComposerView {
     pub preedit: Option<PreeditState>,
     /// 退出码角标（M4.1 批D2）：None 表示不显示；任意按键后由 app 层清空。
     pub exit_badge: Option<ExitBadge>,
+    /// Compose 态占位提示（M4.1 批E）：仅当 `lines` 全空（空编辑器）时
+    /// 以 fg_dim 色显示在光标位置，光标仍在行首正常渲染。
+    /// None 或空串 = 不显示占位。
+    pub placeholder: Option<String>,
+    /// 历史联想 ghost text（M4.1 批E）：光标在文末时在光标后以 fg_dim 色
+    /// 追加渲染；→/End 键在文末+ghost 存在时接受（InsertText(ghost)）。
+    /// None = 无联想；不参与光标/选区几何；超行宽由 TextBounds 自然裁剪。
+    pub ghost: Option<String>,
 }
 
 /// IME 预编辑状态（M4.1 批D2，设计稿 §7.3）。
@@ -87,6 +97,8 @@ impl ComposerView {
             label: label.into(),
             preedit: None,
             exit_badge: None,
+            placeholder: None,
+            ghost: None,
         }
     }
 
@@ -103,6 +115,8 @@ impl ComposerView {
             label: label.into(),
             preedit: None,
             exit_badge: None,
+            placeholder: None,
+            ghost: None,
         }
     }
 
@@ -115,6 +129,8 @@ impl ComposerView {
             label: String::new(),
             preedit: None,
             exit_badge: None,
+            placeholder: None,
+            ghost: None,
         }
     }
 

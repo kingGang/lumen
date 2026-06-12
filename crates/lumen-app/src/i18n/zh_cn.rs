@@ -146,6 +146,15 @@ pub static STRINGS: Strings = Strings {
     toast_compose_tab_hint: "Tab 补全功能即将上线（M3.4）",
     toast_compose_history_hint: "历史搜索功能即将上线（D2）",
     footer_fallback_text: "shell 集成未生效（经典直通模式）",
+    // M4.1 批E：底部状态栏
+    statusbar_mode_compose: "✏ 编辑模式",
+    statusbar_mode_running: "⇣ 直通中",
+    statusbar_mode_altscreen: "⛶ 全屏程序",
+    statusbar_mode_fallback: "⌨ 经典直通",
+    statusbar_classic_off: "经典模式：关",
+    statusbar_classic_on: "经典模式：开",
+    statusbar_classic_tip: "切换经典直通模式 (Ctrl+Shift+E)",
+    composer_placeholder: "输入命令，Enter 发送（Ctrl+Shift+E 切换经典模式）",
     // 登录校验
     login_err_invalid_email: "邮箱格式不正确（需形如 name@example.com）",
     login_err_empty_password: "请输入密码",

@@ -148,6 +148,15 @@ pub static STRINGS: Strings = Strings {
     toast_compose_tab_hint: "Tab completion coming soon (M3.4)",
     toast_compose_history_hint: "History search coming soon (D2)",
     footer_fallback_text: "Shell integration inactive (classic passthrough)",
+    // M4.1 batch E: bottom status bar
+    statusbar_mode_compose: "✏ Compose",
+    statusbar_mode_running: "⇣ Passthrough",
+    statusbar_mode_altscreen: "⛶ Full-screen app",
+    statusbar_mode_fallback: "⌨ Classic mode",
+    statusbar_classic_off: "Classic: off",
+    statusbar_classic_on: "Classic: on",
+    statusbar_classic_tip: "Toggle classic passthrough (Ctrl+Shift+E)",
+    composer_placeholder: "Type a command, Enter to run  (Ctrl+Shift+E for classic mode)",
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",

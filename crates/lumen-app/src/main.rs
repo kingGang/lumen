@@ -2994,6 +2994,14 @@ impl ApplicationHandler<PtyWake> for App {
                     shell_idle,
                     os_dark: state.os_dark,
                     bg_image,
+                    // 底部状态栏所需：当前有效输入模式 + 经典直通开关（M4.1 批E）
+                    #[cfg(feature = "input-editor")]
+                    input_mode: mode::effective_mode(
+                        &tab.focused_pane().term,
+                        state.force_fallback,
+                    ),
+                    #[cfg(feature = "input-editor")]
+                    force_fallback: state.force_fallback,
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
@@ -3014,6 +3022,17 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 if shell_out.term_clicked {
                     state.terminal_focused = true;
+                }
+                // 底部状态栏「经典模式」按钮：复用 ToggleFallback 同路径（M4.1 批E）。
+                #[cfg(feature = "input-editor")]
+                if shell_out.toggle_fallback {
+                    let ti = state.active_tab;
+                    let pi = state.tabs[ti].focused;
+                    state.dispatch(
+                        action::Action::Term(action::TermAction::ToggleFallback),
+                        ti,
+                        pi,
+                    );
                 }
                 // 点击窗格（egui interact 侧的命中，与 window_event 的
                 // 原始鼠标路由互为冗余、同语义）：切焦点窗格。

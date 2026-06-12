@@ -12,6 +12,7 @@ pub mod filetree;
 pub mod layout;
 pub mod login_ui;
 pub mod settings_ui;
+pub mod statusbar;
 pub mod theme;
 pub mod toast;
 pub mod topbar;
@@ -110,6 +111,13 @@ pub struct ShellInput<'a> {
     pub os_dark: bool,
     /// 背景图绘制参数（P13）：None 表示未启用/加载失败，不绘制。
     pub bg_image: Option<BgImageInput>,
+    /// 当前有效输入模式（M4.1 批E：底部状态栏显示）。
+    /// 由 main 每帧调用 effective_mode 推导后传入，shell 侧不缓存。
+    #[cfg(feature = "input-editor")]
+    pub input_mode: crate::mode::InputMode,
+    /// 经典直通模式开关（M4.1 批E：状态栏右端按钮状态）。
+    #[cfg(feature = "input-editor")]
+    pub force_fallback: bool,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -237,6 +245,9 @@ pub struct ShellOutput {
     pub logged_in: Option<crate::profile::Profile>,
     /// 请求登出（头像菜单或设置页 Account；main 删盘并清登录态）。
     pub logged_out: bool,
+    /// 底部状态栏点击了经典直通切换按钮（M4.1 批E）：走 dispatch ToggleFallback 同路径。
+    #[cfg(feature = "input-editor")]
+    pub toggle_fallback: bool,
 }
 
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
@@ -298,6 +309,8 @@ pub fn show(
         login_closed: false,
         logged_in: None,
         logged_out: false,
+        #[cfg(feature = "input-editor")]
+        toggle_fallback: false,
     };
     // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
     // 派生（每帧少量色彩数学，开销可忽略）。
@@ -532,6 +545,30 @@ pub fn show(
     // 文件操作/搜索的结果反馈（egui 帧内 push，当帧即可见）。
     for (kind, text) in ft.toasts {
         st.toast.push(kind, text);
+    }
+
+    // ── 底部状态栏（M4.1 批E）：Panel::bottom 必须在 CentralPanel 之前声明
+    // （egui 面板布局：bottom/top > left/right > central，声明顺序决定剩余区域压缩方向）。
+    // AltScreen 时 footer 隐藏（ComposerView::hidden），但状态栏仍保持可见以便
+    // 用户随时知道当前模式（与 footer 逻辑独立）。
+    #[cfg(feature = "input-editor")]
+    {
+        let sb_resp = egui::Panel::bottom("lumen_statusbar")
+            .exact_size(statusbar::HEIGHT)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg_dark)
+                    .inner_margin(egui::Margin::symmetric(0, 0)),
+            )
+            .show_inside(root, |ui| {
+                let sb_out =
+                    statusbar::show(ui, input.input_mode, input.cwd, input.force_fallback, pal);
+                if sb_out.toggle_fallback {
+                    out.toggle_fallback = true;
+                }
+            });
+        let _ = sb_resp;
     }
 
     egui::CentralPanel::default()

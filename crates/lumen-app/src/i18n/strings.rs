@@ -326,6 +326,32 @@ pub struct Strings {
     /// 请输入密码
     pub login_err_empty_password: &'static str,
 
+    // ── M4.1 批E：底部状态栏（M3.8 海风哥反馈 #3/#6）────────────────
+    /// 状态栏：Compose 态模式指示文字（含图标前缀）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_compose: &'static str,
+    /// 状态栏：Running 态模式指示文字
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_running: &'static str,
+    /// 状态栏：AltScreen 态模式指示文字
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_altscreen: &'static str,
+    /// 状态栏：Fallback 态模式指示文字（警示色）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_mode_fallback: &'static str,
+    /// 状态栏：经典模式切换按钮关态文字
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_classic_off: &'static str,
+    /// 状态栏：经典模式切换按钮开态文字（已开启时显示）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_classic_on: &'static str,
+    /// 状态栏：经典模式切换按钮 hover tooltip
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub statusbar_classic_tip: &'static str,
+    /// Compose 态输入框占位提示文字（缓冲为空时 footer 显示）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub composer_placeholder: &'static str,
+
     // ── filetree 名字校验错误（UI 侧翻译）──────────────────────────
     /// 名称不能为空
     pub validate_name_empty: &'static str,

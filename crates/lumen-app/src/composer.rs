@@ -60,14 +60,19 @@ pub fn compose_view_for_mode(
                 lines
             };
             let cur = editor_view.cursor();
+            // 占位提示（M4.1 批E）：lines 全空时显示 composer_placeholder。
+            let all_empty = lines.iter().all(|l| l.is_empty());
+            let placeholder = all_empty.then(|| s.composer_placeholder.to_owned());
             // Position { line, byte }——与 ComposerView.cursor (行, 字节偏移) 语义相同
             ComposerView {
                 kind: lumen_renderer::composer_view::FooterKind::Composer,
                 lines,
                 cursor: (cur.line, cur.byte),
                 label: s.footer_label_compose.to_owned(),
-                preedit,    // M4.1 批D2：IME 预编辑
-                exit_badge, // M4.1 批D2：退出码角标
+                preedit,     // M4.1 批D2：IME 预编辑
+                exit_badge,  // M4.1 批D2：退出码角标
+                placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
+                ghost: None, // M4.1 批F（ghost text）：待批3填充
             }
         }
         InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
