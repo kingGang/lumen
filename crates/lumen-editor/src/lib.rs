@@ -24,10 +24,12 @@
 pub mod action;
 pub mod cursor;
 mod document;
+pub mod highlight;
 mod undo;
 
 pub use action::{EditAction, Motion};
 pub use cursor::{display_col_to_byte, word_end_right, word_start_left, Position, Selection};
+pub use highlight::{highlight_document, Token, TokenKind};
 
 use document::Document;
 use undo::{Snapshot, UndoStack};
@@ -102,6 +104,16 @@ impl<'a> EditorView<'a> {
     pub fn goal_col(&self) -> Option<usize> {
         self.goal_col
     }
+
+    /// 逐行 PowerShell 语法高亮 token（设计稿 §8）。
+    ///
+    /// 返回 `result[row]` 对应第 `row` 行的 [`Token`] 列表，渲染层据 [`TokenKind`]
+    /// 映射主题色板（本 crate 不涉及颜色）。命令行通常很短，每帧重算成本可忽略
+    /// （设计稿 §7.1）；需要时由渲染层按 `revision` 缓存。
+    pub fn highlight(&self) -> Vec<Vec<Token>> {
+        let lines: Vec<&str> = self.doc.lines.iter().map(|s| s.as_str()).collect();
+        highlight::highlight_document(&lines)
+    }
 }
 
 // ─── Editor ──────────────────────────────────────────────────────────────────
@@ -173,10 +185,13 @@ impl Editor {
         self.abandoned.as_deref()
     }
 
-    /// M3.2 预留：检测是否需要续行（未闭合引号/括号/行尾管道等）。
-    /// 当前批次仅返回 `false`（占位；M3.2 实现 PowerShell tokenizer 后填充）。
+    /// 检测当前文档末尾是否需要续行（未闭合引号/括号/here-string/块注释、
+    /// 行尾管道 `|` 或续行反引号）——供 app 层决定 Enter 是「自动换行续行」
+    /// 还是「提交命令」（设计稿 §4）。复用 [`highlight`] 的同一 PowerShell
+    /// tokenizer（设计稿 §8）。
     pub fn needs_continuation(&self) -> bool {
-        false
+        let lines: Vec<&str> = self.doc.lines.iter().map(|s| s.as_str()).collect();
+        highlight::needs_continuation(&lines)
     }
 
     // ─── 唯一可变入口 ─────────────────────────────────────────────────────────
