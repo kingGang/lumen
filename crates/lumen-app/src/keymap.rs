@@ -617,6 +617,12 @@ pub enum LookupResult {
     /// Compose 态接受 ghost text（→/End 键在光标文末 + ghost 非空时）。
     /// main.rs 收到此结果后取出 ghost 字符串，dispatch InsertText(ghost)。
     /// M4.1 批3：ghost text 接受路径。
+    ///
+    /// `input-editor` feature 门控：ghost 是输入编辑器功能，其产生处（keymap
+    /// →/End 守卫）与消费处（main.rs match arm）均已 cfg 门控，变体本身随之
+    /// 门控，方使 flag-off 构建的 match 自然穷尽——修复第十七轮 ghost 引入、
+    /// 变体漏加 cfg 致 `--no-default-features` 编译失败的回归。
+    #[cfg(feature = "input-editor")]
     AcceptGhost,
 }
 
