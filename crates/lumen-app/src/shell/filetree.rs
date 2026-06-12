@@ -1790,6 +1790,31 @@ pub fn path_insert_text(path: &Path) -> Vec<u8> {
     format!("'{}'", escape_powershell_single_quotes(&raw)).into_bytes()
 }
 
+/// 拖放到终端编辑器（Compose 态 footer 输入框）时插入的路径字符串。
+///
+/// 与 [`path_insert_text`] 使用完全相同的引号包裹规则，但返回 `String`
+/// 而非字节串，供 `dispatch(Edit(InsertText(...)))` 路径使用。
+/// 尾随空格由调用方按需追加（PTY 路径与编辑器路径不同：PTY 路径写入
+/// shell 的行编辑缓冲，尾随空格让光标落在路径后方便继续编辑；编辑器
+/// 路径同理，由 main.rs 侧追加以保持两者行为一致）。
+///
+/// 含控制字符的路径返回 `None`（拒绝插入，纵深防御与 [`path_insert_text`]
+/// 一致）。
+///
+/// # Errors
+/// 返回 `None` 而非 `Result`——含控制字符时静默拒绝，调用方直接跳过即可。
+pub fn path_insert_text_str(path: &Path) -> Option<String> {
+    let raw = path.display().to_string();
+    if raw.chars().any(char::is_control) {
+        log::warn!("路径含控制字符，拒绝插入（编辑器路径）: {}", path.display());
+        return None;
+    }
+    if raw.chars().all(is_plain_path_char) {
+        return Some(raw);
+    }
+    Some(format!("'{}'", escape_powershell_single_quotes(&raw)))
+}
+
 /// 裸插安全的字符白名单（保守集合：不在其中的一律走引号包裹，CJK
 /// 路径名被包裹只是冗余、无害）。
 fn is_plain_path_char(c: char) -> bool {
@@ -1967,6 +1992,69 @@ mod tests {
     fn 拖放插入_控制字符拒绝() {
         assert!(path_insert_text(Path::new("C:\\a\nb")).is_empty());
         assert!(path_insert_text(Path::new("C:\\a\x1bb")).is_empty());
+    }
+
+    // ── path_insert_text_str：编辑器路径，引号规则与 path_insert_text 完全一致 ──
+
+    #[test]
+    fn 编辑器路径_纯安全字符裸插() {
+        assert_eq!(
+            path_insert_text_str(Path::new(r"C:\proj\src\main.rs")),
+            Some("C:\\proj\\src\\main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn 编辑器路径_空格与中文包裹引号() {
+        assert_eq!(
+            path_insert_text_str(Path::new(r"C:\Program Files\app.exe")),
+            Some("'C:\\Program Files\\app.exe'".to_string())
+        );
+        // 中文不在白名单：包裹引号（冗余但无害，与 path_insert_text 一致）。
+        assert_eq!(
+            path_insert_text_str(Path::new(r"C:\工具\a.txt")),
+            Some("'C:\\工具\\a.txt'".to_string())
+        );
+    }
+
+    #[test]
+    fn 编辑器路径_弯引号同形字翻倍() {
+        assert_eq!(
+            path_insert_text_str(Path::new("C:\\a\u{2019}b c")),
+            Some("'C:\\a\u{2019}\u{2019}b c'".to_string())
+        );
+        assert_eq!(
+            path_insert_text_str(Path::new(r"C:\it's here")),
+            Some("'C:\\it''s here'".to_string())
+        );
+    }
+
+    #[test]
+    fn 编辑器路径_控制字符拒绝() {
+        // 控制字符路径返回 None（与 path_insert_text 返回空字节串语义对称）。
+        assert_eq!(path_insert_text_str(Path::new("C:\\a\nb")), None);
+        assert_eq!(path_insert_text_str(Path::new("C:\\a\x1bb")), None);
+    }
+
+    #[test]
+    fn 编辑器路径_与字节版本输出一致() {
+        // 验证 path_insert_text_str 与 path_insert_text 输出字符串完全一致。
+        let cases = [
+            r"C:\proj\src\main.rs",
+            r"C:\Program Files\app",
+            r"C:\工具\测试文件.txt",
+            r"C:\$env stuff",
+        ];
+        for s in &cases {
+            let p = Path::new(s);
+            let bytes = path_insert_text(p);
+            let as_str = std::str::from_utf8(&bytes).expect("path_insert_text 输出应为有效 UTF-8");
+            assert_eq!(
+                path_insert_text_str(p).as_deref(),
+                Some(as_str),
+                "路径 {s} 的两个函数输出应相同"
+            );
+        }
     }
 
     #[test]

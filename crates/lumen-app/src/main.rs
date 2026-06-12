@@ -4045,20 +4045,74 @@ impl ApplicationHandler<PtyWake> for App {
                 // 点窗格——插入后接着编辑命令行的就是它。转义与 cd 注
                 // 入同一套设施（弯引号同形字/控制字符防御见
                 // filetree::path_insert_text；空字节串 = 路径被拒绝）。
+                //
+                // 第二十一轮分流（与 d9444c6 Ctrl+V 分流同构）：
+                // Compose 态 → dispatch Edit(InsertText) 进 footer 编辑器；
+                // Running / AltScreen / Fallback → 原写 PTY 路径不变。
+                // dispatch 内实时查 effective_mode，防落点窗格聚焦瞬间
+                // 与执行时刻的模式漂移。
                 if let Some((pi, path)) = shell_out.insert_path {
-                    let bytes = shell::filetree::path_insert_text(&path);
                     // 下标对应 run_ui 时的布局；本帧结构若已被上方动作
                     // 改变（增删窗格）则跳过本次插入（防御，拖放与增删
                     // 同帧发生的概率可忽略）。
-                    if !bytes.is_empty() && pi < state.tabs[state.active_tab].panes.len() {
+                    if pi < state.tabs[state.active_tab].panes.len() {
+                        // 先聚焦落点窗格（落点若非焦点窗格，先切焦点再插入，
+                        // 与原行为一致）。
                         state.focus_pane(pi);
-                        let s = state.focused_pane_mut();
-                        s.term.grid_mut().scroll_to_bottom();
-                        if let Err(e) = s.write_user_input(&bytes) {
-                            error!("写入 PTY 失败: {e:#}");
+                        let (ti, pi_focused) =
+                            (state.active_tab, state.tabs[state.active_tab].focused);
+
+                        // Compose 态分流：进编辑器；其余态直写 PTY。
+                        #[cfg(feature = "input-editor")]
+                        {
+                            let mode = mode::effective_mode(
+                                &state.tabs[ti].panes[pi_focused].term,
+                                state.force_fallback,
+                            );
+                            if mode == mode::InputMode::Compose {
+                                // path_insert_text_str 与 path_insert_text 同一引号规则；
+                                // 控制字符路径返回 None，静默跳过（纵深防御）。
+                                if let Some(text) = shell::filetree::path_insert_text_str(&path) {
+                                    // 尾随空格：路径后方便光标继续编辑（与 PTY 路径行为对称）。
+                                    let text_with_space = format!("{text} ");
+                                    state.dispatch(
+                                        action::Action::Edit(action::EditAction::InsertText(
+                                            text_with_space,
+                                        )),
+                                        ti,
+                                        pi_focused,
+                                    );
+                                    state.terminal_focused = true;
+                                }
+                                // Compose 路径处理完毕，不走下方 PTY 路径。
+                                // （continue 不可用——在 if-let 块而非循环内；
+                                //  显式跳过：下方 PTY 块受 feature-gate else 保护。）
+                            } else {
+                                // 非 Compose 态：原写 PTY 路径。
+                                let bytes = shell::filetree::path_insert_text(&path);
+                                if !bytes.is_empty() {
+                                    let s = state.focused_pane_mut();
+                                    s.term.grid_mut().scroll_to_bottom();
+                                    if let Err(e) = s.write_user_input(&bytes) {
+                                        error!("写入 PTY 失败: {e:#}");
+                                    }
+                                    state.terminal_focused = true;
+                                }
+                            }
                         }
-                        // 插入后把键盘/IME 焦点交还终端，接着编辑命令行。
-                        state.terminal_focused = true;
+                        // feature = "input-editor" 未开启时：全量走原 PTY 路径。
+                        #[cfg(not(feature = "input-editor"))]
+                        {
+                            let bytes = shell::filetree::path_insert_text(&path);
+                            if !bytes.is_empty() {
+                                let s = state.focused_pane_mut();
+                                s.term.grid_mut().scroll_to_bottom();
+                                if let Err(e) = s.write_user_input(&bytes) {
+                                    error!("写入 PTY 失败: {e:#}");
+                                }
+                                state.terminal_focused = true;
+                            }
+                        }
                     }
                 }
                 // —— 文件树右键菜单：复制绝对/相对路径到剪贴板 ——
