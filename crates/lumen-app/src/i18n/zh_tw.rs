@@ -145,6 +145,9 @@ pub static STRINGS: Strings = Strings {
     filetree_trashed_fmt: "已移入資源回收筒：{}",
     filetree_delete_failed_fmt: "刪除失敗：{}",
     filetree_reveal_failed_fmt: "開啟檔案總管失敗：{}",
+    // M4.1 批B
+    toast_fallback_enabled: "傳統直通模式已開啟（Ctrl+Shift+E 關閉）",
+    toast_fallback_disabled: "傳統直通模式已關閉，恢復智慧路由",
     // 登入校驗
     login_err_invalid_email: "電子郵件格式不正確（需形如 name@example.com）",
     login_err_empty_password: "請輸入密碼",

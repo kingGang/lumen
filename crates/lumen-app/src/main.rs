@@ -1,9 +1,12 @@
 //! Lumen 主程序：winit 事件循环，组装 PTY → 终端状态机 → 渲染器 → egui 外壳。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod action;
 mod background;
 mod i18n;
 mod input;
+mod keymap;
+mod mode;
 mod profile;
 mod session;
 mod sessions_store;
@@ -400,6 +403,12 @@ struct AppState {
     /// 背景图纹理（P13）：已成功加载时为 Some，未启用/加载失败时为 None。
     /// egui 层在终端工作区底部绘制；关闭时 free 旧纹理防泄漏。
     bg_texture: Option<background::BgTexture>,
+    /// 经典直通模式开关（M4.1 批B，Ctrl+Shift+E 切换）。
+    ///
+    /// 置位后 [`mode::effective_mode`] 强制返回 [`mode::InputMode::Fallback`]，
+    /// 所有按键直通 PTY（= M2 现状）。设计稿 §2「手动逃生」。
+    /// **禁止在此字段之外的地方保存输入模式副本**（设计稿铁律）。
+    force_fallback: bool,
 }
 
 impl AppState {
@@ -483,6 +492,146 @@ impl AppState {
     /// 焦点窗格（可变）。
     fn focused_pane_mut(&mut self) -> &mut Session {
         self.tabs[self.active_tab].focused_pane_mut()
+    }
+
+    /// 唯一状态变更入口（M4.1 批B）——设计稿 §6。
+    ///
+    /// **凡绕过此方法直接改状态的代码，code review 一律打回。**
+    ///
+    /// winit 事件处理层只做「事件 → keymap → Action」翻译，不直接碰
+    /// editor / pty / term 状态；M4 远程消息反序列化为同一 `Action` 后
+    /// 经由此方法执行，保证本地与远端行为一致。
+    ///
+    /// 批B 实现范围：
+    /// - `Term(TermAction)` 完整实现（VT 编码下沉、写 PTY、翻屏、块跳转）。
+    /// - `Edit(_)` / `Composer(_)` 仅记 debug log，批D 接编辑器时填充。
+    ///
+    /// # 返回值
+    /// 返回 [`Vec<action::StateEvent>`]，消费方后批接（渲染 / 历史库 /
+    /// 状态条 / M4 状态增量同步）。批B 仅返回 `ModeChanged` 和
+    /// `FallbackToggled` 事件，其余批次逐步填充。
+    fn dispatch(
+        &mut self,
+        action: action::Action,
+        ti: usize,
+        pi: usize,
+    ) -> Vec<action::StateEvent> {
+        use action::{Action, StateEvent, TermAction};
+
+        let mut events = Vec::new();
+
+        match action {
+            // ── Edit：批D 接编辑器时填充 ──────────────────────────────
+            Action::Edit(ea) => {
+                log::debug!("[dispatch] Edit({ea:?}) 批D 接线，暂忽略");
+            }
+
+            // ── Composer：批D 接历史/补全时填充 ───────────────────────
+            Action::Composer(ca) => {
+                log::debug!("[dispatch] Composer({ca:?}) 批D 接线，暂忽略");
+            }
+
+            // ── Term：本批完整实现 ─────────────────────────────────────
+            Action::Term(ta) => match ta {
+                TermAction::Interrupt => {
+                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(b"\x03") {
+                        log::error!("写入 PTY 失败（Interrupt）: {e:#}");
+                    }
+                }
+
+                TermAction::SendKey(ks) => {
+                    // KeyStroke → winit KeyEvent 的反向转换（批D 可能走此路径）
+                    // 批B 暂时通过 PassThrough 路径处理，此分支为 M4 远程预留。
+                    log::debug!("[dispatch] SendKey({ks:?}) 暂由 PassThrough 处理");
+                }
+
+                TermAction::SendText(text) => {
+                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(text.as_bytes()) {
+                        log::error!("写入 PTY 失败（SendText）: {e:#}");
+                    }
+                }
+
+                TermAction::Scroll(dir) => {
+                    let rows = self.tabs[ti].panes[pi].term.grid().rows() as isize;
+                    let delta = match dir {
+                        action::ScrollDir::Up => rows - 1,
+                        action::ScrollDir::Down => -(rows - 1),
+                    };
+                    self.tabs[ti].panes[pi]
+                        .term
+                        .grid_mut()
+                        .scroll_display(delta);
+                    self.window.request_redraw();
+                }
+
+                TermAction::JumpBlock(dir) => {
+                    if self.tabs[ti].panes[pi].jump_block(dir) {
+                        self.window.request_redraw();
+                    }
+                }
+
+                TermAction::PasteClipboard => {
+                    self.tabs[ti].panes[pi].paste_clipboard(&mut self.clipboard);
+                }
+
+                TermAction::CopySelection => {
+                    if self.tabs[ti].panes[pi].copy_selection(&mut self.clipboard) {
+                        self.tabs[ti].panes[pi].selection = None;
+                        self.window.request_redraw();
+                    }
+                }
+
+                TermAction::CopyBlock => {
+                    self.tabs[ti].panes[pi].copy_selected_block(&mut self.clipboard);
+                    self.tabs[ti].panes[pi].selected_block = None;
+                    self.window.request_redraw();
+                }
+
+                TermAction::ScrollToBottom => {
+                    self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                }
+
+                TermAction::Paste(text) => {
+                    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+                    let payload = if self.tabs[ti].panes[pi].term.bracketed_paste() {
+                        let mut p = Vec::with_capacity(normalized.len() + 12);
+                        p.extend_from_slice(b"\x1b[200~");
+                        p.extend_from_slice(normalized.as_bytes());
+                        p.extend_from_slice(b"\x1b[201~");
+                        p
+                    } else {
+                        normalized.into_bytes()
+                    };
+                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
+                        log::error!("写入 PTY 失败（Paste）: {e:#}");
+                    }
+                }
+
+                TermAction::ToggleFallback => {
+                    self.force_fallback = !self.force_fallback;
+                    let s = i18n::strings();
+                    let msg = if self.force_fallback {
+                        s.toast_fallback_enabled
+                    } else {
+                        s.toast_fallback_disabled
+                    };
+                    self.shell_state
+                        .toast
+                        .push(shell::toast::ToastKind::Info, msg);
+                    self.window.request_redraw();
+                    events.push(StateEvent::FallbackToggled(self.force_fallback));
+                }
+            },
+        }
+
+        // 每次 dispatch 后推导当前模式，若变化则发 ModeChanged 事件。
+        // 此推导调用符合设计稿「按键处理后实时计算」的纪律，不缓存。
+        let _current_mode =
+            mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+        // 批B：ModeChanged 事件待消费方（状态条）就绪后填充。
+        // events.push(StateEvent::ModeChanged(current_mode));
+
+        events
     }
 
     /// 按会话 id 定位窗格：返回 (tab 下标, 窗格下标)。
@@ -1362,6 +1511,7 @@ impl App {
             shell_state: shell::ShellState::default(),
             window_just_resized: false,
             bg_texture: None,
+            force_fallback: false,
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1871,244 +2021,155 @@ impl ApplicationHandler<PtyWake> for App {
                 state.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                use winit::keyboard::{Key, NamedKey};
+                // —— M4.1 批B：事件 → keymap 查表 → Action → dispatch ——
+                //
+                // 原八层 if-else 拦截链已全部平移进 keymap 静态表
+                // （crates/lumen-app/src/keymap.rs）。此处为「瘦身后」
+                // 的入口：组装 GuardState、查表、执行结果。
+                //
+                // 无法入表的特例（说明为什么不入表）：
+                // 1. IME：Ime::Commit / Ime::Preedit 事件走 WindowEvent::Ime
+                //    分支（下方），不经过 KeyboardInput，故不在此表内。
+                // 2. 重命名文本输入：重命名编辑中键盘归 egui 输入框，
+                //    terminal_focused=false 的闸已拦住，keymap 中 renaming
+                //    守卫只影响外壳快捷键层，无需单独入表。
+                // 3. login.open 期间外壳快捷键全部静默：由 overlay_open
+                //    守卫 + terminal_focused=false 联合处理，符合设计稿。
+
                 let pressed = event.state == ElementState::Pressed;
-                // —— 外壳级快捷键：Ctrl+T 新建 / Ctrl+W 关闭当前 /
-                // Ctrl+Tab 下一个（Ctrl+Shift+Tab 上一个）/
-                // Ctrl+B 文件树开合 / Ctrl+, 设置页开合 ——
-                // 路由规则：非 alt-screen 时优先于终端直通拦截（窗口级，
-                // 终端是否聚焦都生效）；**alt screen 激活时全部直通终端
-                // 不拦截**——vim 的 Ctrl+W 是窗口操作前缀键、全屏 TUI
-                // 也可能吃 Ctrl+Tab，抢按键会毁掉用户操作；重命名编辑
-                // 中按键归 egui 的输入框，同样不拦截。
-                // 例外：覆盖层（设置/登录）已打开时按键根本到不了终端
-                // （terminal_focused=false 的闸在下方拦截），「让键给
-                // vim」的前提不成立——放行快捷键块，否则 alt screen 下
-                // Ctrl+, 关不掉已打开的设置页（开关不对称，按键被静默
-                // 吞掉）。match 内部的 login/settings 守卫臂保证放行后
-                // 唯一新增的行为就是 Ctrl+, 的关闭路径。
-                let overlay_open = state.shell_state.settings.open || state.shell_state.login.open;
-                // —— 分屏快捷键（F5 批1 验证通道；+ 按钮归批次2）——
-                // Ctrl+Shift+D 焦点 tab 内新增窗格 / Ctrl+Shift+W 关闭
-                // 焦点窗格（最后一个窗格 = 关整个 tab）。守卫与外壳快
-                // 捷键一致：重命名/文件树对话框/覆盖层打开时让位 egui；
-                // **alt screen 不让位、全局拦截**（裁决：vim 的 Ctrl+W
-                // 前缀不带 Shift、全屏 TUI 几乎不绑 Ctrl+Shift+字母；
-                // 且传统键盘编码下 Ctrl+Shift+W 与 Ctrl+W 字节相同，
-                // 放行也只会被对端当成裸 ^W——拦截收益大于冲突风险）。
-                if pressed
-                    && state.modifiers.control_key()
-                    && state.modifiers.shift_key()
-                    && !overlay_open
-                    && state.shell_state.renaming.is_none()
-                    && !state.shell_state.filetree.dialog_open()
-                {
-                    if let Key::Character(c) = &event.logical_key {
-                        if c.eq_ignore_ascii_case("d") {
-                            state.new_pane();
-                            return;
-                        }
-                        if c.eq_ignore_ascii_case("w") {
-                            let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-                            if state.close_pane(ti, pi) {
-                                info!("最后一个会话已关闭，退出应用");
-                                event_loop.exit();
-                            }
-                            return;
-                        }
-                    }
-                    // Ctrl+Shift+Enter：最大化/还原焦点窗格（P14；守卫
-                    // 与 Ctrl+Shift+D/W 一致——含 alt screen 全局拦截，
-                    // 裁决同款：全屏 TUI 几乎不绑 Ctrl+Shift+Enter）。
-                    if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
-                        let pi = state.tabs[state.active_tab].focused;
-                        state.toggle_maximize_pane(pi);
-                        return;
-                    }
-                }
-                if pressed
-                    && state.modifiers.control_key()
-                    && (overlay_open || !state.focused_pane().term.is_alt_screen())
-                    && state.shell_state.renaming.is_none()
-                    // 文件树对话框（新建/删除确认）打开期间键盘归 egui
-                    // 的输入框，外壳快捷键不响应（Ctrl+W 关会话等）。
-                    && !state.shell_state.filetree.dialog_open()
-                {
-                    let shift = state.modifiers.shift_key();
-                    match &event.logical_key {
-                        // 登录覆盖层打开期间外壳快捷键全部不响应（键盘归
-                        // egui 的输入框，Esc 关闭由 Modal 处理）；按键也
-                        // 不会直通 PTY——下方 terminal_focused=false 的闸
-                        // 会拦住。
-                        _ if state.shell_state.login.open => {}
-                        // Ctrl+, 开/关设置页（终端焦点与 IME 路由随之切换）。
-                        Key::Character(c) if !shift && c.as_str() == "," => {
-                            if state.shell_state.settings.open {
-                                state.shell_state.settings.open = false;
-                                state.terminal_focused = true;
-                            } else {
-                                state.shell_state.settings.open_with(&state.settings);
-                                state.terminal_focused = false;
-                            }
-                            state.window.request_redraw();
-                            return;
-                        }
-                        // 设置页打开期间其余外壳快捷键不响应（避免在覆盖
-                        // 层背后偷偷增删会话）；按键也不会直通 PTY——
-                        // 下方 terminal_focused=false 的闸会拦住。
-                        _ if state.shell_state.settings.open => {}
-                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("t") => {
-                            state.new_tab();
-                            return;
-                        }
-                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("w") => {
-                            // Ctrl+W 关整个 tab（关焦点窗格是 Ctrl+Shift+W）。
-                            if state.close_tab(state.active_tab) {
-                                info!("最后一个会话已关闭，退出应用");
-                                event_loop.exit();
-                            }
-                            return;
-                        }
-                        Key::Character(c) if !shift && c.eq_ignore_ascii_case("b") => {
-                            // 文件树开合：终端区宽度随之变化，下一帧
-                            // egui 布局产出新矩形并触发离屏重建+resize。
-                            let ft = &mut state.shell_state.filetree;
-                            ft.visible = !ft.visible;
-                            state.window.request_redraw();
-                            return;
-                        }
-                        Key::Named(NamedKey::Tab) => {
-                            state.cycle_tab(if shift { -1 } else { 1 });
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // 终端聚焦时键盘绕过 egui 直通此处；非聚焦时按键归
-                // egui，无论它是否消费都不再写 PTY（点了侧栏还往
-                // shell 灌字节是事故）。
-                if !state.terminal_focused {
-                    return;
-                }
-                // 键盘直通焦点窗格（F5：键盘/IME/粘贴/块操作全跟焦点）。
-                // 用字段级下标而非访问器：clipboard 等字段需要同时可变
-                // 借用，访问器会借住整个 state。
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
-                // 抬起事件仅在 win32-input-mode 下投递（协议需要 Kd=0）。
-                if !pressed {
-                    if state.tabs[ti].panes[pi].term.win32_input()
-                        && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
-                    {
+
+                // 组装守卫状态（从 AppState 采样，不缓存）。
+                let guard = keymap::GuardState {
+                    has_selection: state.tabs[ti].panes[pi]
+                        .selection
+                        .as_ref()
+                        .is_some_and(|s| !s.is_empty()),
+                    has_selected_block: state.tabs[ti].panes[pi].selected_block.is_some(),
+                    is_alt_screen: state.tabs[ti].panes[pi].term.is_alt_screen(),
+                    overlay_open: state.shell_state.settings.open || state.shell_state.login.open,
+                    renaming: state.shell_state.renaming.is_some(),
+                    filetree_dialog_open: state.shell_state.filetree.dialog_open(),
+                    terminal_focused: state.terminal_focused,
+                    win32_input: state.tabs[ti].panes[pi].term.win32_input()
+                        && std::env::var_os("LUMEN_WIN32_INPUT").is_some(),
+                    shift_pressed: state.modifiers.shift_key(),
+                };
+
+                // 求值当前有效输入模式（纯推导，不缓存）。
+                let mode =
+                    mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+
+                // 查表。
+                let result = keymap::lookup(&event, state.modifiers, mode, pressed, &guard);
+
+                match result {
+                    None => {
+                        // keymap 未命中（通常是 terminal_focused=false 的闸），
+                        // 不写 PTY。
+                    }
+
+                    Some(keymap::LookupResult::ShellAction(shell_action)) => {
+                        // 外壳级动作：不走 dispatch，直接执行外壳逻辑。
+                        use keymap::ShellAction;
+                        match shell_action {
+                            ShellAction::NewPane => {
+                                state.new_pane();
+                            }
+                            ShellAction::ClosePane => {
+                                if state.close_pane(ti, pi) {
+                                    info!("最后一个会话已关闭，退出应用");
+                                    event_loop.exit();
+                                }
+                            }
+                            ShellAction::ToggleMaximizePane => {
+                                let focused = state.tabs[state.active_tab].focused;
+                                state.toggle_maximize_pane(focused);
+                            }
+                            ShellAction::ToggleSettings => {
+                                // 登录覆盖层打开时不响应（键盘归 egui）。
+                                if !state.shell_state.login.open {
+                                    if state.shell_state.settings.open {
+                                        state.shell_state.settings.open = false;
+                                        state.terminal_focused = true;
+                                    } else {
+                                        state.shell_state.settings.open_with(&state.settings);
+                                        state.terminal_focused = false;
+                                    }
+                                    state.window.request_redraw();
+                                }
+                            }
+                            ShellAction::NewTab => {
+                                // 设置页打开时不响应（避免在覆盖层背后偷偷增删）。
+                                if !state.shell_state.settings.open {
+                                    state.new_tab();
+                                }
+                            }
+                            ShellAction::CloseTab => {
+                                if !state.shell_state.settings.open
+                                    && state.close_tab(state.active_tab)
+                                {
+                                    info!("最后一个会话已关闭，退出应用");
+                                    event_loop.exit();
+                                }
+                            }
+                            ShellAction::ToggleFiletree => {
+                                if !state.shell_state.settings.open {
+                                    // 文件树开合：终端区宽度随之变化，下一帧
+                                    // egui 布局产出新矩形并触发离屏重建+resize。
+                                    let ft = &mut state.shell_state.filetree;
+                                    ft.visible = !ft.visible;
+                                    state.window.request_redraw();
+                                }
+                            }
+                            ShellAction::CycleTab(dir) => {
+                                if !state.shell_state.settings.open {
+                                    state.cycle_tab(dir);
+                                }
+                            }
+                        }
+                    }
+
+                    Some(keymap::LookupResult::Win32KeyUp) => {
+                        // win32-input-mode 抬起事件：encode_key_win32(Kd=0) 写 PTY。
                         if let Some(bytes) = input::encode_key_win32(&event, state.modifiers, false)
                         {
                             if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
+                                error!("写入 PTY 失败（win32 key-up）: {e:#}");
+                            }
+                        }
+                    }
+
+                    Some(keymap::LookupResult::Consumed) => {
+                        // 按键已消费（如 Ctrl+Shift+C 无选区），不写 PTY。
+                    }
+
+                    Some(keymap::LookupResult::TerminalAction(action)) => {
+                        // 经由 dispatch 执行终端 Action。
+                        state.dispatch(action, ti, pi);
+                        // 按键记录（端到端延迟埋点）。
+                        state.last_key_at = Some(Instant::now());
+                    }
+
+                    Some(keymap::LookupResult::PassThrough) => {
+                        // 兜底直通：encode_key / encode_key_win32 编码后写 PTY。
+                        let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
+                            && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
+                        let bytes = if use_win32 {
+                            input::encode_key_win32(&event, state.modifiers, true)
+                        } else {
+                            input::encode_key(&event, state.modifiers)
+                        };
+                        if let Some(bytes) = bytes {
+                            state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                            let write_t0 = Instant::now();
+                            if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
                                 error!("写入 PTY 失败: {e:#}");
                             }
+                            state.last_key_at = Some(write_t0);
+                            state.perf_log(format_args!("key 写入耗时 {:?}", write_t0.elapsed()));
                         }
                     }
-                    return;
-                }
-                // Shift+PgUp/PgDn 本地翻屏，不发给 shell。
-                if state.modifiers.shift_key() {
-                    let rows = state.tabs[ti].panes[pi].term.grid().rows() as isize;
-                    let scrolled = match event.logical_key {
-                        Key::Named(NamedKey::PageUp) => {
-                            state.tabs[ti].panes[pi]
-                                .term
-                                .grid_mut()
-                                .scroll_display(rows - 1);
-                            true
-                        }
-                        Key::Named(NamedKey::PageDown) => {
-                            state.tabs[ti].panes[pi]
-                                .term
-                                .grid_mut()
-                                .scroll_display(-(rows - 1));
-                            true
-                        }
-                        _ => false,
-                    };
-                    if scrolled {
-                        state.window.request_redraw();
-                        return;
-                    }
-                    // Shift+Insert 粘贴。
-                    if matches!(event.logical_key, Key::Named(NamedKey::Insert)) {
-                        state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
-                        return;
-                    }
-                }
-                if state.modifiers.control_key() {
-                    // Ctrl+↑/↓：命令块间跳转。备用屏幕（vim/codex）里
-                    // 块不可见也无意义，按键放行给应用。
-                    if !state.tabs[ti].panes[pi].term.is_alt_screen() {
-                        match event.logical_key {
-                            Key::Named(NamedKey::ArrowUp) => {
-                                if state.tabs[ti].panes[pi].jump_block(-1) {
-                                    state.window.request_redraw();
-                                }
-                                return;
-                            }
-                            Key::Named(NamedKey::ArrowDown) => {
-                                if state.tabs[ti].panes[pi].jump_block(1) {
-                                    state.window.request_redraw();
-                                }
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                    let ch = match &event.logical_key {
-                        Key::Character(s) => s.chars().next().map(|c| c.to_ascii_lowercase()),
-                        _ => None,
-                    };
-                    match ch {
-                        // Ctrl+C 优先级：文本选区复制 → 选中块复制输出 →
-                        // 发送中断（Windows Terminal 惯例扩展）。
-                        Some('c') => {
-                            if state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard) {
-                                state.tabs[ti].panes[pi].selection = None;
-                                state.window.request_redraw();
-                                return;
-                            }
-                            // 块处于选中态（用户可见高亮）就必须消费按键：
-                            // 复制失败（空输出/块已淘汰）也只清选中、绝不
-                            // 下穿成中断——误发 ^C 会取消用户输入的命令行。
-                            if state.tabs[ti].panes[pi].selected_block.is_some() {
-                                state.tabs[ti].panes[pi].copy_selected_block(&mut state.clipboard);
-                                state.tabs[ti].panes[pi].selected_block = None;
-                                state.window.request_redraw();
-                                return;
-                            }
-                            if state.modifiers.shift_key() {
-                                return; // Ctrl+Shift+C 无选区时不下发
-                            }
-                        }
-                        // Ctrl+V / Ctrl+Shift+V 粘贴。
-                        Some('v') => {
-                            state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // win32-input-mode 实验性开关（LUMEN_WIN32_INPUT=1 启用）：
-                // 实测当前编码实现反而更卡，默认关闭待核对协议规范。
-                let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
-                    && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
-                let bytes = if use_win32 {
-                    input::encode_key_win32(&event, state.modifiers, true)
-                } else {
-                    input::encode_key(&event, state.modifiers)
-                };
-                if let Some(bytes) = bytes {
-                    state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
-                    let write_t0 = Instant::now();
-                    if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
-                        error!("写入 PTY 失败: {e:#}");
-                    }
-                    state.last_key_at = Some(write_t0);
-                    state.perf_log(format_args!("key 写入耗时 {:?}", write_t0.elapsed()));
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

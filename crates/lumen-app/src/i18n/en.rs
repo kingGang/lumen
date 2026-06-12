@@ -141,6 +141,9 @@ pub static STRINGS: Strings = Strings {
     filetree_trashed_fmt: "Moved to Recycle Bin: {}",
     filetree_delete_failed_fmt: "Delete failed: {}",
     filetree_reveal_failed_fmt: "Failed to open File Explorer: {}",
+    // M4.1 batch B
+    toast_fallback_enabled: "Classic passthrough enabled (Ctrl+Shift+E to disable)",
+    toast_fallback_disabled: "Classic passthrough disabled, smart routing restored",
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",

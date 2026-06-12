@@ -284,6 +284,12 @@ pub struct Strings {
     /// "打开文件管理器失败：{e}"，单参 `{}`：错误文本
     pub filetree_reveal_failed_fmt: &'static str,
 
+    // ── M4.1 批B：经典直通模式切换 toast ────────────────────────────
+    /// 切换为经典直通模式的 toast（Ctrl+Shift+E 开启）
+    pub toast_fallback_enabled: &'static str,
+    /// 关闭经典直通模式的 toast（Ctrl+Shift+E 关闭）
+    pub toast_fallback_disabled: &'static str,
+
     // ── profile 校验错误（UI 侧翻译）────────────────────────────────
     /// 邮箱格式不正确
     pub login_err_invalid_email: &'static str,
