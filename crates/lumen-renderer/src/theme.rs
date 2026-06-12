@@ -42,6 +42,15 @@ impl Rgb {
         }
         [lin(self.0), lin(self.1), lin(self.2), alpha]
     }
+
+    /// 向白色线性混合 `t`（0=原色，1=纯白）提高明度、保持大致色相。
+    /// 用于语法高亮把近黑底上偏沉的色（如青）提亮，增强醒目度
+    /// （M4.2 批2 验收：参数青 `#7dcfff` 在 `#0d0d0d` 底偏暗）。
+    pub fn lighten(self, t: f32) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |v: u8| (v as f32 + (255.0 - v as f32) * t).round() as u8;
+        Rgb(mix(self.0), mix(self.1), mix(self.2))
+    }
 }
 
 /// 终端主题（M3.4 起可在设置页切换；P12 起内置主题集见
@@ -151,5 +160,24 @@ impl Theme {
             );
         }
         (fg, bg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lighten_提高明度且端点钳制() {
+        let c = Rgb(0x7d, 0xcf, 0xff);
+        let l = c.lighten(0.35);
+        // 各通道不减、未饱和通道提亮（向白移动）。
+        assert!(l.0 >= c.0 && l.1 >= c.1 && l.2 >= c.2);
+        assert!(l.0 > c.0, "未饱和通道应提亮");
+        // t=0 原色不变，t=1 纯白；越界钳制。
+        assert_eq!(c.lighten(0.0), c);
+        assert_eq!(c.lighten(1.0), Rgb(255, 255, 255));
+        assert_eq!(c.lighten(2.0), Rgb(255, 255, 255));
+        assert_eq!(c.lighten(-1.0), c);
     }
 }

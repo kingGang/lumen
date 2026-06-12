@@ -996,7 +996,11 @@ impl Renderer {
                                         match sp.kind {
                                             K::Command => self.theme.ansi[4].to_glyphon(),
                                             K::Keyword => self.theme.ansi[5].to_glyphon(),
-                                            K::Parameter => self.theme.ansi[6].to_glyphon(),
+                                            // 参数：青在近黑底偏沉，提亮 35% 增强醒目度
+                                            // （M4.2 批2 验收反馈，保持主题色相）。
+                                            K::Parameter => {
+                                                self.theme.ansi[6].lighten(0.35).to_glyphon()
+                                            }
                                             K::Variable => self.theme.ansi[1].to_glyphon(),
                                             K::Number => self.theme.ansi[3].to_glyphon(),
                                             K::StringLit => self.theme.ansi[2].to_glyphon(),
