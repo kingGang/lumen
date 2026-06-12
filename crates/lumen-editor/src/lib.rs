@@ -27,7 +27,7 @@ mod document;
 mod undo;
 
 pub use action::{EditAction, Motion};
-pub use cursor::{Position, Selection};
+pub use cursor::{display_col_to_byte, word_end_right, word_start_left, Position, Selection};
 
 use document::Document;
 use undo::{Snapshot, UndoStack};

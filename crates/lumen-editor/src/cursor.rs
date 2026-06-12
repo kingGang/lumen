@@ -103,7 +103,14 @@ pub(crate) fn byte_to_display_col(s: &str, byte: usize) -> usize {
 ///
 /// 对于宽字符（如 CJK 占 2 列），`col` 落在字符内部时返回该字符的起始字节偏移。
 /// 例：`"中文"` 中 `col=1` 落在第一个汉字（列 0-1）内部，返回 `0`。
-pub(crate) fn display_col_to_byte(s: &str, col: usize) -> usize {
+///
+/// # Examples
+/// ```
+/// use lumen_editor::display_col_to_byte;
+/// assert_eq!(display_col_to_byte("hello", 2), 2);
+/// assert_eq!(display_col_to_byte("中文", 2), 3); // 第二个汉字起始
+/// ```
+pub fn display_col_to_byte(s: &str, col: usize) -> usize {
     let mut acc = 0usize;
     for (i, g) in s.grapheme_indices(true) {
         let w = UnicodeWidthStr::width(g);
@@ -122,7 +129,9 @@ pub(crate) fn display_col_to_byte(s: &str, col: usize) -> usize {
 
 /// 向左查找词边界（空白/字母数字/符号三类切换处）。
 /// 返回应跳到的字节偏移。
-pub(crate) fn word_start_left(s: &str, byte: usize) -> usize {
+///
+/// CJK 连续字符属于同一类别（字母数字），视为同一词。
+pub fn word_start_left(s: &str, byte: usize) -> usize {
     let byte = byte.min(s.len());
     let prefix = &s[..byte];
     // 按 grapheme 逆序遍历，跳过同类别字符
@@ -146,7 +155,9 @@ pub(crate) fn word_start_left(s: &str, byte: usize) -> usize {
 }
 
 /// 向右查找词边界。返回应跳到的字节偏移。
-pub(crate) fn word_end_right(s: &str, byte: usize) -> usize {
+///
+/// CJK 连续字符属于同一类别（字母数字），视为同一词。
+pub fn word_end_right(s: &str, byte: usize) -> usize {
     let byte = byte.min(s.len());
     let suffix = &s[byte..];
     let graphemes: Vec<(usize, &str)> = suffix.grapheme_indices(true).collect();
