@@ -66,7 +66,7 @@ fn osc633_e_透传验证() {
     let osc633_cmd = r#"[Console]::Write([char]27 + "]633;E;dGVzdA==" + [char]7); exit 0"#;
 
     // 用较大终端尺寸避免 ConPTY 自动折行裁切字节。
-    let (mut session, rx) = PtySession::spawn(
+    let (session, rx) = PtySession::spawn(
         Some("pwsh.exe"),
         &[
             "-NoProfile".into(),

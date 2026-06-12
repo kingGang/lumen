@@ -6,10 +6,12 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 
 /// PTY 输出事件，由读线程推送。
 #[derive(Debug)]
@@ -25,7 +27,11 @@ pub enum PtyEvent {
 /// Drop 时杀掉子进程，避免孤儿 shell。
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// 子进程杀手（Drop 时杀进程）。child 本体 move 进 wait 线程阻塞等
+    /// 退出（见 [`Self::spawn`]），故这里只留可 clone 的 killer。
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    /// 进程存活标志：wait 线程在子进程退出时置 false（[`Self::is_alive`] 据此）。
+    alive: Arc<AtomicBool>,
     /// 写入走独立线程：ConPTY 输入管道在 conhost 繁忙时会反压，
     /// 主线程（UI 事件循环）绝不能阻塞在管道写上。
     write_tx: Sender<Vec<u8>>,
@@ -74,6 +80,10 @@ impl PtySession {
             .with_context(|| format!("启动 shell 失败: {shell}"))?;
         // slave 端句柄交给子进程后即可关闭，否则读端永远等不到 EOF。
         drop(pair.slave);
+        // killer 留作 Drop 杀进程；child 本体稍后 move 进 wait 线程等退出。
+        let killer = child.clone_killer();
+        // 进程存活标志：wait 线程在子进程退出时翻转。
+        let alive = Arc::new(AtomicBool::new(true));
 
         let mut reader = pair
             .master
@@ -101,6 +111,10 @@ impl PtySession {
         // 有界通道形成背压：渲染端消费不过来时读线程会阻塞，
         // 避免 `yes` 这类高速输出把内存撑爆。
         let (tx, rx) = bounded::<PtyEvent>(128);
+        // wait 线程先取一份发送端与存活标志（读线程随后 move 走 tx）。
+        let wait_tx = tx.clone();
+        let wait_alive = alive.clone();
+        let mut wait_child = child;
         std::thread::Builder::new()
             .name("lumen-pty-reader".into())
             .spawn(move || {
@@ -121,10 +135,25 @@ impl PtySession {
             })
             .context("启动 PTY 读线程失败")?;
 
+        // wait 线程：直接阻塞等子进程退出再发 Exited，不依赖 ConPTY 的
+        // read EOF——Windows ConPTY 下 shell 退出后 master read 常不返回
+        // EOF（conhost 保持 pipe 打开），只靠读线程会漏报退出、窗格卡死
+        // 无响应（海风哥 2026-06-13 实测 `exit` 无反应的真因）。读线程的
+        // EOF 分支仍保留作兜底；两路都可能发 Exited，上层按窗格 id 去重。
+        std::thread::Builder::new()
+            .name("lumen-pty-wait".into())
+            .spawn(move || {
+                let _ = wait_child.wait();
+                wait_alive.store(false, Ordering::Release);
+                let _ = wait_tx.send(PtyEvent::Exited);
+            })
+            .context("启动 PTY 等待线程失败")?;
+
         Ok((
             Self {
                 master: pair.master,
-                child,
+                killer,
+                alive,
                 write_tx,
             },
             rx,
@@ -151,15 +180,15 @@ impl PtySession {
             .context("调整 PTY 尺寸失败")
     }
 
-    /// shell 进程是否仍在运行。
-    pub fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    /// shell 进程是否仍在运行（wait 线程在子进程退出时翻转此标志）。
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        let _ = self.killer.kill();
     }
 }
 

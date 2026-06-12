@@ -1552,6 +1552,56 @@ impl AppState {
         false
     }
 
+    /// 单窗格 shell 退出后在原位重启一个新 shell（海风哥 2026-06-13 体验
+    /// 优化：单窗口 `exit` 不关应用，而是换一个干净的 PowerShell 继续用；
+    /// 多窗格场景仍走 [`Self::close_pane`] 关掉退出的那格）。
+    ///
+    /// 沿用旧窗格的网格行列与 cwd（最后上报的 OSC 9;9 目录，失效回初始/
+    /// 默认目录），id 新分配、旧窗格渲染资源释放。返回 `true` 表示重启失败
+    /// 且退回关闭后已无 tab（调用方应退出应用）。
+    fn respawn_pane(&mut self, ti: usize, pi: usize) -> bool {
+        let (rows, cols, cwd, old_id) = {
+            let old = &self.tabs[ti].panes[pi];
+            let g = old.term.grid();
+            let cwd = old
+                .term
+                .cwd()
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| old.initial_cwd.clone())
+                // spawn 约定由调用方先验证目录仍存在。
+                .filter(|p| p.is_dir());
+            (g.rows(), g.cols(), cwd, old.id)
+        };
+        let id = self.next_session_id;
+        self.next_session_id += 1;
+        match Session::spawn(
+            id,
+            rows,
+            cols,
+            SCROLLBACK,
+            self.wake_pending.clone(),
+            self.proxy.clone(),
+            cwd.as_deref(),
+        ) {
+            Ok(s) => {
+                // 原位替换：旧 Session 随赋值 Drop（杀旧进程——已退出）。
+                self.tabs[ti].panes[pi] = s;
+                self.release_pane_resources(old_id);
+                info!("单窗格 shell 退出，已在原位重启新 shell（id {old_id}→{id}）");
+                self.update_window_title();
+                self.window.request_redraw();
+                // 会话内容变更（id 换绑）：落盘。
+                self.persist_sessions();
+                false
+            }
+            Err(e) => {
+                // 重启失败（系统起不了进程）：退回关闭，避免卡死无响应窗格。
+                error!("单窗格 shell 重启失败: {e:#}，退回关闭窗格");
+                self.close_pane(ti, pi)
+            }
+        }
+    }
+
     /// 新建 tab（单窗格，继承当前 shell 配置）并切换为激活。
     /// 行列数先取焦点窗格网格，下一帧按实际窗格矩形校正。
     fn new_tab(&mut self) {
@@ -2567,17 +2617,25 @@ impl ApplicationHandler<PtyWake> for App {
             ));
         }
 
-        // —— 生命周期：shell 退出关闭对应**窗格**（F5：最后一个窗格
-        // 才关 tab，最后一个 tab 关闭才退出应用）。
+        // —— 生命周期：shell 退出（海风哥 2026-06-13 体验优化）——
+        // 多窗格：关闭退出的那格（F5：剩余窗格继续）；
+        // 单窗格：原位重启一个新 shell，不关应用（单窗口 `exit` 后立即
+        // 换一个干净 PowerShell 继续用，省去重开 app）。
         for sid in exited {
             let Some((ti, pi)) = state.find_pane(sid) else {
                 continue;
             };
-            info!("会话 id={sid} 的 shell 已退出，关闭对应窗格");
-            if state.close_pane(ti, pi) {
-                info!("最后一个会话已关闭，退出应用");
-                event_loop.exit();
-                return;
+            if state.tabs[ti].panes.len() > 1 {
+                info!("会话 id={sid} 的 shell 已退出（多窗格），关闭该窗格");
+                // 多窗格时 close_pane 必返回 false（不会退出应用）。
+                state.close_pane(ti, pi);
+            } else {
+                info!("会话 id={sid} 的 shell 已退出（单窗格），原位重启新 shell");
+                if state.respawn_pane(ti, pi) {
+                    info!("重启失败、最后会话已关闭，退出应用");
+                    event_loop.exit();
+                    return;
+                }
             }
         }
 
