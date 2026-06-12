@@ -303,7 +303,10 @@ fn maximized_overflow(
 /// - `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` 取所在（或最近）显示器。
 /// - `GetMonitorInfoW` 取该显示器的工作区（rcWork，不含任务栏）。
 /// - 二者差值由 [`maximized_overflow`] 纯函数计算（便于单测）。
+// ALLOW: 此函数第十轮引入，第十一轮已确认无需在运行路径中调用（见上方注释），
+// 但保留供将来如需平台相关调试用。单测覆盖靠 maximized_overflow 纯函数。
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn query_maximized_overflow(hwnd: windows_sys::Win32::Foundation::HWND) -> (i32, i32, i32, i32) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
@@ -3050,7 +3053,7 @@ impl ApplicationHandler<PtyWake> for App {
                 }
 
                 // —— egui 帧：跑 UI 布局，产出本帧各窗格矩形 ——
-                let mut raw_input = state.egui_state.take_egui_input(&state.window);
+                let raw_input = state.egui_state.take_egui_input(&state.window);
 
                 // —— 最大化越界修复（第十轮问题1）——
                 // 无边框 + WS_THICKFRAME 最大化时，Windows 将窗口推至约
@@ -3067,37 +3070,26 @@ impl ApplicationHandler<PtyWake> for App {
                 //   snap_layouts 按钮换算：egui rect × ppp + inner_position；
                 //   shrink 后按钮 egui 坐标贴 shrunk max，× ppp + (-8) = 工作区
                 //   右边界，正确（不再超出屏幕）。
-                #[cfg(target_os = "windows")]
-                if state.window.is_maximized() {
-                    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                    if let Ok(handle) = state.window.window_handle() {
-                        if let RawWindowHandle::Win32(wh) = handle.as_raw() {
-                            let hwnd = wh.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-                            let (_ol, _ot, or_, ob) = query_maximized_overflow(hwnd);
-                            if or_ > 0 || ob > 0 {
-                                let ppp = state.egui_ctx.pixels_per_point();
-                                // 取当前 screen_rect（egui_winit 已按 inner_size 设置）
-                                let sr = raw_input.screen_rect.get_or_insert_with(|| {
-                                    let sz = state.window.inner_size();
-                                    egui::Rect::from_min_size(
-                                        egui::Pos2::ZERO,
-                                        egui::vec2(sz.width as f32 / ppp, sz.height as f32 / ppp),
-                                    )
-                                });
-                                // 只 shrink max：去掉右端和底端越界区域（物理 px → 逻辑 pt）。
-                                // min 保持 (0,0)——左/顶端超出屏幕的 ~8px 不影响可见内容；
-                                // 鼠标坐标仍是客户区坐标（原点 (0,0)），坐标系无需平移。
-                                sr.max.x -= or_ as f32 / ppp;
-                                sr.max.y -= ob as f32 / ppp;
-                                log::debug!(
-                                    "最大化越界修复：右/下越界 ({or_},{ob})px，\
-                                     screen_rect shrink 后 = {:?}",
-                                    sr
-                                );
-                            }
-                        }
-                    }
-                }
+                // —— 最大化越界修复（第十一轮根因分析：无需 shrink screen_rect）——
+                //
+                // 第十轮曾尝试：GetWindowRect 检测到 8px overflow → shrink raw_input.screen_rect。
+                // 但第十一轮诊断证明该思路错误，原因：
+                //   1. winit 的 window.inner_size() 调用 GetClientRect（非 GetWindowRect），
+                //      返回的是客户区物理像素（2560px on 2560px monitor），已排除 8px 不可见
+                //      阴影边框。
+                //   2. GetWindowRect 返回的 8px overflow 是系统管理的不可见 THICKFRAME 阴影，
+                //      不在客户区内，不影响内容布局。
+                //   3. shrink screen_rect 反而使 egui 布局比可见区域窄 8px，造成右侧 8px 空白。
+                //
+                // 真正原因（第十一轮定位）：
+                //   footer label "[ 编辑模式 ]" 用 `label_char_count * cw` 估算宽度，
+                //   但 CJK 汉字在等宽终端字体中渲染为 2×cw（全角），导致文字实际宽度约为
+                //   估算值的 1.5×，label_x 偏右，文本溢出纹理右边界被裁剪。
+                //   修复已落 lumen-renderer/src/lib.rs（改用 layout_runs().line_w 实测宽度）。
+                //   statusbar 按钮同样受 CJK 宽度估算影响，修复已落 shell/statusbar.rs。
+                //
+                // 此处不再 shrink screen_rect。query_maximized_overflow / maximized_overflow
+                // 纯函数已有单测保留（算法正确，只是本场景不需要应用它）。
 
                 let entries: Vec<shell::TabItem> = state
                     .tabs

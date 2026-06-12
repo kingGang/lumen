@@ -93,9 +93,13 @@ pub fn show(
         // cwd 区域：占满剩余宽度（留右端按钮宽度 + 右边距）
         // 用 with_layout 左右分段
         let available_w = ui.available_width();
-        // 估算按钮宽度（字符长度 × 7 + 12px 内边距 + 8px 右边距）
-        // 与下方 allocate_exact_size 的 btn_size.x 公式保持一致
-        let btn_w_approx = btn_text.chars().count() as f32 * 7.0 + 12.0 + 8.0;
+        // 按钮文字宽度估算：ASCII 字符约 7px，CJK 全角字符约 12px（11pt 比例字体实测）。
+        // 与下方 allocate_exact_size 的 btn_size.x 公式保持一致。
+        let btn_text_w: f32 = btn_text
+            .chars()
+            .map(|c| if c.is_ascii() { 7.0_f32 } else { 12.0_f32 })
+            .sum();
+        let btn_w_approx = btn_text_w + 12.0 + 8.0;
         let cwd_w = (available_w - btn_w_approx - 8.0).max(10.0);
 
         if let Some(path) = cwd {
@@ -149,7 +153,8 @@ pub fn show(
         let btn_h = 18.0_f32;
         let pad_v = ((ui.available_height() - btn_h) / 2.0).max(0.0);
         ui.add_space(0.0); // flush 布局
-        let btn_size = egui::vec2(btn_text.chars().count() as f32 * 7.0 + 12.0, btn_h);
+                           // 按钮宽度：与上方 btn_w_approx 公式一致（ASCII 7px + CJK 12px，加 12px 内边距）。
+        let btn_size = egui::vec2(btn_text_w + 12.0, btn_h);
 
         // 使用 allocate_exact_size 手工绘制，以获得完整视觉控制
         let (rect, resp) = ui.allocate_exact_size(
