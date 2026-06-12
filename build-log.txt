@@ -1,0 +1,4 @@
+   Compiling lumen-term v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-term)
+   Compiling lumen-renderer v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-renderer)
+   Compiling lumen-app v0.1.0 (F:\ClaudeWorkspaces\Lumen\crates\lumen-app)
+    Finished `release` profile [optimized] target(s) in 17.94s

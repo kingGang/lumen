@@ -10,3 +10,10 @@ bitflags.workspace = true
 log.workspace = true
 unicode-width.workspace = true
 vte.workspace = true
+
+[dev-dependencies]
+# OSC 633 透传实测（tests/osc633_passthrough.rs）：spawn 真实 ConPTY 会话
+# 验证 PTY 输出字节流中 633 序列完整到达，证明 ConPTY 不吞 OSC 633。
+lumen-pty = { workspace = true }
+# 测试辅助：从 PtySession 接收端收集字节（lumen-pty 的公共 channel 类型）。
+crossbeam-channel = { workspace = true }

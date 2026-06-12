@@ -1343,4 +1343,82 @@ mod tests {
         t.advance(b"\x1b[?1049l");
         assert!(t.shell_waiting_input());
     }
+
+    // ── M4 P0 补测 ──────────────────────────────────────────────────────────
+
+    /// 场景①：prompt 态——A 到达后 B 未到，不算等待输入；B 到达后 C 未到，算等待。
+    #[test]
+    fn shell等待输入_场景1_prompt态_a后b前不等待_b后c前等待() {
+        let mut t = term();
+        // A 到：提示符开始渲染，未到输入区——不算等待。
+        t.advance(b"\x1b]133;A\x07PS> ");
+        assert!(
+            !t.shell_waiting_input(),
+            "A 到但 B 未到：不算等待输入（提示符还在渲染）"
+        );
+        // B 到，无 C：shell 等待用户输入——算等待。
+        t.advance(b"\x1b]133;B\x07");
+        assert!(t.shell_waiting_input(), "B 到且 C 未到：应判定为等待输入");
+    }
+
+    /// 场景②：运行态——C 到达后 D 未到，shell 正在执行命令，不等待输入。
+    #[test]
+    fn shell等待输入_场景2_运行态_c后d前不等待() {
+        let mut t = term();
+        t.advance(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+        assert!(t.shell_waiting_input(), "前置条件：B 到时应为等待态");
+        // 用户回车：C 标记到达，命令开始执行。
+        t.advance(b"ls\r\n\x1b]133;C\x07");
+        assert!(!t.shell_waiting_input(), "C 到达（命令执行中）：不等待输入");
+        // 输出进来中仍不等待。
+        t.advance(b"file.txt\r\n");
+        assert!(!t.shell_waiting_input(), "输出期间（D 未到）：不等待输入");
+    }
+
+    /// 场景③：alt screen 态——即便块处于等待状态，alt screen 一律视为忙。
+    #[test]
+    fn shell等待输入_场景3_alt_screen态_一律视为忙() {
+        let mut t = term();
+        // 先建立 prompt 等待态（B 到，C 未到）。
+        t.advance(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+        assert!(t.shell_waiting_input(), "前置：B 到时等待输入");
+        // 进入 alt screen：不管块状态，均不等待输入。
+        t.advance(b"\x1b[?1049h");
+        assert!(
+            !t.shell_waiting_input(),
+            "alt screen 激活时：一律视为忙（全屏程序占用终端）"
+        );
+    }
+
+    /// 场景④：无块（从未见 133）——integration 注入失败或 SSH 裸环境，不可判断。
+    #[test]
+    fn shell等待输入_场景4_无块_从未见133_视为未知() {
+        let mut t = term();
+        // 写入普通文字但无任何 OSC 133 标记。
+        t.advance(b"some output without any 133 marker\r\n");
+        assert!(
+            !t.shell_waiting_input(),
+            "无块（未见 OSC 133）：不可判定为等待输入（Fallback 场景）"
+        );
+    }
+
+    /// 场景⑤：D 闭合后新 prompt 周期——D 之后再来 A+B，应再次判定为等待输入。
+    #[test]
+    fn shell等待输入_场景5_d闭合后新prompt周期再次等待() {
+        let mut t = term();
+        // 第一个完整命令周期。
+        t.advance(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+        assert!(t.shell_waiting_input(), "第一周期 B 到：等待输入");
+        t.advance(b"ls\r\n\x1b]133;C\x07output\r\n\x1b]133;D;0\x07");
+        assert!(
+            !t.shell_waiting_input(),
+            "第一周期 D 到（块已闭合）：不等待输入"
+        );
+        // 新 prompt 周期：下一个 A+B 到达。
+        t.advance(b"\x1b]133;A\x07PS> \x1b]133;B\x07");
+        assert!(
+            t.shell_waiting_input(),
+            "D 闭合后新 prompt 周期（新块 B 到）：应再次判定为等待输入"
+        );
+    }
 }

@@ -4,6 +4,14 @@
 # 注入方式：pwsh -NoExit -Command . <本文件>（在用户 profile 之后执行，
 # 包装而非替换用户已有的 prompt / PSConsoleHostReadLine 定制）。
 
+# M4 输入编辑器前置驯化：
+# - PredictionSource None：ghost text 将由 Lumen 本地提供，禁用 shell 侧预测
+#   避免与输入区渲染冲突（Windows PowerShell 5.1 自带版无此参数，catch 兜底）。
+# - BellStyle None：蜂鸣干扰输入区感知，统一禁用。
+# 每条独立 try/catch——兼容无 PSReadLine 环境及参数不兼容的旧版本。
+try { Set-PSReadLineOption -PredictionSource None -ErrorAction Stop } catch {}
+try { Set-PSReadLineOption -BellStyle None -ErrorAction Stop } catch {}
+
 $Global:__LumenPrompt = $function:prompt
 
 function prompt {

@@ -1564,7 +1564,9 @@ name = "lumen-term"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.0",
+ "crossbeam-channel",
  "log",
+ "lumen-pty",
  "unicode-width",
  "vte",
 ]
