@@ -3,6 +3,9 @@
 
 mod action;
 mod background;
+/// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
+#[cfg(feature = "input-editor")]
+mod completion;
 /// footer 输入区视图组装（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
 #[cfg(feature = "input-editor")]
 mod composer;
@@ -548,6 +551,10 @@ struct AppState {
     /// feature = "input-editor" 门控。
     #[cfg(feature = "input-editor")]
     ghost_cache: (u64, Option<String>),
+    /// 补全弹窗候选列表（M4.4 批1）：Tab 键触发后存入，render 时构造 CompletionView。
+    /// feature = "input-editor" 门控。
+    #[cfg(feature = "input-editor")]
+    completion_candidates: Vec<completion::Completion>,
 
     // ── footer 鼠标状态机（第十一轮，feature = "input-editor"）──────────
     /// footer 区域的鼠标是否正在拖选中（左键按住未松开）。
@@ -1427,6 +1434,7 @@ impl AppState {
         self.terminal_focused = !(self.shell_state.settings.open
             || self.shell_state.login.open
             || self.shell_state.history_search.open
+            || self.shell_state.completion.open
             || self.shell_state.renaming.is_some()
             || self.shell_state.filetree.dialog_open());
         self.update_window_title();
@@ -2250,6 +2258,8 @@ impl App {
             #[cfg(feature = "input-editor")]
             ghost_cache: (0, None),
             #[cfg(feature = "input-editor")]
+            completion_candidates: Vec::new(),
+            #[cfg(feature = "input-editor")]
             footer_dragging: false,
             #[cfg(feature = "input-editor")]
             footer_drag_anchor: lumen_editor::Position::default(),
@@ -2885,7 +2895,8 @@ impl ApplicationHandler<PtyWake> for App {
                     is_alt_screen: state.tabs[ti].panes[pi].term.is_alt_screen(),
                     overlay_open: state.shell_state.settings.open
                         || state.shell_state.login.open
-                        || state.shell_state.history_search.open,
+                        || state.shell_state.history_search.open
+                        || state.shell_state.completion.open,
                     renaming: state.shell_state.renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
                     terminal_focused: state.terminal_focused,
@@ -3061,12 +3072,50 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::ComposeTab) => {
-                        // Compose 态 Tab：M3.4 补全占位，显示提示状态条。
-                        let s = i18n::strings();
-                        state
-                            .shell_state
-                            .toast
-                            .push(shell::toast::ToastKind::Info, s.toast_compose_tab_hint);
+                        // Compose 态 Tab：M4.4 批1 文件路径补全。
+                        #[cfg(feature = "input-editor")]
+                        {
+                            let ti = state.active_tab;
+                            let pi = state.tabs[ti].focused;
+                            // 取当前行文本与光标字节偏移。
+                            let (line_text, cursor_byte) = {
+                                let view = state.tabs[ti].panes[pi].editor.view();
+                                let cur = view.cursor();
+                                let line = view.line(cur.line).to_owned();
+                                (line, cur.byte)
+                            };
+                            let cwd = state.tabs[ti].panes[pi]
+                                .term
+                                .cwd()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| std::path::PathBuf::from("."));
+                            let (_, token) = completion::current_token(&line_text, cursor_byte);
+                            let candidates = completion::complete_path(token, &cwd);
+                            if candidates.is_empty() {
+                                // 无候选时保留旧占位提示（静默或 toast）。
+                                let s = i18n::strings();
+                                state
+                                    .shell_state
+                                    .toast
+                                    .push(shell::toast::ToastKind::Info, s.toast_compose_tab_hint);
+                            } else {
+                                state.completion_candidates = candidates;
+                                let comp = &mut state.shell_state.completion;
+                                comp.open = true;
+                                comp.selected = 0;
+                                state.terminal_focused = false;
+                                state.window.request_redraw();
+                            }
+                        }
+                        // 无 input-editor feature 时沿用占位提示。
+                        #[cfg(not(feature = "input-editor"))]
+                        {
+                            let s = i18n::strings();
+                            state
+                                .shell_state
+                                .toast
+                                .push(shell::toast::ToastKind::Info, s.toast_compose_tab_hint);
+                        }
                     }
 
                     Some(keymap::LookupResult::ComposeHistorySearch) => {
@@ -3703,6 +3752,45 @@ impl ApplicationHandler<PtyWake> for App {
                     } else {
                         Vec::new()
                     };
+                // 补全弹窗候选视图（M4.4 批1）：仅 input-editor feature 下，
+                // completion.open 时构造 CompletionView 传入 shell；否则传 None。
+                #[cfg(feature = "input-editor")]
+                let completion_candidate_rows: Vec<
+                    shell::completion_ui::CandidateRow,
+                > = if state.shell_state.completion.open {
+                    state
+                        .completion_candidates
+                        .iter()
+                        .map(|c| shell::completion_ui::CandidateRow {
+                            display: c.display.clone(),
+                            is_dir: c.is_dir,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                // 锚点：footer 上方合理位置（底部 = 窗口高 - statusbar - footer 估算高度）。
+                // 取 egui 逻辑坐标：statusbar 高度 + 一行 footer 高度约 40px 之上。
+                // 首版不要求精确跟随光标列，x 取终端区左缘附近固定值即可。
+                #[cfg(feature = "input-editor")]
+                let completion_view_owned: Option<
+                    shell::completion_ui::CompletionView<'_>,
+                > = if state.shell_state.completion.open && !completion_candidate_rows.is_empty() {
+                    let scale = state.egui_ctx.pixels_per_point();
+                    let win_h = state.window.inner_size().height as f32 / scale;
+                    // statusbar 高度 + footer 约 1 行高度（cell_h 估约 20px）
+                    let anchor_y = win_h
+                            - shell::statusbar::HEIGHT
+                            - 20.0  // footer 单行高度估算
+                            - 4.0; // 小间距
+                    let anchor_x = state.settings.layout.sidebar_width + 12.0;
+                    Some(shell::completion_ui::CompletionView {
+                        candidates: &completion_candidate_rows,
+                        anchor: egui::pos2(anchor_x, anchor_y),
+                    })
+                } else {
+                    None
+                };
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -3722,6 +3810,10 @@ impl ApplicationHandler<PtyWake> for App {
                     #[cfg(feature = "input-editor")]
                     force_fallback: state.force_fallback,
                     history_rows: &history_rows_owned,
+                    #[cfg(feature = "input-editor")]
+                    completion_view: completion_view_owned,
+                    #[cfg(not(feature = "input-editor"))]
+                    completion_view: None,
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
@@ -3855,6 +3947,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
+                    && !state.shell_state.completion.open
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
                     state.terminal_focused = true;
@@ -4088,6 +4181,59 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 // 面板打开期间键盘恒归 egui（终端不收键盘）。
                 if state.shell_state.history_search.open {
+                    state.terminal_focused = false;
+                }
+
+                // —— 补全弹窗（M4.4 批1）输出处理 ——
+                // completion_accept：用选定候选的 replacement 替换当前 token。
+                #[cfg(feature = "input-editor")]
+                if let Some(idx) = shell_out.completion_accept {
+                    if let Some(cand) = state.completion_candidates.get(idx) {
+                        let replacement = cand.replacement.clone();
+                        let ti = state.active_tab;
+                        let pi = state.tabs[ti].focused;
+                        // 重新计算 token 区间（接受时再算一次，保证与编辑器当前状态一致）。
+                        let (token_start, cursor_byte) = {
+                            let view = state.tabs[ti].panes[pi].editor.view();
+                            let cur = view.cursor();
+                            let line = view.line(cur.line).to_owned();
+                            let (start, _) = completion::current_token(&line, cur.byte);
+                            (start, cur.byte)
+                        };
+                        let token_start_pos = lumen_editor::Position {
+                            line: state.tabs[ti].panes[pi].editor.view().cursor().line,
+                            byte: token_start,
+                        };
+                        let cursor_pos = lumen_editor::Position {
+                            line: state.tabs[ti].panes[pi].editor.view().cursor().line,
+                            byte: cursor_byte,
+                        };
+                        // 选中 token 区间，然后 InsertText 替换。
+                        state.tabs[ti].panes[pi].editor.apply(
+                            &lumen_editor::EditAction::SetSelection(lumen_editor::Selection {
+                                anchor: token_start_pos,
+                                cursor: cursor_pos,
+                            }),
+                        );
+                        state.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::InsertText(replacement));
+                        state.shell_state.completion.open = false;
+                        state.completion_candidates.clear();
+                        state.terminal_focused = true;
+                        state.window.request_redraw();
+                    }
+                }
+                // completion_closed：关闭弹窗，焦点还给终端。
+                if shell_out.completion_closed {
+                    state.shell_state.completion.open = false;
+                    state.completion_candidates.clear();
+                    state.terminal_focused = true;
+                    state.window.request_redraw();
+                }
+                // 弹窗打开期间键盘归 egui（终端不收键盘）。
+                #[cfg(feature = "input-editor")]
+                if state.shell_state.completion.open {
                     state.terminal_focused = false;
                 }
 

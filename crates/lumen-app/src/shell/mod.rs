@@ -8,6 +8,7 @@
 //! 菜单）与登录覆盖层（mock）。UI 只产出动作（[`ShellOutput`]），
 //! 会话增删切换/PTY 写入/设置即时生效/登录写盘由 main.rs 执行。
 
+pub mod completion_ui;
 pub mod filetree;
 pub mod history_search_ui;
 pub mod layout;
@@ -59,6 +60,8 @@ pub struct ShellState {
     pub login: login_ui::LoginUiState,
     /// 历史搜索面板（M4.3 Ctrl+R；开关/query/selected 等跨帧状态）。
     pub history_search: history_search_ui::HistorySearchUiState,
+    /// 文件路径补全弹窗（M4.4 批1 Tab；open/selected 跨帧状态）。
+    pub completion: completion_ui::CompletionUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
 }
@@ -123,6 +126,9 @@ pub struct ShellInput<'a> {
     pub force_fallback: bool,
     /// 历史搜索面板本帧展示的行（由 main 在 render 前计算；面板关闭时传空切片）。
     pub history_rows: &'a [history_search_ui::HistoryRow],
+    /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
+    /// 候选列表由 main 在 render 前计算好。
+    pub completion_view: Option<completion_ui::CompletionView<'a>>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -259,6 +265,10 @@ pub struct ShellOutput {
     pub history_closed: bool,
     /// 历史搜索面板：query 本帧发生变化（main 应 request_redraw 以便下帧重算结果）。
     pub history_query_changed: bool,
+    /// 补全弹窗（M4.4 批1）：用户接受的候选下标（应替换 token 并关闭弹窗）。
+    pub completion_accept: Option<usize>,
+    /// 补全弹窗（M4.4 批1）：本帧请求关闭（Esc）。
+    pub completion_closed: bool,
 }
 
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
@@ -325,6 +335,8 @@ pub fn show(
         history_accept: None,
         history_closed: false,
         history_query_changed: false,
+        completion_accept: None,
+        completion_closed: false,
     };
     // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
     // 派生（每帧少量色彩数学，开销可忽略）。
@@ -1130,6 +1142,18 @@ pub fn show(
         if l_out.closed {
             st.login.open = false;
             out.login_closed = true;
+        }
+    }
+
+    // —— 补全弹窗（M4.4 批1 Tab；锚定小浮层，盖在设置/登录之上，toast 之下）——
+    // completion_view 由 main 每帧传入；Some = 显示弹窗，None = 不显示。
+    if let Some(cv) = &input.completion_view {
+        let c_out = completion_ui::show(root.ctx(), &mut st.completion, cv, pal);
+        if let Some(idx) = c_out.accept {
+            out.completion_accept = Some(idx);
+        }
+        if c_out.closed {
+            out.completion_closed = true;
         }
     }
 
