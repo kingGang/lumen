@@ -691,55 +691,55 @@ pub fn show(
                 };
                 ui.painter().rect_filled(title_rect, 0.0, bar_bg);
 
-                // ✕ 常驻标题栏右端（F7①：从悬停浮现迁入标题栏；单窗格
-                // 关闭 = 关整个 tab，与 Ctrl+Shift+W 同语义）。✕ 用画线
-                // 而非字形（不赌字体覆盖）；raw 鼠标路由对该矩形让位见
-                // main.rs（pane_close_rects_px）。
-                let close_rect = egui::Rect::from_center_size(
-                    egui::pos2(
-                        title_rect.max.x - 4.0 - PANE_CLOSE_SIZE / 2.0,
-                        title_rect.center().y,
-                    ),
-                    egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
-                );
-                let cresp = ui.interact(
-                    close_rect,
-                    ui.id().with(("pane_close", i)),
-                    egui::Sense::click(),
-                );
-                {
-                    let painter = ui.painter();
-                    let c = close_rect.center();
-                    if cresp.hovered() {
-                        painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
-                    }
-                    let r = 3.5;
-                    let stroke =
-                        egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
-                    painter.line_segment(
-                        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
-                        stroke,
-                    );
-                    painter.line_segment(
-                        [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
-                        stroke,
-                    );
-                }
-                if cresp
-                    .on_hover_text(crate::i18n::strings().pane_close_tip)
-                    .clicked()
-                {
-                    out.pane_close = Some(i);
-                }
-                out.pane_close_rects.push(close_rect);
-
-                // —— 最大化/还原按钮（P14）：✕ 左侧，仅多窗格时显示
-                // （单窗格本就满屏，无最大化语义）。普通态画 ▢（最大
-                // 化），最大化态画 ⧉（双矩形，还原）；painter 画线与
-                // ✕ 同款风格，不赌字体覆盖。命中矩形进 pane_close_rects
-                // 让 raw 鼠标路由让位（同 ✕：点击不聚焦/不建选区）。
-                let mut title_end = close_rect.min.x - 4.0;
+                // —— 标题栏右侧按钮区：仅多窗格显示（✕ 关闭 + 最大化/还原）。
+                // 单窗格无需关闭（关闭 = 关整个 tab，走 Ctrl+Shift+W）、也无
+                // 最大化语义，整个按钮区省去、标题占满到右端（海风哥
+                // 2026-06-13，推翻 F7① 单窗格也显示 ✕ 的旧裁决）。✕ 与最大化
+                // 均画线（不赌字体覆盖）；命中矩形进 pane_close_rects 让 raw
+                // 鼠标路由让位（点击不聚焦/不建选区）。
+                let mut title_end = title_rect.max.x - 8.0;
                 if input.panes.len() > 1 {
+                    // ✕ 关闭按钮（标题栏右端）。
+                    let close_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            title_rect.max.x - 4.0 - PANE_CLOSE_SIZE / 2.0,
+                            title_rect.center().y,
+                        ),
+                        egui::vec2(PANE_CLOSE_SIZE, PANE_CLOSE_SIZE),
+                    );
+                    let cresp = ui.interact(
+                        close_rect,
+                        ui.id().with(("pane_close", i)),
+                        egui::Sense::click(),
+                    );
+                    {
+                        let painter = ui.painter();
+                        let c = close_rect.center();
+                        if cresp.hovered() {
+                            painter.circle_filled(c, PANE_CLOSE_SIZE / 2.0, pal.bg_highlight);
+                        }
+                        let r = 3.5;
+                        let stroke =
+                            egui::Stroke::new(1.2, if cresp.hovered() { pal.fg } else { bar_fg });
+                        painter.line_segment(
+                            [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                            stroke,
+                        );
+                        painter.line_segment(
+                            [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                            stroke,
+                        );
+                    }
+                    if cresp
+                        .on_hover_text(crate::i18n::strings().pane_close_tip)
+                        .clicked()
+                    {
+                        out.pane_close = Some(i);
+                    }
+                    out.pane_close_rects.push(close_rect);
+
+                    // 最大化/还原按钮（P14）：✕ 左侧。普通态画 ▢（最大化），
+                    // 最大化态画 ⧉（双矩形错位，还原）。
                     let max_rect = egui::Rect::from_center_size(
                         egui::pos2(
                             close_rect.min.x - 4.0 - PANE_CLOSE_SIZE / 2.0,
