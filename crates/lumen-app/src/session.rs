@@ -406,25 +406,122 @@ impl Session {
     }
 }
 
-/// 把 shell integration 脚本写到临时目录，返回注入用的启动参数。
-/// 写入失败时返回空参数（shell 照常可用，只是没有命令块标记）。
+/// 生成 shell 启动参数，把集成脚本（OSC 133 命令边界 + OSC 9;9 cwd 上报）
+/// **内联注入** shell——不落地任何文件。
+///
+/// 仅 Windows PowerShell（pwsh/powershell）走此路径；其它 shell 暂返回空参数
+/// （shell 照常可用，只是无命令块/cwd 上报，自然降级 Fallback）。
+///
+/// 用 `-EncodedCommand`（base64 的 UTF-16LE）取代旧的「写 .ps1 到 Temp + dot-source」，
+/// 一举根治三类分发故障（海风哥 2026-06-13 拷贝到他机实测）：
+/// 1. **不落地文件**——换机 / 只拷 exe / 受限环境都不再「找不到文件」；
+/// 2. **不读 .ps1 文件**——ExecutionPolicy / 组策略只管文件加载、管不到内联命令，
+///    企业锁策略的机器也能注入；
+/// 3. **base64 精确传字节**——规避脚本（含中文注释）被读取端系统 ANSI 代码页解码
+///    致乱码、解析报 `UnexpectedToken`（本机中文系统 + UTF-8 pwsh 正常，拷到西文 /
+///    Windows PowerShell 5.1 机器即触发的真凶）。
 fn shell_integration_args() -> Vec<String> {
+    if !cfg!(windows) {
+        // TODO（跨平台）：unix bash/zsh 走各自内联注入（--rcfile /dev/stdin、
+        // PROMPT_COMMAND、ZDOTDIR 等）；此处先不注入、干净降级。
+        return Vec::new();
+    }
     let script = include_str!("../assets/integration.ps1");
-    let path = std::env::temp_dir().join("lumen_integration.ps1");
-    match std::fs::write(&path, script) {
-        Ok(()) => vec![
-            "-NoLogo".into(),
-            // 进程级放行：Windows PowerShell 5.1 默认 Restricted 策略
-            // 会拒绝加载任何 .ps1，注入会在终端顶部报红错。
-            "-ExecutionPolicy".into(),
-            "Bypass".into(),
-            "-NoExit".into(),
-            "-Command".into(),
-            format!(". '{}'", path.display()),
-        ],
-        Err(e) => {
-            error!("写出 shell integration 脚本失败: {e}");
-            Vec::new()
-        }
+    // PowerShell `-EncodedCommand` 约定：base64( UTF-16LE 编码的命令文本 )。
+    let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    vec![
+        "-NoLogo".into(),
+        "-NoExit".into(),
+        "-EncodedCommand".into(),
+        base64_encode(&utf16le),
+    ]
+}
+
+/// 标准 base64 编码（RFC 4648，带 `=` padding，无换行）。
+///
+/// 自实现、零依赖：仅 [`shell_integration_args`] 注入 `-EncodedCommand` 用，
+/// 只需编码方向。字母表 `A-Za-z0-9+/`，PowerShell `-EncodedCommand` 接受此标准变体。
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_编码_rfc4648_标准向量() {
+        // RFC 4648 §10 测试向量。
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_编码_含高位字节与padding() {
+        // +/= 边界字符与单/双 padding 覆盖。
+        assert_eq!(base64_encode(&[0xFB, 0xFF, 0xBF]), "+/+/");
+        assert_eq!(base64_encode(&[0xFF]), "/w==");
+        assert_eq!(base64_encode(&[0xFF, 0xFF]), "//8=");
+    }
+
+    #[test]
+    fn base64_编码_往返_utf16le_中文不丢() {
+        // 中文经 UTF-16LE→base64 应保留全部字节（长度=字符数×2，4 字节一组对齐）。
+        let s = "命令块 OSC133";
+        let utf16le: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let enc = base64_encode(&utf16le);
+        // 解码字符集合法 + 长度符合 base64( n 字节 ) = ceil(n/3)*4。
+        assert_eq!(enc.len(), utf16le.len().div_ceil(3) * 4);
+        assert!(enc
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell集成_走encoded_command不落地文件() {
+        let args = shell_integration_args();
+        assert!(
+            args.iter().any(|a| a == "-EncodedCommand"),
+            "Windows 下应走 -EncodedCommand 内联注入"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains(".ps1")),
+            "不应再落地或引用任何 .ps1 文件"
+        );
+        assert!(args.iter().any(|a| a == "-NoExit"));
+        let encoded = args.last().expect("应有 base64 参数");
+        assert!(!encoded.is_empty(), "脚本 base64 不应为空");
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')),
+            "base64 应只含标准字母表"
+        );
     }
 }
