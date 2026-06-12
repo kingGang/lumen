@@ -7,7 +7,14 @@
 //! # 内容（左→右）
 //! - 左：输入模式指示（颜色语义：Fallback 用警示微黄）
 //! - 中：焦点窗格 cwd（截断显示，hover 全路径）
-//! - 右：经典直通切换按钮（hover tooltip，点击=ToggleFallback 同路径）
+//! - 右：经典直通切换按钮（真按钮样式，hover tooltip，点击=ToggleFallback 同路径）
+//!
+//! # 经典模式按钮视觉规格（第十轮问题2）
+//! - 圆角矩形，圆角 4px（rounding = 4.0）
+//! - 1px `panel_outline` 描边，无填充（关闭态）
+//! - 悬停态：`bg_highlight` 填充（与其他控件 hover 一致）
+//! - 开启态（force_fallback=true）：`accent` 填充 + `accent_fg` 文字（白底黑字醒目 CTA）
+//! - 文字字号 11，垂直居中，按钮高度约 18px（24px 状态栏垂直居中）
 //!
 //! # 设计原则
 //! - 状态栏高度常驻（不影响 footer 的 resize 链，两者独立）
@@ -86,8 +93,9 @@ pub fn show(
         // cwd 区域：占满剩余宽度（留右端按钮宽度 + 右边距）
         // 用 with_layout 左右分段
         let available_w = ui.available_width();
-        // 估算按钮宽度（字符长度 × 7 + 边距）
-        let btn_w_approx = btn_text.chars().count() as f32 * 7.0 + 20.0;
+        // 估算按钮宽度（字符长度 × 7 + 12px 内边距 + 8px 右边距）
+        // 与下方 allocate_exact_size 的 btn_size.x 公式保持一致
+        let btn_w_approx = btn_text.chars().count() as f32 * 7.0 + 12.0 + 8.0;
         let cwd_w = (available_w - btn_w_approx - 8.0).max(10.0);
 
         if let Some(path) = cwd {
@@ -121,22 +129,86 @@ pub fn show(
             );
         }
 
-        // ── 右：经典直通切换按钮 ───────────────────────────────────
-        // 按钮颜色：开态用警示微黄（force_fallback = true）
-        let btn_color = if force_fallback {
-            // 警示微黄（Fallback 开启提示）
-            egui::Color32::from_rgb(220, 180, 60)
+        // ── 右：经典直通切换按钮（真按钮样式，第十轮问题2）──────────
+        // 开启态（force_fallback=true）：accent 白底 + accent_fg 黑字（醒目 CTA）。
+        // 关闭态：线框灰字（panel_outline 1px 描边 + fg_dim 文字，低调）。
+        // 悬停：bg_highlight 填充（统一 hover 档）。
+        // 圆角 4px，高度约 18px（24px 状态栏垂直居中）。
+        let btn_fill = if force_fallback {
+            pal.accent
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let btn_text_color = if force_fallback {
+            pal.accent_fg
         } else {
             pal.fg_dim
         };
-        let btn = egui::Button::new(egui::RichText::new(btn_text).size(11.0).color(btn_color))
-            .frame(false)
-            .min_size(egui::vec2(0.0, ui.available_height()));
 
-        let resp = ui.add(btn).on_hover_text(s.statusbar_classic_tip);
+        // 按钮内边距（水平 6px，垂直 1px），使整体高约 18px
+        let btn_h = 18.0_f32;
+        let pad_v = ((ui.available_height() - btn_h) / 2.0).max(0.0);
+        ui.add_space(0.0); // flush 布局
+        let btn_size = egui::vec2(btn_text.chars().count() as f32 * 7.0 + 12.0, btn_h);
+
+        // 使用 allocate_exact_size 手工绘制，以获得完整视觉控制
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(btn_size.x, ui.available_height()),
+            egui::Sense::click(),
+        );
+        let resp = resp.on_hover_text(s.statusbar_classic_tip);
+
+        // 垂直居中的按钮矩形
+        let btn_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, rect.center().y - btn_h / 2.0),
+            egui::vec2(rect.width(), btn_h),
+        );
+
+        if ui.is_rect_visible(btn_rect) {
+            let painter = ui.painter();
+            let rounding = egui::CornerRadius::same(4);
+
+            // 背景填充（悬停 or 开启态）
+            let fill = if force_fallback {
+                btn_fill
+            } else if resp.hovered() {
+                pal.bg_highlight
+            } else {
+                egui::Color32::TRANSPARENT
+            };
+            if fill != egui::Color32::TRANSPARENT {
+                painter.rect_filled(btn_rect, rounding, fill);
+            }
+
+            // 1px 描边（关闭态始终显示；开启态白底自带视觉边界，但仍留描边保持形状）
+            let stroke_color = if force_fallback {
+                // 开启态：accent 描边（白底）
+                pal.accent
+            } else {
+                pal.panel_outline
+            };
+            painter.rect_stroke(
+                btn_rect,
+                rounding,
+                egui::Stroke::new(1.0, stroke_color),
+                egui::StrokeKind::Inside,
+            );
+
+            // 文字居中
+            painter.text(
+                btn_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                btn_text,
+                egui::FontId::proportional(11.0),
+                btn_text_color,
+            );
+        }
+
         if resp.clicked() {
             out.toggle_fallback = true;
         }
+
+        let _ = pad_v; // 已由 allocate_exact_size 覆盖居中逻辑
 
         ui.add_space(8.0);
     });

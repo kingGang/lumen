@@ -257,6 +257,95 @@ fn width_worth_persisting(actual: f32, stored: f32, min: f32, max: f32) -> bool 
     (min - 1.0..=max + 1.0).contains(&actual) && (actual - stored).abs() >= 1.0
 }
 
+/// 最大化时窗口四边超出工作区的物理像素越界量（纯函数，单测友好）。
+///
+/// # 机理（M3.8 / 第十轮问题1）
+///
+/// Windows 无边框窗口（`WS_THICKFRAME` + `WM_NCCALCSIZE` 铺满客户区）
+/// 最大化时，系统把窗口 outer rect 向四周各扩约 8px，使粗边框恰好
+/// 隐藏在屏幕外——这是 VSCode/Chromium 等无边框应用的标准行为，
+/// 俗称「隐形边框」。egui 按完整 `inner_size` 布局，四边各 ~8px 画在
+/// 屏幕外，右/下贴边内容被裁。
+///
+/// 本函数比较窗口矩形与显示器工作区矩形，计算各边超出量（物理像素）：
+/// - `left`  = `work.left  - win.left`（win 比 work 更偏左时为正）
+/// - `top`   = `work.top   - win.top`
+/// - `right` = `win.right  - work.right`（win 右端超出 work 时为正）
+/// - `bottom`= `win.bottom - work.bottom`
+///
+/// 非最大化时窗口在工作区内，各边差值 ≤ 0，函数返回全零（0,0,0,0）。
+/// 跨显示器负坐标（副显示器在主屏左侧）由 i32 算术自然处理。
+///
+/// # 参数
+/// - `win`  : `(left, top, right, bottom)` 窗口 outer rect 物理像素（屏幕坐标）。
+/// - `work` : `(left, top, right, bottom)` 显示器工作区物理像素（屏幕坐标）。
+///
+/// # 返回
+/// `(left, top, right, bottom)` 各边越界量（物理像素，最小 0）。
+fn maximized_overflow(
+    win: (i32, i32, i32, i32),
+    work: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let left = (work.0 - win.0).max(0);
+    let top = (work.1 - win.1).max(0);
+    let right = (win.2 - work.2).max(0);
+    let bottom = (win.3 - work.3).max(0);
+    (left, top, right, bottom)
+}
+
+/// 查询当前窗口相对所在显示器工作区的四边越界量（物理像素）。
+///
+/// 仅在 Windows + 最大化时实际调用；非最大化时直接返回 `(0,0,0,0)`
+/// 以避免不必要的 Win32 调用。失败时静默返回 `(0,0,0,0)`（退化安全）。
+///
+/// # 实现说明
+/// - `GetWindowRect` 取窗口 outer rect（含不可见 THICKFRAME 部分）。
+/// - `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` 取所在（或最近）显示器。
+/// - `GetMonitorInfoW` 取该显示器的工作区（rcWork，不含任务栏）。
+/// - 二者差值由 [`maximized_overflow`] 纯函数计算（便于单测）。
+#[cfg(target_os = "windows")]
+fn query_maximized_overflow(hwnd: windows_sys::Win32::Foundation::HWND) -> (i32, i32, i32, i32) {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    // SAFETY: hwnd 由 winit 创建并由调用方保证在消息循环期间有效；
+    // 两个 RECT 均以 zeroed 初始化，API 成功时完整填写，失败时
+    // 我们检查返回值并返回 (0,0,0,0)，不读取未初始化内存。
+    unsafe {
+        let mut win_rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut win_rect) == 0 {
+            return (0, 0, 0, 0);
+        }
+
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_null() {
+            return (0, 0, 0, 0);
+        }
+
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: std::mem::zeroed(),
+            rcWork: std::mem::zeroed(),
+            dwFlags: 0,
+        };
+        if GetMonitorInfoW(hmon, &mut mi) == 0 {
+            return (0, 0, 0, 0);
+        }
+
+        let win = (win_rect.left, win_rect.top, win_rect.right, win_rect.bottom);
+        let work = (
+            mi.rcWork.left,
+            mi.rcWork.top,
+            mi.rcWork.right,
+            mi.rcWork.bottom,
+        );
+        maximized_overflow(win, work)
+    }
+}
+
 /// 恢复路径各窗格的初始内容区估算（B2 修复，抽成纯函数加单测）。
 ///
 /// spawn 发生在首帧 egui 布局之前，旧实现给所有窗格统一按**整个
@@ -2961,7 +3050,55 @@ impl ApplicationHandler<PtyWake> for App {
                 }
 
                 // —— egui 帧：跑 UI 布局，产出本帧各窗格矩形 ——
-                let raw_input = state.egui_state.take_egui_input(&state.window);
+                let mut raw_input = state.egui_state.take_egui_input(&state.window);
+
+                // —— 最大化越界修复（第十轮问题1）——
+                // 无边框 + WS_THICKFRAME 最大化时，Windows 将窗口推至约
+                // (-8,-8)，尺寸比工作区大 ~16px（隐藏不可见粗边框）。egui
+                // 按完整 inner_size 布局，右/下贴边内容画在屏幕外被裁剪。
+                //
+                // 修复：用 MonitorFromWindow + GetMonitorInfoW 实算四边越界量，
+                // shrink raw_input.screen_rect.max（只改 max，保持 min=(0,0)），
+                // 使 egui 内容区等于实际可见区域。
+                //
+                // 坐标链路验证：
+                //   鼠标事件坐标 = 客户区坐标（原点 (0,0)），screen_rect.min
+                //   仍为 (0,0)，两者坐标系一致，无需平移。
+                //   snap_layouts 按钮换算：egui rect × ppp + inner_position；
+                //   shrink 后按钮 egui 坐标贴 shrunk max，× ppp + (-8) = 工作区
+                //   右边界，正确（不再超出屏幕）。
+                #[cfg(target_os = "windows")]
+                if state.window.is_maximized() {
+                    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                    if let Ok(handle) = state.window.window_handle() {
+                        if let RawWindowHandle::Win32(wh) = handle.as_raw() {
+                            let hwnd = wh.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+                            let (_ol, _ot, or_, ob) = query_maximized_overflow(hwnd);
+                            if or_ > 0 || ob > 0 {
+                                let ppp = state.egui_ctx.pixels_per_point();
+                                // 取当前 screen_rect（egui_winit 已按 inner_size 设置）
+                                let sr = raw_input.screen_rect.get_or_insert_with(|| {
+                                    let sz = state.window.inner_size();
+                                    egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(sz.width as f32 / ppp, sz.height as f32 / ppp),
+                                    )
+                                });
+                                // 只 shrink max：去掉右端和底端越界区域（物理 px → 逻辑 pt）。
+                                // min 保持 (0,0)——左/顶端超出屏幕的 ~8px 不影响可见内容；
+                                // 鼠标坐标仍是客户区坐标（原点 (0,0)），坐标系无需平移。
+                                sr.max.x -= or_ as f32 / ppp;
+                                sr.max.y -= ob as f32 / ppp;
+                                log::debug!(
+                                    "最大化越界修复：右/下越界 ({or_},{ob})px，\
+                                     screen_rect shrink 后 = {:?}",
+                                    sr
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let entries: Vec<shell::TabItem> = state
                     .tabs
                     .iter()
@@ -4059,7 +4196,10 @@ impl ApplicationHandler<PtyWake> for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_order, estimate_restored_pane_px, width_worth_persisting, PaneLayout};
+    use super::{
+        drain_order, estimate_restored_pane_px, maximized_overflow, width_worth_persisting,
+        PaneLayout,
+    };
 
     /// 估算测试区域：与 layout.rs 测试同款 304x202（宽对 3 列、高对
     /// 2 排整除：上3下2 时上排格 100x100、下排格 151x100）。
@@ -4146,6 +4286,55 @@ mod tests {
         // NaN/Inf 防御：不写。
         assert!(!width_worth_persisting(f32::NAN, 180.0, 140.0, 320.0));
         assert!(!width_worth_persisting(f32::INFINITY, 180.0, 140.0, 320.0));
+    }
+
+    // ── 第十轮问题1：最大化越界纯函数测试 ──────────────────────────────
+
+    #[test]
+    fn 最大化越界_标准8px() {
+        // 2560×1440 屏幕（工作区），窗口 rect (-8,-8)~(2568,1400)
+        // 实测典型值：四边各 8px 越界
+        let win = (-8, -8, 2568, 1400);
+        let work = (0, 0, 2560, 1440);
+        let (l, t, r, b) = maximized_overflow(win, work);
+        assert_eq!(l, 8, "左越界应为 8px");
+        assert_eq!(t, 8, "顶越界应为 8px");
+        assert_eq!(r, 8, "右越界应为 8px");
+        assert_eq!(b, 0, "底未越界应为 0（工作区底在任务栏上方）");
+    }
+
+    #[test]
+    fn 最大化越界_非最大化时全零() {
+        // 正常非最大化窗口在工作区内：所有越界量为 0
+        let win = (100, 100, 1100, 740);
+        let work = (0, 0, 2560, 1440);
+        let (l, t, r, b) = maximized_overflow(win, work);
+        assert_eq!((l, t, r, b), (0, 0, 0, 0), "非最大化时无越界");
+    }
+
+    #[test]
+    fn 最大化越界_跨显示器负坐标() {
+        // 副显示器在主屏左侧（工作区 x=-1920..0，y=0..1080）
+        // 最大化时窗口 rect (-1928,-8)~(8,1072)
+        let win = (-1928, -8, 8, 1072);
+        let work = (-1920, 0, 0, 1080);
+        let (l, t, r, b) = maximized_overflow(win, work);
+        assert_eq!(l, 8, "副显示器左越界应为 8px");
+        assert_eq!(t, 8, "副显示器顶越界应为 8px");
+        assert_eq!(r, 8, "副显示器右越界应为 8px");
+        assert_eq!(b, 0, "副显示器底未越界");
+    }
+
+    #[test]
+    fn 最大化越界_底部也有越界() {
+        // 部分配置下底部也越界（任务栏很高时）
+        let win = (-8, -8, 2568, 1448);
+        let work = (0, 0, 2560, 1400);
+        let (l, t, r, b) = maximized_overflow(win, work);
+        assert_eq!(l, 8);
+        assert_eq!(t, 8);
+        assert_eq!(r, 8);
+        assert_eq!(b, 48, "底部越界量应正确计算");
     }
 
     // ── M4.1 批D1：提交编码纯函数测试（设计稿 §3.2 步骤 2）─────────

@@ -61,8 +61,11 @@ windows-sys = { version = "0.61", features = [
     # 最大化按钮区域时返回 HTMAXBUTTON，触发 Win11 Snap 弹出。
     "Win32_UI_Shell",
     # WM_NCHITTEST / HTMAXBUTTON / WM_NCLBUTTONDOWN 等消息常量，
-    # 以及 ShowWindow / SW_RESTORE / SW_MAXIMIZE。
+    # 以及 ShowWindow / SW_RESTORE / SW_MAXIMIZE / GetWindowRect。
     "Win32_UI_WindowsAndMessaging",
+    # 最大化越界修复（第十轮问题1）：MonitorFromWindow / GetMonitorInfoW /
+    # MONITORINFO / HMONITOR，用于计算最大化时窗口超出工作区的越界量。
+    "Win32_Graphics_Gdi",
 ] }
 
 # 背景图片解码（P13）：纯 CPU 解码、不依赖系统图形库，支持 png/jpeg/webp/bmp。
