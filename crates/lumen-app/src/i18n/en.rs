@@ -154,6 +154,10 @@ pub static STRINGS: Strings = Strings {
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",
+    // M4.3 History search panel
+    history_search_placeholder: "Search history…",
+    history_search_empty: "No matching history",
+    history_search_hint: "↑↓ select · Enter fill · Esc close",
     // File name validation
     validate_name_empty: "Name cannot be empty",
     validate_name_illegal: "Name is not allowed",

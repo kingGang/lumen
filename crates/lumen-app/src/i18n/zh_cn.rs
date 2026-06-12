@@ -152,6 +152,10 @@ pub static STRINGS: Strings = Strings {
     // 登录校验
     login_err_invalid_email: "邮箱格式不正确（需形如 name@example.com）",
     login_err_empty_password: "请输入密码",
+    // M4.3 历史搜索面板
+    history_search_placeholder: "搜索历史命令…",
+    history_search_empty: "没有匹配的历史命令",
+    history_search_hint: "↑↓ 选择 · Enter 填入 · Esc 关闭",
     // 文件名校验
     validate_name_empty: "名称不能为空",
     validate_name_illegal: "名称不合法",

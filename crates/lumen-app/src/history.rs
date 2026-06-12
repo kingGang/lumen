@@ -458,6 +458,110 @@ impl HistoryStore {
         }
         None
     }
+
+    /// 模糊搜索历史命令（M4.3 Ctrl+R 历史搜索面板）。
+    ///
+    /// 子序列匹配（大小写不敏感）+ 评分（连续/词首边界 bonus + 短文本加权），
+    /// 按分降序返回（同分按近因 = entries 下标大→小，即新→旧）。空 query 返回
+    /// 全部、按近因排序。跳过多行条目（面板单行展示）。
+    ///
+    /// 返回的 [`HistorySearchHit::entry_idx`] 是 [`Self::entries`] 的下标。
+    pub fn fuzzy_search(&self, query: &str) -> Vec<HistorySearchHit> {
+        // query 去空白 + 小写化为字符序列。
+        let q: Vec<char> = query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if q.is_empty() {
+            // 空 query：全部非多行条目，按近因（新 → 旧）。
+            return self
+                .entries
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, e)| !e.text.contains('\n'))
+                .map(|(entry_idx, _)| HistorySearchHit {
+                    entry_idx,
+                    score: 0,
+                    match_spans: Vec::new(),
+                })
+                .collect();
+        }
+        let mut hits: Vec<HistorySearchHit> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.text.contains('\n'))
+            .filter_map(|(entry_idx, e)| {
+                fuzzy_match_score(&e.text, &q).map(|(score, match_spans)| HistorySearchHit {
+                    entry_idx,
+                    score,
+                    match_spans,
+                })
+            })
+            .collect();
+        // 分降序；同分按近因（entry_idx 大 = 新）。
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+        hits
+    }
+}
+
+/// 历史模糊搜索命中（M4.3 Ctrl+R 面板）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySearchHit {
+    /// 命中条目在 [`HistoryStore::entries`] 中的下标。
+    pub entry_idx: usize,
+    /// 匹配分（降序排列，越大越相关）。
+    pub score: i64,
+    /// 命中字符在条目 `text` 中的字节区间 `[start, end)`（已合并连续，供高亮）。
+    pub match_spans: Vec<(usize, usize)>,
+}
+
+/// 子序列模糊匹配 + 评分：`query_lower`（已小写、去空白）全部字符按序出现在
+/// `text` 中则命中。返回 `(score, 命中字节区间)`，不命中返回 `None`。
+///
+/// 评分：每命中 +1；与上一命中字符相邻（连续）额外 +5；命中处于词首/边界
+/// （前一字符非字母数字，或行首）额外 +3；命中后按文本越短越相关追加小幅加权。
+fn fuzzy_match_score(text: &str, query_lower: &[char]) -> Option<(i64, Vec<(usize, usize)>)> {
+    let mut qi = 0usize;
+    let mut score: i64 = 0;
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut prev_match_end: Option<usize> = None;
+    let mut prev_char: Option<char> = None;
+    for (byte, ch) in text.char_indices() {
+        if qi >= query_lower.len() {
+            break;
+        }
+        let ch_lower = ch.to_lowercase().next().unwrap_or(ch);
+        if ch_lower == query_lower[qi] {
+            let end = byte + ch.len_utf8();
+            if prev_match_end == Some(byte) {
+                // 与上一命中相邻：连续 bonus + 合并到上一区间。
+                score += 5;
+                if let Some(last) = spans.last_mut() {
+                    last.1 = end;
+                }
+            } else {
+                score += 1;
+                spans.push((byte, end));
+            }
+            // 词首/边界 bonus（前一字符非字母数字，或行首）。
+            if prev_char.map(|c| !c.is_alphanumeric()).unwrap_or(true) {
+                score += 3;
+            }
+            prev_match_end = Some(end);
+            qi += 1;
+        }
+        prev_char = Some(ch);
+    }
+    if qi == query_lower.len() {
+        // 短文本加权（匹配密度）：文本越短越相关。
+        score += (100i64 - text.len() as i64).max(0) / 10;
+        Some((score, spans))
+    } else {
+        None
+    }
 }
 
 /// 去重并保留最近 `max` 条：同 text 的条目合并（保留 exit_code 非 None 的，
@@ -571,6 +675,69 @@ mod tests {
             draft: None,
             abandoned: None,
         }
+    }
+
+    // ── 模糊搜索（M4.3）────────────────────────────────────────────────
+
+    /// 用给定文本构造内存 store（ts 按下标递增 = 越后越新）。
+    fn store_with(texts: &[&str]) -> HistoryStore {
+        let mut s = make_store(std::env::temp_dir().join("lumen_fuzzy_test"));
+        for (i, text) in texts.iter().enumerate() {
+            s.entries.push(HistoryEntry {
+                text: (*text).into(),
+                cwd: None,
+                exit_code: None,
+                duration_ms: None,
+                ts: (i + 1) as u64,
+            });
+        }
+        s
+    }
+
+    #[test]
+    fn fuzzy_子序列匹配_高亮区间_不匹配() {
+        let s = store_with(&["git status", "git commit -m x", "docker run nginx"]);
+        // "git" 命中两条 git、不命中 docker；高亮区间 (0,3)。
+        let hits = s.fuzzy_search("git");
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert_eq!(h.match_spans, vec![(0, 3)], "git 连续命中应合并为单区间");
+        }
+        // 子序列：'dkr' 命中 "docker run"（d..k..r）。
+        let hits2 = s.fuzzy_search("dkr");
+        assert!(hits2
+            .iter()
+            .any(|h| s.entries[h.entry_idx].text.starts_with("docker")));
+        // 全不命中。
+        assert!(s.fuzzy_search("zzz").is_empty());
+    }
+
+    #[test]
+    fn fuzzy_大小写不敏感_空query按近因() {
+        let s = store_with(&["LS -la", "PWD"]);
+        assert_eq!(s.fuzzy_search("ls").len(), 1, "大小写不敏感");
+        // 空 query 返回全部、按近因（新 → 旧）。
+        let all = s.fuzzy_search("");
+        assert_eq!(all.len(), 2);
+        assert_eq!(s.entries[all[0].entry_idx].text, "PWD", "最新条目排首");
+    }
+
+    #[test]
+    fn fuzzy_连续与短文本优先() {
+        let s = store_with(&["git", "g-i-t-x-y-z"]);
+        let hits = s.fuzzy_search("git");
+        assert_eq!(
+            s.entries[hits[0].entry_idx].text, "git",
+            "连续命中 + 短文本应排在分散命中之前"
+        );
+    }
+
+    #[test]
+    fn fuzzy_跳过多行条目() {
+        let s = store_with(&["foo\nbar", "foobar"]);
+        let hits = s.fuzzy_search("foo");
+        assert_eq!(hits.len(), 1, "多行条目应跳过");
+        assert_eq!(s.entries[hits[0].entry_idx].text, "foobar");
     }
 
     // ── 去重函数 ─────────────────────────────────────────────────────

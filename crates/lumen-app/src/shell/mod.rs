@@ -9,6 +9,7 @@
 //! 会话增删切换/PTY 写入/设置即时生效/登录写盘由 main.rs 执行。
 
 pub mod filetree;
+pub mod history_search_ui;
 pub mod layout;
 pub mod login_ui;
 pub mod settings_ui;
@@ -56,6 +57,8 @@ pub struct ShellState {
     pub settings: settings_ui::SettingsUiState,
     /// 登录覆盖层（开关/输入缓冲等跨帧状态）。
     pub login: login_ui::LoginUiState,
+    /// 历史搜索面板（M4.3 Ctrl+R；开关/query/selected 等跨帧状态）。
+    pub history_search: history_search_ui::HistorySearchUiState,
     /// 系统提示框队列（toast；shell 内外都可 push，见 toast.rs）。
     pub toast: toast::ToastState,
 }
@@ -118,6 +121,8 @@ pub struct ShellInput<'a> {
     /// 经典直通模式开关（M4.1 批E：状态栏右端按钮状态）。
     #[cfg(feature = "input-editor")]
     pub force_fallback: bool,
+    /// 历史搜索面板本帧展示的行（由 main 在 render 前计算；面板关闭时传空切片）。
+    pub history_rows: &'a [history_search_ui::HistoryRow],
 }
 
 /// 一帧外壳 UI 的产出。
@@ -248,6 +253,12 @@ pub struct ShellOutput {
     /// 底部状态栏点击了经典直通切换按钮（M4.1 批E）：走 dispatch ToggleFallback 同路径。
     #[cfg(feature = "input-editor")]
     pub toggle_fallback: bool,
+    /// 历史搜索面板：用户选定的命令文本（应填入输入框并关闭面板）。
+    pub history_accept: Option<String>,
+    /// 历史搜索面板：本帧请求关闭（Esc / backdrop 点击）。
+    pub history_closed: bool,
+    /// 历史搜索面板：query 本帧发生变化（main 应 request_redraw 以便下帧重算结果）。
+    pub history_query_changed: bool,
 }
 
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
@@ -311,6 +322,9 @@ pub fn show(
         logged_out: false,
         #[cfg(feature = "input-editor")]
         toggle_fallback: false,
+        history_accept: None,
+        history_closed: false,
+        history_query_changed: false,
     };
     // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
     // 派生（每帧少量色彩数学，开销可忽略）。
@@ -1116,6 +1130,23 @@ pub fn show(
         if l_out.closed {
             st.login.open = false;
             out.login_closed = true;
+        }
+    }
+
+    // —— 历史搜索面板（M4.3 Ctrl+R；盖在设置/登录之上，toast 之下）——
+    // 面板 open 时调用；产出写入 ShellOutput 对应字段。
+    if st.history_search.open {
+        let hs_out =
+            history_search_ui::show(root.ctx(), &mut st.history_search, input.history_rows, pal);
+        if hs_out.accept.is_some() {
+            out.history_accept = hs_out.accept;
+        }
+        if hs_out.closed {
+            st.history_search.open = false;
+            out.history_closed = true;
+        }
+        if hs_out.query_changed {
+            out.history_query_changed = true;
         }
     }
 

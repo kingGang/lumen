@@ -289,8 +289,10 @@ pub struct Strings {
     /// Compose 态 Tab 键占位提示 toast（M3.4 补全未实现）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub toast_compose_tab_hint: &'static str,
-    /// Compose 态 Ctrl+R 占位提示 toast（D2 历史搜索未实现）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    /// Compose 态 Ctrl+R 占位提示 toast（M4.3 面板已实现，此字段保留供降级/非 input-editor 模式）
+    // ALLOW: M4.3 后 ComposeHistorySearch 直接打开面板，toast 路径不再走此字段；
+    // 保留字段是为了维持三语文件的编译期完备性检查（删字段会导致三语实例编译报错）。
+    #[allow(dead_code)]
     pub toast_compose_history_hint: &'static str,
 
     // ── 侧栏标题栏（R8）─────────────────────────────────────────────────────
@@ -356,6 +358,17 @@ pub struct Strings {
     /// 右键菜单：全选
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub ctx_menu_select_all: &'static str,
+
+    // ── M4.3 历史搜索面板 ────────────────────────────────────────────
+    /// 历史搜索输入框占位提示
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub history_search_placeholder: &'static str,
+    /// 历史搜索无匹配项时的空态提示
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub history_search_empty: &'static str,
+    /// 历史搜索面板底部操作提示（↑↓ 选择 · Enter 填入 · Esc 关闭）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub history_search_hint: &'static str,
 
     // ── filetree 名字校验错误（UI 侧翻译）──────────────────────────
     /// 名称不能为空

@@ -1426,6 +1426,7 @@ impl AppState {
         // （bypass_egui 即刻生效，等不到下一帧的纠偏）。
         self.terminal_focused = !(self.shell_state.settings.open
             || self.shell_state.login.open
+            || self.shell_state.history_search.open
             || self.shell_state.renaming.is_some()
             || self.shell_state.filetree.dialog_open());
         self.update_window_title();
@@ -2882,7 +2883,9 @@ impl ApplicationHandler<PtyWake> for App {
                         .is_some_and(|s| !s.is_empty()),
                     has_selected_block: state.tabs[ti].panes[pi].selected_block.is_some(),
                     is_alt_screen: state.tabs[ti].panes[pi].term.is_alt_screen(),
-                    overlay_open: state.shell_state.settings.open || state.shell_state.login.open,
+                    overlay_open: state.shell_state.settings.open
+                        || state.shell_state.login.open
+                        || state.shell_state.history_search.open,
                     renaming: state.shell_state.renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
                     terminal_focused: state.terminal_focused,
@@ -3067,12 +3070,15 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::ComposeHistorySearch) => {
-                        // Compose 态 Ctrl+R：D2 历史搜索占位，显示提示状态条。
-                        let s = i18n::strings();
-                        state
-                            .shell_state
-                            .toast
-                            .push(shell::toast::ToastKind::Info, s.toast_compose_history_hint);
+                        // Compose 态 Ctrl+R：打开历史搜索面板（M4.3）。
+                        let hs = &mut state.shell_state.history_search;
+                        hs.open = true;
+                        hs.query.clear();
+                        hs.selected = 0;
+                        hs.focus_query = true;
+                        // 面板打开期间键盘归 egui，不进终端。
+                        state.terminal_focused = false;
+                        state.window.request_redraw();
                     }
 
                     Some(keymap::LookupResult::ComposeEsc) => {
@@ -3674,6 +3680,29 @@ impl ApplicationHandler<PtyWake> for App {
                         opacity: state.settings.appearance.background.opacity,
                         dim: state.settings.appearance.background.dim,
                     });
+                // 历史搜索面板行数据（M4.3）：仅面板打开时计算（最多取 50 条）。
+                // 面板关闭时传空 Vec，不做 fuzzy_search 开销。
+                let history_rows_owned: Vec<shell::history_search_ui::HistoryRow> =
+                    if state.shell_state.history_search.open {
+                        let query = &state.shell_state.history_search.query;
+                        state
+                            .history
+                            .fuzzy_search(query)
+                            .into_iter()
+                            .take(50)
+                            .map(|hit| {
+                                let entry = &state.history.entries()[hit.entry_idx];
+                                shell::history_search_ui::HistoryRow {
+                                    text: entry.text.clone(),
+                                    cwd: entry.cwd.clone(),
+                                    exit_code: entry.exit_code,
+                                    match_spans: hit.match_spans,
+                                }
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -3692,6 +3721,7 @@ impl ApplicationHandler<PtyWake> for App {
                     ),
                     #[cfg(feature = "input-editor")]
                     force_fallback: state.force_fallback,
+                    history_rows: &history_rows_owned,
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
@@ -3824,6 +3854,7 @@ impl ApplicationHandler<PtyWake> for App {
                     && state.shell_state.renaming.is_none()
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
+                    && !state.shell_state.history_search.open
                     && !state.egui_ctx.input(|i| i.pointer.any_click())
                 {
                     state.terminal_focused = true;
@@ -4024,6 +4055,42 @@ impl ApplicationHandler<PtyWake> for App {
                     // 关闭后焦点交还终端（IME 强制复位链路每帧照旧执行）。
                     state.terminal_focused = true;
                 }
+
+                // —— 历史搜索面板（M4.3）输出处理 ——
+                // history_accept：把选定命令写入焦点窗格编辑器并关闭面板。
+                #[cfg(feature = "input-editor")]
+                if let Some(text) = shell_out.history_accept {
+                    let ti = state.active_tab;
+                    let pi = state.tabs[ti].focused;
+                    state.tabs[ti].panes[pi]
+                        .editor
+                        .apply(&lumen_editor::EditAction::SetText(text));
+                    // 光标移到行末（视觉跟手，与历史导航同款）。
+                    state.tabs[ti].panes[pi]
+                        .editor
+                        .apply(&lumen_editor::EditAction::Move {
+                            motion: lumen_editor::Motion::DocEnd,
+                            extend: false,
+                        });
+                    state.shell_state.history_search.open = false;
+                    state.terminal_focused = true;
+                    state.window.request_redraw();
+                }
+                // history_closed：关闭面板，焦点还给终端。
+                if shell_out.history_closed {
+                    state.shell_state.history_search.open = false;
+                    state.terminal_focused = true;
+                    state.window.request_redraw();
+                }
+                // history_query_changed：query 变化，下帧重算结果（fuzzy_search 在 run_ui 前算）。
+                if shell_out.history_query_changed {
+                    state.window.request_redraw();
+                }
+                // 面板打开期间键盘恒归 egui（终端不收键盘）。
+                if state.shell_state.history_search.open {
+                    state.terminal_focused = false;
+                }
+
                 // 文件树对话框（新建输入/删除确认）：打开期间键盘/IME
                 // 归 egui 的输入框（与重命名编辑同款仲裁）；关闭后交还
                 // 终端（与设置页关闭同款，点「取消」也交还）。

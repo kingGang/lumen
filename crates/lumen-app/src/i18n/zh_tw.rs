@@ -158,6 +158,10 @@ pub static STRINGS: Strings = Strings {
     // 登入校驗
     login_err_invalid_email: "電子郵件格式不正確（需形如 name@example.com）",
     login_err_empty_password: "請輸入密碼",
+    // M4.3 歷史搜尋面板
+    history_search_placeholder: "搜尋歷史命令…",
+    history_search_empty: "沒有相符的歷史命令",
+    history_search_hint: "↑↓ 選擇 · Enter 填入 · Esc 關閉",
     // 檔案名稱校驗
     validate_name_empty: "名稱不能為空",
     validate_name_illegal: "名稱不合法",
