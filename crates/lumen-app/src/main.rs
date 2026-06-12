@@ -525,7 +525,11 @@ impl AppState {
     fn apply_theme(&mut self) {
         let info = settings::theme_info(self.settings.effective_theme_id(self.os_dark));
         self.renderer.set_theme(info.theme());
-        shell::theme::apply_style(&self.egui_ctx, &shell::theme::shell_palette(info));
+        let pal = shell::theme::shell_palette(info);
+        // 问题5：将 panel_outline 描边色注入 renderer，更新 footer 上边框颜色。
+        let [r, g, b, _] = pal.panel_outline.to_array();
+        self.renderer.set_footer_border_color(r, g, b);
+        shell::theme::apply_style(&self.egui_ctx, &pal);
         info!("主题已应用：{}（id {}）", info.name, info.id);
     }
 
@@ -1512,6 +1516,12 @@ impl App {
         let actual_family = renderer.reconfigure_font(&ap.font_family, ap.font_size);
         let theme_info = settings::theme_info(app_settings.effective_theme_id(os_dark));
         renderer.set_theme(theme_info.theme());
+        // 问题5：启动时同步 panel_outline 描边色到 renderer。
+        {
+            let pal = shell::theme::shell_palette(theme_info);
+            let [r, g, b, _] = pal.panel_outline.to_array();
+            renderer.set_footer_border_color(r, g, b);
+        }
         info!(
             "设置加载：主题 {}（id {}，sync_with_os={}）字号 {} 侧栏宽 {}/{} 字体「{}」→ 实际生效「{actual_family}」",
             theme_info.name,
@@ -2770,6 +2780,22 @@ impl ApplicationHandler<PtyWake> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // 问题4（B4 修复）：无边框窗口最小化时 winit inner_size
+                // 缩为约 160×28 小条（非 0×0，绕过原有 0 尺寸守卫），
+                // egui 布局与 PTY resize 会以此极小尺寸执行，导致
+                // layout.rs 的 clamp 产生 max < min panic，进而在
+                // wgpu swapchain 释放时触发次生 panic。
+                // 守卫：最小化态 (is_minimized == true) 或宽/高 < 120
+                // 物理像素（160×28 小条实测值）时跳过整帧渲染与布局。
+                {
+                    let sz = state.window.inner_size();
+                    const MIN_RENDERABLE: u32 = 120;
+                    let too_small = sz.width < MIN_RENDERABLE || sz.height < MIN_RENDERABLE;
+                    let minimized = state.window.is_minimized().unwrap_or(false);
+                    if minimized || too_small {
+                        return;
+                    }
+                }
                 // surface 帧先行取得：失败（Lost/Outdated 已就地重配）则
                 // 本帧整体跳过——egui 输入与 textures_delta 都未消费，
                 // 状态不丢，等下一次重绘。
@@ -3270,11 +3296,19 @@ impl ApplicationHandler<PtyWake> for App {
                         state.settings.appearance.background.enabled && state.bg_texture.is_some();
                     state.renderer.set_transparent_background(enabled);
                 }
+                // 问题7：顶栏① 会话栏显隐——写入 settings 并触发存盘。
+                let sidebar_changed = if let Some(v) = shell_out.toggle_sidebar {
+                    state.settings.layout.sidebar_visible = v;
+                    true
+                } else {
+                    false
+                };
                 let need_save = shell_out.settings_font_changed
                     || shell_out.settings_theme_changed
                     || shell_out.settings_background_image_changed
                     || shell_out.settings_background_params_changed
-                    || shell_out.settings_language_changed;
+                    || shell_out.settings_language_changed
+                    || sidebar_changed;
                 if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
                     // 弹 toast：用户以为改完即存，静默丢失重启才发现。

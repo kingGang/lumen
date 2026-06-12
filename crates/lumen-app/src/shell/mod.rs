@@ -157,9 +157,14 @@ pub struct ShellOutput {
     pub maximize_btn_rect: Option<egui::Rect>,
     /// 顶栏「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
-    /// 顶栏「▦」（P15）：当前 tab 全部窗格比例恢复均分（最大化态
-    /// 先退出）；复位后 main 落盘。
+    /// 顶栏③还原窗格大小（P15 / 问题7）：当前 tab 全部窗格比例恢复均分
+    /// （最大化态先退出）；复位后 main 落盘。
     pub layout_reset: bool,
+    /// 顶栏①切换会话栏显示/隐藏（问题7）：Some(v) = 新可见值，None = 未操作。
+    /// main 更新 settings.layout.sidebar_visible 并落盘。
+    pub toggle_sidebar: Option<bool>,
+    /// 顶栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
+    pub toggle_filetree: Option<bool>,
     /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
     /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
     pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
@@ -263,6 +268,8 @@ pub fn show(
         maximize_btn_rect: None,
         new_pane: false,
         layout_reset: false,
+        toggle_sidebar: None,
+        toggle_filetree: None,
         divider_drag: None,
         divider_drag_ended: false,
         divider_reset: None,
@@ -325,12 +332,25 @@ pub fn show(
         input.profile,
         pal,
         is_maximized,
+        topbar::ViewState {
+            sidebar_visible: app_settings.layout.sidebar_visible,
+            filetree_visible: st.filetree.visible,
+        },
     );
     if tb.new_pane {
         out.new_pane = true;
     }
     if tb.reset_layout {
         out.layout_reset = true;
+    }
+    // 问题7：三视图切换信号转发
+    if tb.toggle_sidebar.is_some() {
+        out.toggle_sidebar = tb.toggle_sidebar;
+    }
+    if let Some(v) = tb.toggle_filetree {
+        // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
+        st.filetree.visible = v;
+        out.toggle_filetree = Some(v);
     }
     if tb.open_settings {
         out.settings_opened = true;
@@ -368,79 +388,82 @@ pub fn show(
         out.maximize_btn_rect = tb.maximize_btn_rect;
     }
 
-    // 左侧会话栏：可拖宽（P10）。default_size 只在 egui 无面板记忆
-    // （首帧）时生效 = 还原持久化宽度；此后宽度由 egui 面板自管，
-    // 实际值经 sidebar_width 报回 main，松手时写盘。拖动改变终端区
-    // 宽度，沿用「矩形变化 → 重建离屏纹理 + 全会话 resize」链路。
-    let sb_resp = egui::Panel::left("lumen_sidebar")
-        .default_size(app_settings.layout.sidebar_width)
-        .size_range(crate::settings::SIDEBAR_WIDTH_MIN..=crate::settings::SIDEBAR_WIDTH_MAX)
-        .resizable(true)
-        .show_separator_line(false)
-        .frame(
-            egui::Frame::new()
-                .fill(pal.bg_dark)
-                .inner_margin(egui::Margin::symmetric(8, 10)),
-        )
-        .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
-    out.sidebar_width = sb_resp.response.rect.width();
-    // P16b：左侧会话栏轮廓描边——画左/右/上/下四边。共享边去重规则
-    // （P16b 复验修正）：每对相邻面板的共享边由**左侧**面板画右边线，
-    // 右侧面板不画左边线——侧栏画右（侧栏|文件树共享边）、文件树画右
-    // （文件树|命令行区共享边）、两者均不画左。原「侧栏省右+文件树省左」
-    // 把同一条共享边两侧都省了，中间反而没线（海风哥实测反馈）。
-    // 像素对齐（1/ppp 逻辑点 = 1 物理像素），防分数 DPI 模糊。
-    {
-        use egui::emath::GuiRounding as _;
-        let ppp = root.pixels_per_point();
-        let r = sb_resp.response.rect.round_to_pixels(ppp);
-        let hw = 0.5 / ppp; // 半像素：inner 边相当于向内缩半像素绘制
-        let col = pal.panel_outline;
-        let stroke = egui::Stroke::new(1.0 / ppp, col);
-        let p = root.painter();
-        // 左边
-        p.line_segment(
-            [
-                egui::pos2(r.min.x + hw, r.min.y),
-                egui::pos2(r.min.x + hw, r.max.y),
-            ],
-            stroke,
-        );
-        // 右边（侧栏|文件树共享边，由本侧负责画）
-        p.line_segment(
-            [
-                egui::pos2(r.max.x - hw, r.min.y),
-                egui::pos2(r.max.x - hw, r.max.y),
-            ],
-            stroke,
-        );
-        // 上边
-        p.line_segment(
-            [
-                egui::pos2(r.min.x, r.min.y + hw),
-                egui::pos2(r.max.x, r.min.y + hw),
-            ],
-            stroke,
-        );
-        // 下边
-        p.line_segment(
-            [
-                egui::pos2(r.min.x, r.max.y - hw),
-                egui::pos2(r.max.x, r.max.y - hw),
-            ],
-            stroke,
-        );
-    }
-    // 侧栏右缘的拖宽手柄命中区（与面板边线同心、向两侧各探
-    // resize_grab_radius_side）：报给 main 让 raw 鼠标按下让位——
-    // 拖宽期间不交出终端焦点，调完宽度接着打字不断流。
+    // 左侧会话栏（问题7：sidebar_visible 控制是否渲染）。
+    // 隐藏时不画面板，侧栏宽度报 0（main 不更新 settings.layout.sidebar_width）。
     let grab = root.style().interaction.resize_grab_radius_side;
     let edge_rect = |edge_x: f32, root: &egui::Ui| {
         let y = root.available_rect_before_wrap().y_range();
         egui::Rect::from_x_y_ranges(edge_x - grab..=edge_x + grab, y)
     };
-    out.panel_resize_rects
-        .push(edge_rect(sb_resp.response.rect.max.x, root));
+    if app_settings.layout.sidebar_visible {
+        // 可拖宽（P10）。default_size 只在 egui 无面板记忆（首帧）时生效
+        // = 还原持久化宽度；此后宽度由 egui 面板自管，实际值经
+        // sidebar_width 报回 main，松手时写盘。
+        let sb_resp = egui::Panel::left("lumen_sidebar")
+            .default_size(app_settings.layout.sidebar_width)
+            .size_range(crate::settings::SIDEBAR_WIDTH_MIN..=crate::settings::SIDEBAR_WIDTH_MAX)
+            .resizable(true)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.bg_dark)
+                    .inner_margin(egui::Margin::symmetric(8, 10)),
+            )
+            .show_inside(root, |ui| sidebar_ui(ui, input.tabs, st, pal, &mut out));
+        out.sidebar_width = sb_resp.response.rect.width();
+        // P16b：左侧会话栏轮廓描边——画左/右/上/下四边。共享边去重规则
+        // （P16b 复验修正）：每对相邻面板的共享边由**左侧**面板画右边线，
+        // 右侧面板不画左边线——侧栏画右（侧栏|文件树共享边）、文件树画右
+        // （文件树|命令行区共享边）、两者均不画左。原「侧栏省右+文件树省左」
+        // 把同一条共享边两侧都省了，中间反而没线（海风哥实测反馈）。
+        // 像素对齐（1/ppp 逻辑点 = 1 物理像素），防分数 DPI 模糊。
+        {
+            use egui::emath::GuiRounding as _;
+            let ppp = root.pixels_per_point();
+            let r = sb_resp.response.rect.round_to_pixels(ppp);
+            let hw = 0.5 / ppp; // 半像素：inner 边相当于向内缩半像素绘制
+            let col = pal.panel_outline;
+            let stroke = egui::Stroke::new(1.0 / ppp, col);
+            let p = root.painter();
+            // 左边
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x + hw, r.min.y),
+                    egui::pos2(r.min.x + hw, r.max.y),
+                ],
+                stroke,
+            );
+            // 右边（侧栏|文件树共享边，由本侧负责画）
+            p.line_segment(
+                [
+                    egui::pos2(r.max.x - hw, r.min.y),
+                    egui::pos2(r.max.x - hw, r.max.y),
+                ],
+                stroke,
+            );
+            // 上边
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x, r.min.y + hw),
+                    egui::pos2(r.max.x, r.min.y + hw),
+                ],
+                stroke,
+            );
+            // 下边
+            p.line_segment(
+                [
+                    egui::pos2(r.min.x, r.max.y - hw),
+                    egui::pos2(r.max.x, r.max.y - hw),
+                ],
+                stroke,
+            );
+        }
+        // 侧栏右缘的拖宽手柄命中区（与面板边线同心、向两侧各探
+        // resize_grab_radius_side）：报给 main 让 raw 鼠标按下让位——
+        // 拖宽期间不交出终端焦点，调完宽度接着打字不断流。
+        out.panel_resize_rects
+            .push(edge_rect(sb_resp.response.rect.max.x, root));
+    }
 
     // 中间一栏：文件树（可折叠 + 可拖宽 P10；树根跟随激活会话 cwd）。
     // 开合/拖宽改变终端区宽度，沿用同一条矩形变化链路。

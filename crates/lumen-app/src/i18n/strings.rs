@@ -51,10 +51,6 @@ pub struct Strings {
     pub topbar_new_pane_tip: &'static str,
     /// 新增窗格禁用 tooltip，单参 `{}`：MAX_PANES 数字
     pub topbar_max_panes_fmt: &'static str,
-    /// 复位布局 tooltip "恢复窗格默认大小"
-    pub topbar_reset_tip: &'static str,
-    /// 复位布局禁用 tooltip "单窗格无需复位"
-    pub topbar_reset_disabled_tip: &'static str,
     /// 头像 tooltip（未登录态）"未登录"
     pub topbar_not_logged_in: &'static str,
     /// 头像菜单 Settings
@@ -174,10 +170,6 @@ pub struct Strings {
     pub login_btn: &'static str,
 
     // ── 文件树 UI ────────────────────────────────────────────────────
-    /// 展开文件树 tooltip
-    pub filetree_expand_tip: &'static str,
-    /// 收起文件树 tooltip
-    pub filetree_collapse_tip: &'static str,
     /// 刷新按钮标签
     pub filetree_refresh: &'static str,
     /// 刷新 tooltip
@@ -313,6 +305,20 @@ pub struct Strings {
     /// Fallback 态状态条文案（shell 集成未生效时显示）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub footer_fallback_text: &'static str,
+
+    // ── 顶栏三视图切换按钮（问题7）────────────────────────────────────
+    /// 显示/隐藏会话栏 tooltip（展开态）
+    pub topbar_sidebar_show_tip: &'static str,
+    /// 显示/隐藏会话栏 tooltip（隐藏态）
+    pub topbar_sidebar_hide_tip: &'static str,
+    /// 显示/隐藏文件树 tooltip（展开态）
+    pub topbar_filetree_show_tip: &'static str,
+    /// 显示/隐藏文件树 tooltip（隐藏态）
+    pub topbar_filetree_hide_tip: &'static str,
+    /// 还原窗格大小 tooltip（启用态，对应原「▦」功能）
+    pub topbar_reset_layout_tip: &'static str,
+    /// 还原窗格大小禁用 tooltip（单窗格时）
+    pub topbar_reset_layout_disabled_tip: &'static str,
 
     // ── profile 校验错误（UI 侧翻译）────────────────────────────────
     /// 邮箱格式不正确

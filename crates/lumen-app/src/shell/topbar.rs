@@ -1,6 +1,19 @@
-//! 顶栏（M3.5 / M3.8）：左侧激活会话标题（兼拖动区）+ 右侧自绘窗控
-//! 三按钮（最小化/最大化还原/关闭）+ 新增窗格 / 复位布局 / 圆形头像
-//! 按钮与下拉菜单。
+//! 顶栏（M3.5 / M3.8 / 问题1 修复）：左侧激活会话标题（兼拖动区）、
+//! 右侧自绘窗控三按钮（最小化/最大化还原/关闭）、三视图切换按钮组、
+//! 「＋」新增窗格与圆形头像按钮下拉菜单。
+//!
+//! 问题1 修复（RTL 布局 cursor().min bug）：
+//! - 原实现用 `allocate_rect(Rect::from_min_size(cursor().min, …))` 手工构造矩形，
+//!   RTL 布局下 cursor().min 是剩余区域左上角而非当前放置位置，导致三个窗控
+//!   按钮全部叠画在面板左端、顶栏内容消失。
+//! - 修复：一律用 `allocate_exact_size(vec2(W, H), Sense::click())` 让布局引擎
+//!   自动放置（RTL 下靠右排、左移 cursor），painter 按返回 rect 画图。
+//!
+//! 问题7（三视图切换按钮）：
+//! - 在「＋」左侧新增三按钮组：①显示/隐藏会话栏 ②显示/隐藏文件树（复用 Ctrl+B）
+//!   ③还原窗格大小（原顶栏「▦」功能迁入）。
+//! - 原「▦」按钮删除（功能已迁到③）。
+//! - 图标 painter 画线风格（项目惯例）。
 //!
 //! M3.8 变更：
 //! - 窗口无边框后，窗控三按钮并入顶栏右端（Warp/VSCode 形态）。
@@ -26,6 +39,8 @@ use super::theme::Palette;
 pub const HEIGHT: f32 = 34.0;
 /// 窗控按钮热区宽度（逻辑像素，参考 Win11 约 46 × 34）。
 const WC_BTN_W: f32 = 46.0;
+/// 视图切换按钮尺寸（逻辑像素，问题7）。
+const VIEW_BTN: f32 = 26.0;
 /// 头像直径。
 const AVATAR_SIZE: f32 = 24.0;
 /// 下拉菜单宽度。
@@ -44,8 +59,7 @@ pub struct TopbarOutput {
     pub log_out: bool,
     /// 点击了「＋」：焦点 tab 内新增窗格（同 Ctrl+Shift+D，F5）。
     pub new_pane: bool,
-    /// 点击了「▦」复位按钮（P15）：当前 tab 全部窗格比例恢复均分
-    /// （处于最大化态时先退出再复位）。
+    /// 点击了③还原窗格大小按钮（原「▦」功能，问题7迁入）。
     pub reset_layout: bool,
     // ── M3.8 窗口控制信号 ──────────────────────────────────────────────
     /// 拖动了顶栏空白区——main 调 window.drag_window()。
@@ -62,6 +76,20 @@ pub struct TopbarOutput {
     /// 子类化用）：main 换算为屏幕物理像素后写入 snap_layouts 原子。
     /// 按钮不可见（极端情况）时为 None，main 跳过本帧更新。
     pub maximize_btn_rect: Option<egui::Rect>,
+    // ── 问题7：三视图切换信号 ─────────────────────────────────────────
+    /// 切换会话栏显示/隐藏（点击①按钮）。None = 未点击，Some(v) = 新可见值。
+    pub toggle_sidebar: Option<bool>,
+    /// 切换文件树显示/隐藏（点击②按钮，与 Ctrl+B 同状态源）。None = 未点击，Some(v) = 新可见值。
+    pub toggle_filetree: Option<bool>,
+}
+
+/// 顶栏三视图切换按钮的可见态（问题7）：将两个 bool 打包传入 [`show`]，
+/// 避免参数列表超过 clippy 7 参数限制。
+pub struct ViewState {
+    /// 会话栏（①）当前是否可见。
+    pub sidebar_visible: bool,
+    /// 文件树（②）当前是否可见（与 Ctrl+B 同状态源）。
+    pub filetree_visible: bool,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -70,6 +98,7 @@ pub struct TopbarOutput {
 /// - `title`：激活会话标题，与窗口标题同源（main 的 display_title）。
 /// - `pane_count`：激活 tab 当前窗格数（「＋」按钮满额禁用判定）。
 /// - `is_maximized`：窗口当前是否最大化（切换最大化/还原图标）。
+/// - `view`：三视图切换按钮的当前可见态（①会话栏 / ②文件树）。
 pub fn show(
     root: &mut egui::Ui,
     title: &str,
@@ -77,6 +106,7 @@ pub fn show(
     profile: Option<&Profile>,
     pal: &Palette,
     is_maximized: bool,
+    view: ViewState,
 ) -> TopbarOutput {
     let mut out = TopbarOutput::default();
     egui::Panel::top("lumen_topbar")
@@ -89,31 +119,28 @@ pub fn show(
                 .inner_margin(egui::Margin::symmetric(0, 0)),
         )
         .show_inside(root, |ui| {
-            // right_to_left 布局：最右端是窗控三按钮，其左是头像/＋/▦，
+            // right_to_left 布局：最右端是窗控三按钮，其左是头像/三视图按钮/＋，
             // 余下空白是拖动区 + 左侧标题文字。
+            //
+            // 关键：一律用 allocate_exact_size(vec2(W, H), Sense::click()) 让布局
+            // 引擎自动放置——RTL 下布局引擎从右向左分配，自动靠右排列并左移
+            // cursor，painter 按返回 rect 画图，不依赖 cursor().min。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // ── 窗控三按钮（最右，从右到左：关闭 → 最大化/还原 → 最小化）
-                // ──────────────────────────────────────────────────────────────
                 let s = i18n::strings();
 
+                // ── 窗控三按钮（最右，从右到左：关闭 → 最大化/还原 → 最小化）
+                // ──────────────────────────────────────────────────────────────
+
                 // 关闭按钮（悬停红底 #c42b1c 白字，Win11 惯例）
-                let close_rect = ui.allocate_rect(
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(WC_BTN_W, HEIGHT)),
-                    egui::Sense::HOVER,
-                );
-                // 先 allocate 占位，再 interact 注册语义
-                let close_resp = ui.interact(
-                    close_rect.rect,
-                    ui.id().with("wc_close"),
-                    egui::Sense::click(),
-                );
+                let (close_rect, close_resp) =
+                    ui.allocate_exact_size(egui::vec2(WC_BTN_W, HEIGHT), egui::Sense::click());
                 {
                     let painter = ui.painter();
-                    let c = close_rect.rect.center();
+                    let c = close_rect.center();
                     if close_resp.hovered() {
                         // 悬停红底（Win11 关闭按钮惯例色 #c42b1c）
                         painter.rect_filled(
-                            close_rect.rect,
+                            close_rect,
                             0.0,
                             egui::Color32::from_rgb(0xc4, 0x2b, 0x1c),
                         );
@@ -140,20 +167,13 @@ pub fn show(
                 }
 
                 // 最大化/还原按钮
-                let maxrst_rect = ui.allocate_rect(
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(WC_BTN_W, HEIGHT)),
-                    egui::Sense::HOVER,
-                );
-                let maxrst_resp = ui.interact(
-                    maxrst_rect.rect,
-                    ui.id().with("wc_maxrst"),
-                    egui::Sense::click(),
-                );
+                let (maxrst_rect, maxrst_resp) =
+                    ui.allocate_exact_size(egui::vec2(WC_BTN_W, HEIGHT), egui::Sense::click());
                 {
                     let painter = ui.painter();
-                    let c = maxrst_rect.rect.center();
+                    let c = maxrst_rect.center();
                     if maxrst_resp.hovered() {
-                        painter.rect_filled(maxrst_rect.rect, 0.0, pal.bg_highlight);
+                        painter.rect_filled(maxrst_rect, 0.0, pal.bg_highlight);
                     }
                     let fg = if maxrst_resp.hovered() {
                         pal.fg
@@ -208,23 +228,16 @@ pub fn show(
                 }
                 // M3.8 批2：记录最大化按钮的逻辑矩形，供 main 换算为
                 // 屏幕物理像素后写入 snap_layouts 原子（WM_NCHITTEST 命中用）。
-                out.maximize_btn_rect = Some(maxrst_rect.rect);
+                out.maximize_btn_rect = Some(maxrst_rect);
 
                 // 最小化按钮
-                let min_rect = ui.allocate_rect(
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(WC_BTN_W, HEIGHT)),
-                    egui::Sense::HOVER,
-                );
-                let min_resp = ui.interact(
-                    min_rect.rect,
-                    ui.id().with("wc_minimize"),
-                    egui::Sense::click(),
-                );
+                let (min_rect, min_resp) =
+                    ui.allocate_exact_size(egui::vec2(WC_BTN_W, HEIGHT), egui::Sense::click());
                 {
                     let painter = ui.painter();
-                    let c = min_rect.rect.center();
+                    let c = min_rect.center();
                     if min_resp.hovered() {
-                        painter.rect_filled(min_rect.rect, 0.0, pal.bg_highlight);
+                        painter.rect_filled(min_rect, 0.0, pal.bg_highlight);
                     }
                     let fg = if min_resp.hovered() {
                         pal.fg
@@ -249,6 +262,7 @@ pub fn show(
                     .width(MENU_WIDTH)
                     .show(|ui| menu_ui(ui, profile, pal, &mut out));
                 ui.add_space(6.0);
+
                 // 「＋」新增窗格（F5）：满 MAX_PANES 时禁用 + 悬停提示。
                 let plus =
                     egui::Button::new(egui::RichText::new("＋").size(15.0).color(pal.fg_dim))
@@ -260,19 +274,161 @@ pub fn show(
                 if presp.clicked() {
                     out.new_pane = true;
                 }
-                ui.add_space(2.0);
-                // 「▦」复位布局（P15）：当前 tab 窗格比例恢复均分；
-                // 单窗格无比例可言，禁用态。
-                let reset =
-                    egui::Button::new(egui::RichText::new("▦").size(13.0).color(pal.fg_dim))
-                        .min_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE));
-                let rresp = ui
-                    .add_enabled(pane_count > 1, reset)
-                    .on_hover_text(s.topbar_reset_tip)
-                    .on_disabled_hover_text(s.topbar_reset_disabled_tip);
-                if rresp.clicked() {
+                ui.add_space(4.0);
+
+                // ── 三视图切换按钮组（问题7，「＋」左侧）─────────────────
+                // 按钮顺序（RTL：从右向左）：③还原 → ②文件树 → ①会话栏
+                // 画线风格（项目惯例），激活态 pal.fg，隐藏态 pal.fg_dim。
+
+                // ③ 还原窗格大小（原「▦」功能，问题7迁入）
+                // 单窗格时禁用（无多窗格比例可还原）。
+                let (reset_rect, reset_resp) =
+                    ui.allocate_exact_size(egui::vec2(VIEW_BTN, VIEW_BTN), egui::Sense::click());
+                {
+                    // 禁用态：pane_count <= 1
+                    let enabled = pane_count > 1;
+                    let fg = if !enabled {
+                        pal.fg_dim.gamma_multiply(0.4)
+                    } else if reset_resp.hovered() {
+                        pal.fg
+                    } else {
+                        pal.fg_dim
+                    };
+                    if reset_resp.hovered() && enabled {
+                        ui.painter().rect_filled(reset_rect, 3.0, pal.bg_highlight);
+                    }
+                    // 四格 ▦ 图标（沿用既有画法）
+                    let c = reset_rect.center();
+                    let s2 = 3.5;
+                    let gap = 1.5;
+                    let stroke = egui::Stroke::new(1.1, fg);
+                    for dx in [-1.0f32, 1.0] {
+                        for dy in [-1.0f32, 1.0] {
+                            let ox = c.x + dx * (s2 + gap / 2.0);
+                            let oy = c.y + dy * (s2 + gap / 2.0);
+                            ui.painter().rect_stroke(
+                                egui::Rect::from_center_size(
+                                    egui::pos2(ox, oy),
+                                    egui::vec2(s2 * 2.0, s2 * 2.0),
+                                ),
+                                0.0,
+                                stroke,
+                                egui::StrokeKind::Middle,
+                            );
+                        }
+                    }
+                }
+                let tip3 = if pane_count > 1 {
+                    s.topbar_reset_layout_tip
+                } else {
+                    s.topbar_reset_layout_disabled_tip
+                };
+                if reset_resp.on_hover_text(tip3).clicked() && pane_count > 1 {
                     out.reset_layout = true;
                 }
+
+                ui.add_space(2.0);
+
+                // ② 显示/隐藏文件树（Ctrl+B 同状态源，复用 filetree.visible）
+                let (ft_rect, ft_resp) =
+                    ui.allocate_exact_size(egui::vec2(VIEW_BTN, VIEW_BTN), egui::Sense::click());
+                {
+                    // 激活态（文件树可见）用 fg，隐藏态用 fg_dim
+                    let fg = if view.filetree_visible {
+                        pal.fg
+                    } else {
+                        pal.fg_dim
+                    };
+                    if ft_resp.hovered() {
+                        ui.painter().rect_filled(ft_rect, 3.0, pal.bg_highlight);
+                    }
+                    // 图标②：方框+内部两短横线（列表意象）
+                    let c = ft_rect.center();
+                    let r = 4.5;
+                    let stroke = egui::Stroke::new(1.1, fg);
+                    // 外框
+                    ui.painter().rect_stroke(
+                        egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)),
+                        0.0,
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                    // 内部两短横线
+                    let line_x0 = c.x - r * 0.55;
+                    let line_x1 = c.x + r * 0.65;
+                    let stroke_inner = egui::Stroke::new(1.0, fg);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(line_x0, c.y - r * 0.35),
+                            egui::pos2(line_x1, c.y - r * 0.35),
+                        ],
+                        stroke_inner,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(line_x0, c.y + r * 0.35),
+                            egui::pos2(line_x1, c.y + r * 0.35),
+                        ],
+                        stroke_inner,
+                    );
+                }
+                let tip2 = if view.filetree_visible {
+                    s.topbar_filetree_hide_tip
+                } else {
+                    s.topbar_filetree_show_tip
+                };
+                if ft_resp.on_hover_text(tip2).clicked() {
+                    out.toggle_filetree = Some(!view.filetree_visible);
+                }
+
+                ui.add_space(2.0);
+
+                // ① 显示/隐藏会话栏
+                let (sb_rect, sb_resp) =
+                    ui.allocate_exact_size(egui::vec2(VIEW_BTN, VIEW_BTN), egui::Sense::click());
+                {
+                    // 激活态（侧栏可见）用 fg，隐藏态用 fg_dim
+                    let fg = if view.sidebar_visible {
+                        pal.fg
+                    } else {
+                        pal.fg_dim
+                    };
+                    if sb_resp.hovered() {
+                        ui.painter().rect_filled(sb_rect, 3.0, pal.bg_highlight);
+                    }
+                    // 图标①：方框+左竖实条
+                    let c = sb_rect.center();
+                    let r = 4.5;
+                    let stroke = egui::Stroke::new(1.1, fg);
+                    // 外框
+                    ui.painter().rect_stroke(
+                        egui::Rect::from_center_size(c, egui::vec2(r * 2.0, r * 2.0)),
+                        0.0,
+                        stroke,
+                        egui::StrokeKind::Middle,
+                    );
+                    // 左侧实条（竖线）
+                    let bar_x = c.x - r * 0.5;
+                    let stroke_bar = egui::Stroke::new(2.5, fg);
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(bar_x, c.y - r * 0.7),
+                            egui::pos2(bar_x, c.y + r * 0.7),
+                        ],
+                        stroke_bar,
+                    );
+                }
+                let tip1 = if view.sidebar_visible {
+                    s.topbar_sidebar_hide_tip
+                } else {
+                    s.topbar_sidebar_show_tip
+                };
+                if sb_resp.on_hover_text(tip1).clicked() {
+                    out.toggle_sidebar = Some(!view.sidebar_visible);
+                }
+
+                ui.add_space(4.0);
+
                 // ── 左侧标题 + 拖动区（right_to_left 余下空间）───────────
                 // 用 left_to_right 子布局占满余下空间——仲裁规则：
                 //   · drag_started_by(Primary)  → 发 drag_title_bar 信号

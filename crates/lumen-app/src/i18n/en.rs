@@ -22,8 +22,6 @@ pub static STRINGS: Strings = Strings {
     wc_close: "Close",
     topbar_new_pane_tip: "New pane (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "Maximum {} panes",
-    topbar_reset_tip: "Reset pane sizes",
-    topbar_reset_disabled_tip: "Single pane needs no reset",
     topbar_not_logged_in: "Not logged in",
     menu_settings: "Settings",
     menu_keyboard_shortcuts: "Keyboard shortcuts",
@@ -88,8 +86,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "Password",
     login_btn: "Log in",
     // File tree UI
-    filetree_expand_tip: "Expand file tree (Ctrl+B)",
-    filetree_collapse_tip: "Collapse file tree (Ctrl+B)",
     filetree_refresh: "Refresh",
     filetree_refresh_tip: "Reload directory",
     filetree_search_tip: "Search file names",
@@ -161,4 +157,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "Name cannot contain control characters",
     validate_name_bad_chars: "Name cannot contain \\ / : * ? \" < > | characters",
     validate_name_trailing: "Name cannot end with a dot or space",
+    // Topbar view-toggle buttons (issue 7)
+    topbar_sidebar_show_tip: "Show session sidebar",
+    topbar_sidebar_hide_tip: "Hide session sidebar",
+    topbar_filetree_show_tip: "Show file tree (Ctrl+B)",
+    topbar_filetree_hide_tip: "Hide file tree (Ctrl+B)",
+    topbar_reset_layout_tip: "Reset pane sizes",
+    topbar_reset_layout_disabled_tip: "Only one pane, nothing to reset",
 };

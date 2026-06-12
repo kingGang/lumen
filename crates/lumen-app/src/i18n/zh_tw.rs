@@ -28,8 +28,6 @@ pub static STRINGS: Strings = Strings {
     wc_close: "關閉",
     topbar_new_pane_tip: "新增窗格 (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "最多 {} 個窗格",
-    topbar_reset_tip: "恢復窗格預設大小",
-    topbar_reset_disabled_tip: "單窗格無需復位",
     topbar_not_logged_in: "未登入",
     menu_settings: "設定",
     menu_keyboard_shortcuts: "鍵盤快捷鍵",
@@ -92,8 +90,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "密碼",
     login_btn: "登入",
     // 檔案樹 UI
-    filetree_expand_tip: "展開檔案樹 (Ctrl+B)",
-    filetree_collapse_tip: "收起檔案樹 (Ctrl+B)",
     filetree_refresh: "重新整理",
     filetree_refresh_tip: "重新讀取目錄",
     filetree_search_tip: "搜尋檔案名稱",
@@ -165,4 +161,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名稱不能包含控制字元",
     validate_name_bad_chars: "名稱不能包含 \\ / : * ? \" < > | 字元",
     validate_name_trailing: "名稱不能以點或空格結尾",
+    // 頂欄三視圖切換按鈕（問題7）
+    topbar_sidebar_show_tip: "顯示工作階段欄",
+    topbar_sidebar_hide_tip: "隱藏工作階段欄",
+    topbar_filetree_show_tip: "顯示檔案樹 (Ctrl+B)",
+    topbar_filetree_hide_tip: "隱藏檔案樹 (Ctrl+B)",
+    topbar_reset_layout_tip: "還原窗格預設大小",
+    topbar_reset_layout_disabled_tip: "單一窗格無需復位",
 };

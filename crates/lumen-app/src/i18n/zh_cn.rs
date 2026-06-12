@@ -22,8 +22,6 @@ pub static STRINGS: Strings = Strings {
     wc_close: "关闭",
     topbar_new_pane_tip: "新增窗格 (Ctrl+Shift+D)",
     topbar_max_panes_fmt: "最多 {} 个窗格",
-    topbar_reset_tip: "恢复窗格默认大小",
-    topbar_reset_disabled_tip: "单窗格无需复位",
     topbar_not_logged_in: "未登录",
     menu_settings: "设置",
     menu_keyboard_shortcuts: "键盘快捷键",
@@ -86,8 +84,6 @@ pub static STRINGS: Strings = Strings {
     login_password_hint: "密码",
     login_btn: "登录",
     // 文件树 UI
-    filetree_expand_tip: "展开文件树 (Ctrl+B)",
-    filetree_collapse_tip: "收起文件树 (Ctrl+B)",
     filetree_refresh: "刷新",
     filetree_refresh_tip: "重新读取目录",
     filetree_search_tip: "搜索文件名",
@@ -159,4 +155,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名称不能包含控制字符",
     validate_name_bad_chars: "名称不能包含 \\ / : * ? \" < > | 字符",
     validate_name_trailing: "名称不能以点或空格结尾",
+    // 顶栏三视图切换按钮（问题7）
+    topbar_sidebar_show_tip: "显示会话栏",
+    topbar_sidebar_hide_tip: "隐藏会话栏",
+    topbar_filetree_show_tip: "显示文件树 (Ctrl+B)",
+    topbar_filetree_hide_tip: "隐藏文件树 (Ctrl+B)",
+    topbar_reset_layout_tip: "恢复窗格默认大小",
+    topbar_reset_layout_disabled_tip: "单窗格无需复位",
 };

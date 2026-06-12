@@ -136,6 +136,10 @@ pub struct Renderer {
     /// RGB 分量会被加色叠加到背景图上，导致颜色泄漏（发白/发亮）。
     /// 全透明（RGBA=0）则终端像素完整覆盖背景图对应区域，无泄漏。
     transparent_background: bool,
+    /// footer 上边框颜色（问题5）：由外壳层在主题切换时通过
+    /// [`Self::set_footer_border_color`] 注入，对齐全 app 的
+    /// `panel_outline` 描边色；默认值为深色板 #4a4a4a。
+    footer_border_color: Rgb,
 }
 
 impl Renderer {
@@ -224,6 +228,8 @@ impl Renderer {
             cell_h,
             padding: PADDING * scale_factor,
             transparent_background: false,
+            // 问题5：默认深色板 panel_outline #4a4a4a（主题应用时由外壳覆写）。
+            footer_border_color: Rgb(0x4a, 0x4a, 0x4a),
         })
     }
 
@@ -280,6 +286,14 @@ impl Renderer {
     /// `false` 时恢复主题背景色 Clear（默认行为）。
     pub fn set_transparent_background(&mut self, enabled: bool) {
         self.transparent_background = enabled;
+    }
+
+    /// 设置 footer 上边框颜色（问题5）。
+    ///
+    /// 应在主题切换时由外壳层调用，传入当前生效色板的 `panel_outline`
+    /// 分量（R/G/B，sRGB 值域 0–255），对齐全 app 面板描边语义。
+    pub fn set_footer_border_color(&mut self, r: u8, g: u8, b: u8) {
+        self.footer_border_color = Rgb(r, g, b);
     }
 
     /// 行级排版缓存整体失效（字体/字号/主题变更后调用，全窗格）。
@@ -671,11 +685,12 @@ impl Renderer {
                         size: [footer_w, footer_px],
                         color: bg.to_linear_f32(1.0),
                     });
-                    // 上边框 1px（前景色 20% 透明度）。
+                    // 上边框 1px（问题5：使用 panel_outline 描边色，
+                    // 由外壳层在主题切换时通过 set_footer_border_color 注入）。
                     instances.push(rect::RectInstance {
                         pos: [0.0, footer_top],
                         size: [footer_w, 1.0],
-                        color: self.theme.foreground.to_linear_f32(0.25),
+                        color: self.footer_border_color.to_linear_f32(1.0),
                     });
 
                     // Compose 态：竖条光标（宽 2px，前景色全不透明）。

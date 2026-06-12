@@ -139,6 +139,15 @@ pub struct LayoutSettings {
     pub sidebar_width: f32,
     /// 中间文件树栏宽度（逻辑像素，展开态；收起窄条宽度固定不存）。
     pub filetree_width: f32,
+    /// 左侧会话栏是否可见（问题7）：true = 显示（默认），false = 隐藏。
+    /// `#[serde(default)]` 保证旧文件缺字段时补 true（与 Default 一致）。
+    #[serde(default = "default_sidebar_visible")]
+    pub sidebar_visible: bool,
+}
+
+/// sidebar_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
+fn default_sidebar_visible() -> bool {
+    true
 }
 
 impl Default for LayoutSettings {
@@ -146,6 +155,7 @@ impl Default for LayoutSettings {
         Self {
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             filetree_width: FILETREE_WIDTH_DEFAULT,
+            sidebar_visible: true,
         }
     }
 }
@@ -331,6 +341,14 @@ impl Settings {
                     "filetree_width",
                     "layout.filetree_width",
                     d.filetree_width,
+                    path,
+                );
+                // sidebar_visible（问题7）：旧文件缺字段静默补 true。
+                s.layout.sidebar_visible = lenient_field(
+                    ly,
+                    "sidebar_visible",
+                    "layout.sidebar_visible",
+                    d.sidebar_visible,
                     path,
                 );
             } else {
@@ -561,6 +579,7 @@ mod tests {
             layout: LayoutSettings {
                 sidebar_width: 260.0,
                 filetree_width: 320.0,
+                sidebar_visible: true,
             },
             language: crate::i18n::Language::ZhTw,
         };

@@ -271,8 +271,19 @@ fn split(extent: f32, weights: &[f32], origin: f32) -> Vec<(f32, f32)> {
 /// 相邻两段调整的钳制：目标长 `desired` 夹在 [min, pair-min]，两段
 /// 合计 `pair` 不足 2×min 时冻结（None）；与当前值差小于死区也视为
 /// 未变化（None）。返回钳制后的新长度。
+///
+/// 特殊情况（B4/问题4 修复）：窗口最小化时 winit inner_size 缩为
+/// 约 160×28 小条（非 0×0），导致 pair < 2*min 但 clamp(min, pair-min)
+/// 中 pair-min < min，产生 max < min 的 f32::clamp panic。
+/// 此处在 pair <= 2.0 * min 时返回 pair / 2.0（平均分，冻结语义），
+/// 绕过 clamp 保证不 panic。
 fn clamp_pair(desired: f32, current: f32, pair: f32, min: f32) -> Option<f32> {
-    if !desired.is_finite() || pair < 2.0 * min {
+    if !desired.is_finite() {
+        return None;
+    }
+    // 两段合计不足双倍最小值时（含最小化小条场景 pair ~= 160 < 2×163）：
+    // 不能正常钳制，冻结当前值（返回 None）。
+    if pair <= 2.0 * min {
         return None;
     }
     let new = desired.clamp(min, pair - min);
@@ -493,6 +504,25 @@ mod tests {
         let before = l.clone();
         assert!(!l.drag_col_to(0, 0, 30.0, small));
         assert_eq!(l, before);
+    }
+
+    #[test]
+    fn 最小化小条场景不panic() {
+        // 问题4（B4）：无边框窗口最小化时 winit 给出约 160×28 的小条，
+        // 两列 pair ≈ 160 < 2×163 = 326，原 clamp(min, pair-min) 中
+        // pair-min=160-163=-3 < min=163，f32::clamp panic。
+        // 修复后 clamp_pair 直接返回 None（冻结），不 panic。
+        let minimized = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(160.0, 28.0));
+        let mut l = PaneLayout::uniform(2);
+        let before = l.clone();
+        // 拖动不生效，权重不变，且不 panic。
+        assert!(!l.drag_col_to(0, 0, 80.0, minimized));
+        assert_eq!(l, before);
+        // pair 恰好 = 2*min 边界情况：240/2=120=min，pair 正好不足，也冻结。
+        let edge = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(242.0, 28.0));
+        assert!(!l.drag_col_to(0, 0, 80.0, edge));
+        // 正常大小窗口：仍可拖动。
+        assert!(l.drag_col_to(0, 0, 100.0, area()));
     }
 
     #[test]

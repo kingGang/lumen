@@ -51,9 +51,6 @@ use egui_ltreeview::{Action, NodeBuilder, TreeView, TreeViewBuilder, TreeViewSta
 use super::theme;
 use super::toast::ToastKind;
 
-/// 收起后保留的窄条宽度（容纳展开按钮，保证可发现性）。展开态宽度
-/// 可拖动调整（P10），默认值与范围见 crate::settings。
-const STRIP_WIDTH: f32 = 22.0;
 /// 单层最多展示的条目数。
 const MAX_ENTRIES_PER_DIR: usize = 1000;
 /// 目录枚举的硬上限（含被展示的部分）：超大目录（十万级）只枚举到
@@ -324,13 +321,13 @@ impl FileTreeState {
     }
 
     /// 文件树栏当前实际占用宽度（逻辑点）：展开时为用户设置的展开宽度，
-    /// 收起时为窄条固定宽度 [`STRIP_WIDTH`]。new_pane() 预计算新窗格
-    /// 尺寸时用此值估算终端工作区，保证 spawn 尺寸与首帧布局一致。
+    /// 收起时返回 0.0（问题7：收起态不再画窄条，不占用任何宽度）。
+    /// new_pane() 预计算新窗格尺寸时用此值估算终端工作区。
     pub fn effective_width(&self, expanded_width: f32) -> f32 {
         if self.visible {
             expanded_width
         } else {
-            STRIP_WIDTH
+            0.0
         }
     }
 
@@ -642,6 +639,9 @@ pub fn show(
         st.dispatch_search();
     }
 
+    // 问题7：收起态不再画窄条（开合由顶栏②与 Ctrl+B 管）。
+    // 展开态照常画完整面板（可拖宽）；隐藏态不画任何面板，panel_rect
+    // 保持 None——mod.rs 的描边与拖宽手柄逻辑对 None 已做跳过处理。
     if st.visible {
         let resp = egui::Panel::left("lumen_filetree")
             .default_size(width)
@@ -656,29 +656,9 @@ pub fn show(
             .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, &mut out));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
-    } else {
-        let strip_resp = egui::Panel::left("lumen_filetree_strip")
-            .exact_size(STRIP_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(pal.filetree_fill)
-                    .inner_margin(egui::Margin::symmetric(1, 8)),
-            )
-            .show_inside(root, |ui| {
-                let btn =
-                    egui::Button::new(egui::RichText::new("▶").size(9.0).color(pal.fg_dim)).small();
-                if ui
-                    .add(btn)
-                    .on_hover_text(crate::i18n::strings().filetree_expand_tip)
-                    .clicked()
-                {
-                    st.visible = true;
-                }
-            });
-        out.panel_rect = Some(strip_resp.response.rect);
     }
+    // else：st.visible == false → 不画任何面板，panel_rect = None，
+    // panel_width = None（mod.rs 已处理 None 跳过描边/手柄逻辑）。
 
     // 对话框（新建输入/删除确认）：模态层，面板收起时也照常显示。
     dialog_ui(root.ctx(), st, pal, &mut out);
@@ -705,18 +685,10 @@ fn panel_ui(
     pal: &theme::Palette,
     out: &mut FileTreeOutput,
 ) {
-    // —— 工具条：收起按钮 + 根目录名（悬停看全路径）+ 搜索/刷新 ——
+    // —— 工具条：根目录名（悬停看全路径）+ 搜索/刷新 ——
+    // 问题7：收起按钮已删除（开合由顶栏②与 Ctrl+B 统一管理）。
     let s = crate::i18n::strings();
     ui.horizontal(|ui| {
-        let collapse =
-            egui::Button::new(egui::RichText::new("◀").size(9.0).color(pal.fg_dim)).small();
-        if ui
-            .add(collapse)
-            .on_hover_text(s.filetree_collapse_tip)
-            .clicked()
-        {
-            st.visible = false;
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let refresh = egui::Button::new(
                 egui::RichText::new(s.filetree_refresh)
