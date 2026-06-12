@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+## 输入编辑器 footer 渲染（M4.1 批C）：ComposerView 数据结构 +
+## footer 区域绘制 + grid 扣高。默认开启；剔除时行为与现状逐字节一致。
+input-editor = []
+default = ["input-editor"]
+
 [dependencies]
 anyhow.workspace = true
 bytemuck.workspace = true

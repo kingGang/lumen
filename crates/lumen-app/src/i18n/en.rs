@@ -144,6 +144,10 @@ pub static STRINGS: Strings = Strings {
     // M4.1 batch B
     toast_fallback_enabled: "Classic passthrough enabled (Ctrl+Shift+E to disable)",
     toast_fallback_disabled: "Classic passthrough disabled, smart routing restored",
+    // M4.1 batch C: footer status bar strings
+    footer_label_compose: "Compose",
+    footer_running_text: "Running… (passthrough)",
+    footer_label_running: "Running",
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",

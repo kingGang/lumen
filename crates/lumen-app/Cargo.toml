@@ -9,6 +9,13 @@ license.workspace = true
 name = "lumen"
 path = "src/main.rs"
 
+[features]
+## 输入编辑器 footer 渲染（M4.1 批C）——设计稿 §7.1。
+## 默认开启；剔除时所有 footer 渲染/占高逻辑被完全移除，
+## 行为与旧版逐字节一致。
+input-editor = ["lumen-renderer/input-editor"]
+default = ["input-editor"]
+
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true

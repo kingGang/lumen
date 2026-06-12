@@ -148,6 +148,10 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批B
     toast_fallback_enabled: "傳統直通模式已開啟（Ctrl+Shift+E 關閉）",
     toast_fallback_disabled: "傳統直通模式已關閉，恢復智慧路由",
+    // M4.1 批C：footer 狀態條文案
+    footer_label_compose: "編輯",
+    footer_running_text: "執行中…（直通模式）",
+    footer_label_running: "執行中",
     // 登入校驗
     login_err_invalid_email: "電子郵件格式不正確（需形如 name@example.com）",
     login_err_empty_password: "請輸入密碼",

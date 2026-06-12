@@ -290,6 +290,19 @@ pub struct Strings {
     /// 关闭经典直通模式的 toast（Ctrl+Shift+E 关闭）
     pub toast_fallback_disabled: &'static str,
 
+    // ── M4.1 批C：footer 状态条文案（input-editor feature）──────────
+    // 字段在 feature 剔除时不被读取（dead_code）；用 cfg_attr 消除警告，
+    // 字段仍保留在 struct 内（三语编译期完备性要求不能 cfg 删字段）。
+    /// Compose 态模式标签（footer 右角）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub footer_label_compose: &'static str,
+    /// Running 态状态条主文案（等高状态条中央文本）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub footer_running_text: &'static str,
+    /// Running 态模式标签（footer 右角）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub footer_label_running: &'static str,
+
     // ── profile 校验错误（UI 侧翻译）────────────────────────────────
     /// 邮箱格式不正确
     pub login_err_invalid_email: &'static str,

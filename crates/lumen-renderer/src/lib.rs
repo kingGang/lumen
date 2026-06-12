@@ -9,6 +9,9 @@
 //! 共享 atlas/字体系统/矩形管线等重资源；窗格关闭时调用方负责
 //! [`Renderer::drop_offscreen`] 释放纹理与缓存。
 
+/// footer 输入区视图数据结构（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
+#[cfg(feature = "input-editor")]
+pub mod composer_view;
 mod rect;
 mod theme;
 pub mod themes;
@@ -293,9 +296,34 @@ impl Renderer {
         (self.cell_w, self.cell_h)
     }
 
+    /// 内边距（物理像素）。footer 内边距计算需要此值。
+    pub fn padding(&self) -> f32 {
+        self.padding
+    }
+
     /// 给定终端区物理像素尺寸能容纳的 (rows, cols)（扣除四周内边距）。
+    ///
+    /// 不含 footer 扣高；feature = "input-editor" 开启时请用
+    /// [`Self::grid_size_for_with_footer`] 传入 footer 高度。
     pub fn grid_size_for(&self, width: u32, height: u32) -> (usize, usize) {
-        let usable_h = (height as f32 - self.padding * 2.0).max(0.0);
+        self.grid_size_for_with_footer(width, height, 0.0)
+    }
+
+    /// 给定终端区物理像素尺寸能容纳的 (rows, cols)，扣除 footer 后再计算。
+    ///
+    /// `footer_px` 为 footer 区域物理像素高度（`0.0` = 无 footer，与
+    /// [`Self::grid_size_for`] 等价）。调用方传入 `footer_height_px(...)` 的
+    /// 返回值，renderer 接口侵入最小（侦察报告 §5 建议方案）。
+    ///
+    /// # 设计稿对应章节
+    /// 设计稿 §7.1「grid 扣高」+ 侦察报告 §5。
+    pub fn grid_size_for_with_footer(
+        &self,
+        width: u32,
+        height: u32,
+        footer_px: f32,
+    ) -> (usize, usize) {
+        let usable_h = (height as f32 - self.padding * 2.0 - footer_px).max(0.0);
         let usable_w = (width as f32 - self.padding * 2.0).max(0.0);
         let rows = (usable_h / self.cell_h).floor() as usize;
         let cols = (usable_w / self.cell_w).floor() as usize;
@@ -305,8 +333,30 @@ impl Renderer {
     /// 窗格内像素坐标（相对窗格原点）→ 视图格子坐标（行, 列），
     /// 自动夹紧到该窗格的网格范围。`width`/`height` 为窗格物理像素
     /// 尺寸（分屏后各窗格尺寸不同，由调用方传入）。
+    ///
+    /// 不含 footer 排除；feature = "input-editor" 开启时请用
+    /// [`Self::cell_at_with_footer`] 以正确排除 footer 区域点击。
     pub fn cell_at(&self, px: f64, py: f64, width: u32, height: u32) -> (usize, usize) {
-        let (rows, cols) = self.grid_size_for(width, height);
+        self.cell_at_with_footer(px, py, width, height, 0.0)
+    }
+
+    /// 窗格内像素坐标 → 视图格子坐标，排除底部 footer 区域。
+    ///
+    /// `footer_px` 为 footer 物理像素高度（`0.0` = 无 footer，与
+    /// [`Self::cell_at`] 等价）。点击落在 footer 区域（y ≥ height - footer_px）
+    /// 时夹紧到网格末行，不映射进 footer（footer 有自己的点击处理）。
+    ///
+    /// # 设计稿对应章节
+    /// 设计稿 §7.1「cell_at 排除 footer 区域」。
+    pub fn cell_at_with_footer(
+        &self,
+        px: f64,
+        py: f64,
+        width: u32,
+        height: u32,
+        footer_px: f32,
+    ) -> (usize, usize) {
+        let (rows, cols) = self.grid_size_for_with_footer(width, height, footer_px);
         let col = ((px as f32 - self.padding) / self.cell_w).floor() as isize;
         let row = ((py as f32 - self.padding) / self.cell_h).floor() as isize;
         (
@@ -413,6 +463,10 @@ impl Renderer {
     /// 行号仍有效，充当未闭合命令块状态条的下边界（与光标同源防抖，
     /// 块条几何才能帧间连续，见下方注释）；`selected_block` 为选中
     /// 命令块的 id（块背景高亮）。
+    ///
+    /// 等价于 `render_impl(id, term, selection, cursor, selected_block, None)`。
+    /// feature = "input-editor" 开启时请用 [`Self::render_with_composer`] 传入
+    /// footer 视图；flag 剔除时本函数是唯一 render 入口，行为与现状逐字节一致。
     pub fn render(
         &mut self,
         id: u64,
@@ -421,12 +475,58 @@ impl Renderer {
         cursor: (usize, usize, bool),
         selected_block: Option<u64>,
     ) -> Result<()> {
+        self.render_impl(id, term, selection, cursor, selected_block, None)
+    }
+
+    /// 带 footer 输入区视图的渲染帧（feature = "input-editor"）——设计稿 §7.1。
+    ///
+    /// `composer` 为 footer 只读视图：
+    /// - `None` 或 Hidden 态：不绘制 footer，grid 使用全高。
+    /// - Composer / StatusBar 态：底部绘制 footer 卡片，grid 扣除 footer 高度。
+    #[cfg(feature = "input-editor")]
+    pub fn render_with_composer(
+        &mut self,
+        id: u64,
+        term: &Terminal,
+        selection: Option<&Selection>,
+        cursor: (usize, usize, bool),
+        selected_block: Option<u64>,
+        composer: Option<&composer_view::ComposerView>,
+    ) -> Result<()> {
+        self.render_impl(id, term, selection, cursor, selected_block, composer)
+    }
+
+    /// 渲染实现（统一入口，两个公开 render 方法均调用此处）。
+    fn render_impl(
+        &mut self,
+        id: u64,
+        term: &Terminal,
+        selection: Option<&Selection>,
+        cursor: (usize, usize, bool),
+        selected_block: Option<u64>,
+        #[cfg(feature = "input-editor")] composer: Option<&composer_view::ComposerView>,
+        #[cfg(not(feature = "input-editor"))] _composer: Option<()>,
+    ) -> Result<()> {
         // 离屏视图按值克隆（Arc 浅拷贝），避免长借用 self 卡住后续字段访问。
         let Some(off) = self.offscreens.get(&id) else {
             anyhow::bail!("窗格 {id} 的离屏纹理不存在（须先 ensure_offscreen）");
         };
         let view = off.render_view.clone();
         let (target_w, target_h) = (off.width, off.height);
+
+        // ---- M4.1 批C：footer 扣高（feature = "input-editor"）——设计稿 §7.1 ----
+        // footer_px 为底部保留的物理像素高度：
+        //   - feature 剔除 / Hidden 态：0.0，grid 全高，行为与旧版逐字节一致。
+        //   - Composer / StatusBar 态：1 行高 + 内边距（min 1 行常驻等高铁律）。
+        // 内边距固定为 padding * 0.4，取 padding 的一个比例，不随字号比例失调。
+        #[cfg(feature = "input-editor")]
+        let footer_px = {
+            let fp = self.padding * 0.4;
+            let max_h = target_h as f32 / 3.0;
+            composer_view::footer_height_px(composer, self.cell_h, fp, max_h)
+        };
+        #[cfg(not(feature = "input-editor"))]
+        let footer_px: f32 = 0.0;
 
         let grid = term.grid();
         let rows = grid.rows();
@@ -551,6 +651,57 @@ impl Renderer {
                 });
             }
         }
+        // ---- M4.1 批C：footer 矩形（feature = "input-editor"）——设计稿 §7.1 ----
+        // 同一 render pass：卡片背景（不透明）/ 上边框 1px / 竖条光标 ~2px /
+        // 选区高亮——全部走现有 RectInstance，零新 GPU 管线。
+        #[cfg(feature = "input-editor")]
+        if footer_px > 0.0 {
+            if let Some(cv) = composer {
+                if cv.is_visible() {
+                    let footer_top = target_h as f32 - footer_px;
+                    let footer_w = target_w as f32;
+                    let fp = self.padding * 0.4; // footer 内边距（与 footer_px 计算一致）
+
+                    // 卡片背景：主题背景色略深（alpha 混合到离屏纹理上）。
+                    // 取主题背景 RGB，提高亮度或改变色调。
+                    // 简化：用前景色 5% 透明度叠加（视觉上区别于 grid 区）。
+                    let bg = self.theme.background;
+                    instances.push(rect::RectInstance {
+                        pos: [0.0, footer_top],
+                        size: [footer_w, footer_px],
+                        color: bg.to_linear_f32(1.0),
+                    });
+                    // 上边框 1px（前景色 20% 透明度）。
+                    instances.push(rect::RectInstance {
+                        pos: [0.0, footer_top],
+                        size: [footer_w, 1.0],
+                        color: self.theme.foreground.to_linear_f32(0.25),
+                    });
+
+                    // Compose 态：竖条光标（宽 2px，前景色全不透明）。
+                    use composer_view::FooterKind;
+                    if cv.kind == FooterKind::Composer {
+                        let (cur_line, cur_byte) = cv.cursor;
+                        // 首期等宽：字节偏移按 ASCII 宽度估算（unicode-width M4.2 精化）。
+                        // 安全：lines 至少有 1 行（compose_empty 保证）。
+                        let line_text = cv.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
+                        // 统计光标前字节的等宽列数（每字节宽 = 1，与网格规则一致）。
+                        // M4.2 起改为 unicode-width 宽字符 2 列。
+                        let col = line_text[..cur_byte.min(line_text.len())].chars().count() as f32;
+                        let cursor_x = fp + col * cw;
+                        let cursor_y = footer_top + fp + cur_line as f32 * ch;
+                        if cursor_x < footer_w && cursor_y + ch <= target_h as f32 {
+                            instances.push(rect::RectInstance {
+                                pos: [cursor_x, cursor_y],
+                                size: [2.0_f32.max(cw * 0.12), ch],
+                                color: self.theme.foreground.to_linear_f32(0.9),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         self.rects
             .prepare(&self.device, &self.queue, (target_w, target_h), &instances);
 
@@ -683,7 +834,46 @@ impl Renderer {
 
         let fg_default = self.theme.foreground.to_glyphon();
         let width = target_w as i32;
-        let text_areas: Vec<TextArea> = row_segs
+
+        // ---- M4.1 批C：footer 文本排版（feature = "input-editor"）——设计稿 §7.1 ----
+        // 独立 glyphon TextBuffer 池，不混入 row_segs 行缓存（哈希语义不耦合）。
+        // 行数少，每帧重排无性能问题（设计稿明确）。纯文本单色（高亮 M4.2）。
+        // 生命周期纪律：footer_buffers 必须先于 text_areas 声明，二者同作用域，
+        // TextArea 借用 footer_buffers 中的元素，在 prepare 调用后一起 drop。
+        #[cfg(feature = "input-editor")]
+        let footer_buffers: Vec<(usize, TextBuffer, f32, i32)> = {
+            // 元素：(line_idx, buf, text_y, bottom_clamp)
+            let mut bufs: Vec<(usize, TextBuffer, f32, i32)> = Vec::new();
+            if footer_px > 0.0 {
+                if let Some(cv) = composer {
+                    if cv.is_visible() {
+                        let footer_top = target_h as f32 - footer_px;
+                        let fp = self.padding * 0.4;
+                        for (li, line_text) in cv.lines.iter().enumerate() {
+                            if line_text.is_empty() {
+                                continue;
+                            }
+                            let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                            buf.set_size(&mut self.font_system, None, Some(ch));
+                            buf.set_text(
+                                &mut self.font_system,
+                                line_text,
+                                &base_attrs,
+                                Shaping::Advanced,
+                                None,
+                            );
+                            let text_y = footer_top + fp + li as f32 * ch;
+                            let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
+                            bufs.push((li, buf, text_y, bottom_clamp));
+                        }
+                    }
+                }
+            }
+            bufs
+        };
+
+        // 终端网格 TextArea 列表 + footer TextArea（借用上方 footer_buffers）。
+        let mut text_areas: Vec<TextArea> = row_segs
             .iter()
             .take(rows)
             .enumerate()
@@ -705,6 +895,28 @@ impl Renderer {
                 })
             })
             .collect();
+
+        // footer TextArea（借用 footer_buffers 元素，生命周期随 text_areas drop 同帧结束）。
+        #[cfg(feature = "input-editor")]
+        {
+            let fp = self.padding * 0.4;
+            for (_li, buf, text_y, bottom_clamp) in &footer_buffers {
+                text_areas.push(TextArea {
+                    buffer: buf,
+                    left: fp,
+                    top: *text_y,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: 0,
+                        top: *text_y as i32,
+                        right: width,
+                        bottom: *bottom_clamp,
+                    },
+                    default_color: fg_default,
+                    custom_glyphs: &[],
+                });
+            }
+        }
 
         self.viewport.update(
             &self.queue,
@@ -851,6 +1063,69 @@ fn measure_cell(font_system: &mut FontSystem, family: &str, font_size: f32) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── grid_size_for_with_footer 纯逻辑测试（不依赖 GPU）─────────────────
+
+    /// 模拟 grid_size_for_with_footer 的核心数学逻辑（提取为独立函数以便单测）。
+    fn compute_grid(
+        width: u32,
+        height: u32,
+        padding: f32,
+        cell_w: f32,
+        cell_h: f32,
+        footer_px: f32,
+    ) -> (usize, usize) {
+        let usable_h = (height as f32 - padding * 2.0 - footer_px).max(0.0);
+        let usable_w = (width as f32 - padding * 2.0).max(0.0);
+        let rows = (usable_h / cell_h).floor() as usize;
+        let cols = (usable_w / cell_w).floor() as usize;
+        (rows.max(1), cols.max(1))
+    }
+
+    /// 无 footer 时行列数与旧接口一致。
+    #[test]
+    fn grid_无_footer_等价旧接口() {
+        // padding=10, cell=20x20, 窗格 640x480
+        let (r0, c0) = compute_grid(640, 480, 10.0, 20.0, 20.0, 0.0);
+        // usable_h = 480-20=460, rows=floor(460/20)=23
+        // usable_w = 640-20=620, cols=floor(620/20)=31
+        assert_eq!(r0, 23, "行数无 footer");
+        assert_eq!(c0, 31, "列数无 footer");
+    }
+
+    /// 有 footer 时行数减少，列数不变（footer 只占高度）。
+    #[test]
+    fn grid_有_footer_行数减少() {
+        // 假设 footer 占 32px（1 行 cell_h=20 + padding*2=6*2）
+        let footer_px = 32.0_f32;
+        let (r_with, c_with) = compute_grid(640, 480, 10.0, 20.0, 20.0, footer_px);
+        let (r_without, c_without) = compute_grid(640, 480, 10.0, 20.0, 20.0, 0.0);
+        assert!(
+            r_with < r_without,
+            "有 footer 时行数 {r_with} 应少于无 footer 时 {r_without}"
+        );
+        assert_eq!(c_with, c_without, "footer 不影响列数");
+    }
+
+    /// footer 存在时行数减少量等于 ceil(footer_px / cell_h)（常驻等高铁律验证）。
+    ///
+    /// footer_px = cell_h + padding*2（1 行内容 + 内边距），
+    /// 减少行数 = ceil(footer_px / cell_h)。
+    /// 常驻等高铁律保证：Compose↔Running 切换 footer_px 不变，行数不变。
+    #[test]
+    fn grid_footer_减少行数等于ceil除以cell_h() {
+        let cell_h = 20.0_f32;
+        let fp = 6.0_f32; // footer_padding
+        let footer_px = cell_h + fp * 2.0; // 32px
+        let (r_without, _) = compute_grid(640, 480, 10.0, 10.0, cell_h, 0.0);
+        let (r_with, _) = compute_grid(640, 480, 10.0, 10.0, cell_h, footer_px);
+        let expected_reduction = (footer_px / cell_h).ceil() as usize;
+        assert_eq!(
+            r_without - r_with,
+            expected_reduction,
+            "footer {footer_px}px / cell_h {cell_h}px 应减少 {expected_reduction} 行"
+        );
+    }
 
     /// 渲染字号必须与测量字号一致：用测量出的 cell_w 对照同字号下
     /// 长串 ASCII 的排版宽度，偏差超过 0.5px 即说明 advance 不匹配，

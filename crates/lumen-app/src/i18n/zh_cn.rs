@@ -142,6 +142,10 @@ pub static STRINGS: Strings = Strings {
     // M4.1 批B
     toast_fallback_enabled: "经典直通模式已开启（Ctrl+Shift+E 关闭）",
     toast_fallback_disabled: "经典直通模式已关闭，恢复智能路由",
+    // M4.1 批C：footer 状态条文案
+    footer_label_compose: "编辑",
+    footer_running_text: "运行中…（直通模式）",
+    footer_label_running: "运行中",
     // 登录校验
     login_err_invalid_email: "邮箱格式不正确（需形如 name@example.com）",
     login_err_empty_password: "请输入密码",

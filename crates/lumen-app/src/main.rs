@@ -3,6 +3,9 @@
 
 mod action;
 mod background;
+/// footer 输入区视图组装（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
+#[cfg(feature = "input-editor")]
+mod composer;
 mod i18n;
 mod input;
 mod keymap;
@@ -726,13 +729,29 @@ impl AppState {
     /// 把当前鼠标像素位置换算成**焦点窗格**的选区端点（绝对行号）。
     /// cell_at 接相对窗格原点的坐标并按窗格尺寸夹紧；焦点窗格矩形
     /// 未知（首帧布局前）时返回 None。
+    ///
+    /// M4.1 批C：footer 区域（底部 footer_px 像素）的点击夹紧到末行，
+    /// 不映射进 footer（footer 有自己的点击处理，批D 实现）。
     fn sel_point_at_mouse(&self) -> Option<SelPoint> {
         let (x, y, w, h) = self.focused_pane_rect_px()?;
-        let (row, col) = self.renderer.cell_at(
+        // M4.1 批C：计算 footer 高度以排除 footer 区域的点击。
+        #[cfg(feature = "input-editor")]
+        let footer_px = {
+            let mode = mode::effective_mode(&self.focused_pane().term, self.force_fallback);
+            let cv = composer::compose_view_for_mode(mode);
+            let (_, cell_h) = self.renderer.cell_size();
+            let fp = self.renderer.padding() * 0.4;
+            let max_h = h / 3.0;
+            lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h)
+        };
+        #[cfg(not(feature = "input-editor"))]
+        let footer_px: f32 = 0.0;
+        let (row, col) = self.renderer.cell_at_with_footer(
             self.mouse_pos.0 - x as f64,
             self.mouse_pos.1 - y as f64,
             w.max(1.0) as u32,
             h.max(1.0) as u32,
+            footer_px,
         );
         Some(SelPoint {
             line: self.focused_pane().term.grid().view_top_abs_line() + row as u64,
@@ -992,6 +1011,9 @@ impl AppState {
         let new_pane_layout = PaneLayout::uniform(n + 1);
         let est_px = estimate_restored_pane_px(est_area, &new_pane_layout, n + 1, None, scale);
         // 估算不可用时兜底焦点窗格当前尺寸（防御，不应发生）。
+        // M4.1 批C 注：新窗格 spawn 时 term 尚无 block 数据 → Fallback 态 →
+        // footer_px=0，此处用 grid_size_for（等价 footer_px=0）正确。
+        // 首帧实际布局后 RedrawRequested 会按真实 footer 高度做精确 resize。
         let (rows, cols) = est_px
             .get(n)
             .map(|&(w, h)| self.renderer.grid_size_for(w, h))
@@ -1319,8 +1341,11 @@ impl App {
         // 按还原布局预切矩形估算（见 estimate_restored_pane_px——B2
         // 修复：旧实现全员按整区 spawn，首帧腰斩级缩行 resize 与首个
         // 提示符打印撞车，是症状①②的共同触发器）。
+        // M4.1 批C 注：初始化时 term 尚未 spawn（无 block 数据）→ Fallback →
+        // footer_px=0；此处 grid_size_for 等价 footer_px=0，正确。
+        // 首帧 RedrawRequested 按真实 footer 高度精确校正。
         let (rows, cols) = renderer.grid_size_for(term_w, term_h);
-        info!("终端尺寸: {rows} 行 x {cols} 列");
+        info!("终端尺寸: {rows} 行 x {cols} 列（初始化估算，footer 待首帧校正）");
         // 估算用终端工作区（逻辑点）：再扣文件树栏（启动时默认展开，
         // 宽度来自设置）。与首帧实际布局的残差只剩面板边距像素级出入。
         let filetree_px = (app_settings.layout.filetree_width * scale).round();
@@ -1374,6 +1399,8 @@ impl App {
                         }
                     }
                     // 估算不可用（防御，不应发生）回退整区行列。
+                    // M4.1 批C 注：恢复路径 term 尚未 spawn → Fallback → footer_px=0，
+                    // grid_size_for 等价 footer_px=0。首帧 RedrawRequested 校正。
                     let (est_rows, est_cols) = est_px
                         .get(pi)
                         .map(|&(w, h)| renderer.grid_size_for(w, h))
@@ -3110,7 +3137,51 @@ impl ApplicationHandler<PtyWake> for App {
                         // ——切换激活的首帧先走到这里 resize 再渲染，旧
                         // 行列的画面不会上屏。设置页改字号即时生效走的就
                         // 是这条链路：cell 尺寸变 → 行列数变 → resize。
-                        let (rows, cols) = state.renderer.grid_size_for(tw, th);
+                        //
+                        // M4.1 批C：footer 扣高（feature = "input-editor"）。
+                        // 聚焦窗格按当前模式计算 footer 高度；非聚焦窗格无 footer。
+                        // AltScreen / Fallback 隐藏 footer（footer_px=0）→ 一进一出
+                        // 各一次 resize，与整窗 resize 走同一路径（window_just_resized
+                        // 豁免已覆盖，见 B3-8 注释），不额外处理。
+                        // 常驻等高铁律：Compose↔Running footer_px 相同 → 不触发 resize。
+                        #[cfg(feature = "input-editor")]
+                        let footer_px_for_resize = {
+                            let pane_idx = i;
+                            let is_focused = state.tabs[state.active_tab].focused == pane_idx;
+                            if is_focused {
+                                let pane = &state.tabs[state.active_tab].panes[i];
+                                let mode = mode::effective_mode(&pane.term, state.force_fallback);
+                                let cv = composer::compose_view_for_mode(mode);
+                                let (_, cell_h) = state.renderer.cell_size();
+                                let fp = state.renderer.padding() * 0.4;
+                                let max_h = th as f32 / 3.0;
+                                lumen_renderer::composer_view::footer_height_px(
+                                    Some(&cv),
+                                    cell_h,
+                                    fp,
+                                    max_h,
+                                )
+                            } else {
+                                0.0_f32
+                            }
+                        };
+                        #[cfg(not(feature = "input-editor"))]
+                        let footer_px_for_resize: f32 = 0.0;
+                        let (rows, cols) =
+                            state
+                                .renderer
+                                .grid_size_for_with_footer(tw, th, footer_px_for_resize);
+                        // M4.1 批C 冒烟观测点：首帧可见 footer 占高生效。
+                        // 日志示例：「footer 占高 32px，网格 {rows}x{cols}
+                        //            （无 footer 时多 1-2 行）」
+                        if footer_px_for_resize > 0.0 {
+                            log::debug!(
+                                "M4.1 批C：窗格 id={} footer 占高 {:.0}px \
+                                 → 网格 {rows}x{cols}（窗格 {tw}x{th}）",
+                                state.tabs[state.active_tab].panes[i].id,
+                                footer_px_for_resize
+                            );
+                        }
                         let s = &mut state.tabs[state.active_tab].panes[i];
                         let (old_rows, old_cols) = {
                             let g = s.term.grid();
@@ -3166,6 +3237,16 @@ impl ApplicationHandler<PtyWake> for App {
                 // 合成（渲染计划在途，ESU 后补画）。
                 let mut rendered = 0usize;
                 if structure_unchanged {
+                    // M4.1 批C：按当前有效模式组装 ComposerView（feature = "input-editor"）。
+                    // 节拍纪律（设计稿 §7.4）：编辑器重绘直接 request_redraw，
+                    // 不挂 PTY debounce。此处仅按模式组装视图数据，无副作用。
+                    #[cfg(feature = "input-editor")]
+                    let footer_view = {
+                        let focused = state.focused_pane();
+                        let mode = mode::effective_mode(&focused.term, state.force_fallback);
+                        composer::compose_view_for_mode(mode)
+                    };
+
                     for (i, skip) in skip_pane.iter().enumerate() {
                         if *skip {
                             continue;
@@ -3176,13 +3257,36 @@ impl ApplicationHandler<PtyWake> for App {
                         // 防抖光标态整组传入：不可见时行号仍是运行中块
                         // 状态条的下边界（与光标同源防抖，块条几何帧间
                         // 连续）。
-                        if let Err(e) = state.renderer.render(
+                        // M4.1 批C：feature = "input-editor" 开启时用
+                        // render_with_composer 传入 footer 视图；flag 剔除时用 render。
+                        // 只有聚焦窗格显示 footer；非聚焦窗格传 None = 无 footer。
+                        // 批D 起按各窗格独立模式组装（多窗格各自有 footer）。
+                        #[cfg(feature = "input-editor")]
+                        let render_result = {
+                            let composer_view =
+                                if state.tabs[state.active_tab].focused == i {
+                                    Some(&footer_view)
+                                } else {
+                                    None
+                                };
+                            state.renderer.render_with_composer(
+                                s.id,
+                                &s.term,
+                                s.selection.as_ref(),
+                                s.cursor_displayed,
+                                s.selected_block,
+                                composer_view,
+                            )
+                        };
+                        #[cfg(not(feature = "input-editor"))]
+                        let render_result = state.renderer.render(
                             s.id,
                             &s.term,
                             s.selection.as_ref(),
                             s.cursor_displayed,
                             s.selected_block,
-                        ) {
+                        );
+                        if let Err(e) = render_result {
                             error!("渲染失败: {e:#}");
                         }
                         rendered += 1;
