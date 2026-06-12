@@ -6,6 +6,9 @@ mod background;
 /// footer 输入区视图组装（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
 #[cfg(feature = "input-editor")]
 mod composer;
+/// footer 鼠标事件处理：像素→Position、click-count 状态机、词/行选区（第十一轮）。
+#[cfg(feature = "input-editor")]
+mod footer_mouse;
 /// 命令历史库（M4.1 批D2，feature = "input-editor"）——设计稿 §8。
 #[cfg(feature = "input-editor")]
 mod history;
@@ -516,6 +519,20 @@ struct AppState {
     /// feature = "input-editor" 门控。
     #[cfg(feature = "input-editor")]
     ghost_cache: (u64, Option<String>),
+
+    // ── footer 鼠标状态机（第十一轮，feature = "input-editor"）──────────
+    /// footer 区域的鼠标是否正在拖选中（左键按住未松开）。
+    #[cfg(feature = "input-editor")]
+    footer_dragging: bool,
+    /// footer 拖选锚点（按下时记录，松开前不变）。
+    #[cfg(feature = "input-editor")]
+    footer_drag_anchor: lumen_editor::Position,
+    /// click-count 状态机（单击/双击/三击）。
+    #[cfg(feature = "input-editor")]
+    footer_click_state: footer_mouse::ClickState,
+    /// 右键菜单请求（含菜单弹出的窗口物理像素位置）；Some 时由 egui 帧弹出菜单。
+    #[cfg(feature = "input-editor")]
+    footer_context_menu_at: Option<(f64, f64)>,
 }
 
 /// 提交文本编码为 PTY 载荷（M4.1 批D1/D2）——设计稿 §3.2 步骤 2。
@@ -604,6 +621,38 @@ fn app_to_editor_action(ea: &action::EditAction) -> lumen_editor::EditAction {
         AEa::Redo => EEa::Redo,
         AEa::Clear => EEa::Clear,
     }
+}
+
+/// lumen_editor::EditAction → app 层 action::Action 转换（footer 鼠标路径用）。
+///
+/// 仅转换 footer 鼠标事件实际产生的 EditAction 变体（SetSelection / SelectAll）；
+/// 其余变体若意外传入，按 SelectAll 保守兜底（不应发生，加 debug 日志）。
+///
+/// # Errors
+/// 不返回 Result；映射失败以 debug log 标注。
+#[cfg(feature = "input-editor")]
+fn lumen_editor_action_to_app_action(ea: lumen_editor::EditAction) -> action::Action {
+    use action::{Action, EditAction as AEa, Position as APos, Selection as ASel};
+    use lumen_editor::EditAction as EEa;
+
+    let app_ea = match ea {
+        EEa::SetSelection(s) => AEa::SetSelection(ASel {
+            anchor: APos {
+                line: s.anchor.line,
+                byte: s.anchor.byte,
+            },
+            head: APos {
+                line: s.cursor.line,
+                byte: s.cursor.byte,
+            },
+        }),
+        EEa::SelectAll => AEa::SelectAll,
+        other => {
+            log::debug!("[footer_mouse] 意外的 EditAction: {other:?}，兜底 SelectAll");
+            AEa::SelectAll
+        }
+    };
+    Action::Edit(app_ea)
 }
 
 impl AppState {
@@ -960,6 +1009,104 @@ impl AppState {
                     self.window.request_redraw();
                     events.push(StateEvent::FallbackToggled(self.force_fallback));
                 }
+
+                // ── CopyEditorSelection（第十一轮，input-editor feature）──
+                // 复制 Compose 态编辑器选区文本到剪贴板。
+                // 有选区时复制并 toast；无选区时静默无操作。
+                #[cfg(feature = "input-editor")]
+                TermAction::CopyEditorSelection => {
+                    let view = self.tabs[ti].panes[pi].editor.view();
+                    if view.has_selection() {
+                        let sel = view.selection();
+                        let (start, end) = sel.ordered();
+                        // 从各行拼接选区文本
+                        let mut text = String::new();
+                        for row in start.line..=end.line {
+                            let line = view.line(row);
+                            let from = if row == start.line { start.byte } else { 0 };
+                            let to = if row == end.line {
+                                end.byte
+                            } else {
+                                line.len()
+                            };
+                            text.push_str(&line[from..to]);
+                            if row < end.line {
+                                text.push('\n');
+                            }
+                        }
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            if let Err(e) = cb.set_text(text.clone()) {
+                                log::warn!("复制编辑器选区失败: {e}");
+                                self.shell_state.toast.push(
+                                    shell::toast::ToastKind::Warn,
+                                    i18n::strings().toast_copy_failed,
+                                );
+                            } else {
+                                let preview: String = text.chars().take(40).collect();
+                                let preview = if text.len() > preview.len() {
+                                    format!("{preview}…")
+                                } else {
+                                    preview
+                                };
+                                self.shell_state.toast.push(
+                                    shell::toast::ToastKind::Info,
+                                    i18n::fmt1(i18n::strings().toast_copied_fmt, preview),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // ── CutEditorSelection（第十一轮，input-editor feature）───
+                // 剪切 Compose 态编辑器选区：复制 + 删除选区。
+                #[cfg(feature = "input-editor")]
+                TermAction::CutEditorSelection => {
+                    // 先复制（复用同一逻辑）
+                    let has_sel = self.tabs[ti].panes[pi].editor.view().has_selection();
+                    if has_sel {
+                        // 触发内部 CopyEditorSelection 逻辑（递归 dispatch 不合适，内联）
+                        // 用块作用域限制 view 借用，确保在访问 clipboard 前已释放。
+                        let text = {
+                            let view = self.tabs[ti].panes[pi].editor.view();
+                            let sel = view.selection();
+                            let (start, end) = sel.ordered();
+                            let mut t = String::new();
+                            for row in start.line..=end.line {
+                                let line = view.line(row);
+                                let from = if row == start.line { start.byte } else { 0 };
+                                let to = if row == end.line {
+                                    end.byte
+                                } else {
+                                    line.len()
+                                };
+                                t.push_str(&line[from..to]);
+                                if row < end.line {
+                                    t.push('\n');
+                                }
+                            }
+                            t
+                        };
+                        if let Some(cb) = self.clipboard.as_mut() {
+                            if let Err(e) = cb.set_text(text.clone()) {
+                                log::warn!("剪切编辑器选区（复制阶段）失败: {e}");
+                            }
+                        }
+                        // 删除选区
+                        let outcome = self.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::DeleteBackward);
+                        if outcome.doc_changed {
+                            self.window.request_redraw();
+                            events.push(StateEvent::EditorRevision(
+                                self.tabs[ti].panes[pi].editor.revision(),
+                            ));
+                        }
+                    }
+                }
+
+                // ── 无 feature 时的死代码分支（保持编译通过）─────────────
+                #[cfg(not(feature = "input-editor"))]
+                TermAction::CopyEditorSelection | TermAction::CutEditorSelection => {}
             },
         }
 
@@ -1050,6 +1197,64 @@ impl AppState {
         self.panel_resize_rects_px.iter().any(|(x, y, w, h)| {
             mx >= *x as f64 && my >= *y as f64 && mx < (*x + *w) as f64 && my < (*y + *h) as f64
         })
+    }
+
+    /// 焦点窗格 footer 区域的物理像素矩形 (x, y, w, h)。
+    ///
+    /// 与 `sel_point_at_mouse` 使用相同几何源（同函数计算 footer_px），
+    /// 确保命中判定与渲染几何一致、不漂移。
+    /// Compose/Fallback（可见）态才返回 Some；AltScreen/Hidden 态返回 None。
+    #[cfg(feature = "input-editor")]
+    fn focused_footer_rect_px(&self) -> Option<(f32, f32, f32, f32)> {
+        let (x, y, w, h) = self.focused_pane_rect_px()?;
+        let pane = self.focused_pane();
+        let mode = mode::effective_mode(&pane.term, self.force_fallback);
+        let cv = composer::compose_view_for_mode(
+            mode,
+            pane.editor.view(),
+            pane.preedit.clone(),
+            pane.exit_badge.clone(),
+            None,
+        );
+        if !cv.is_visible() {
+            return None;
+        }
+        let (_, cell_h) = self.renderer.cell_size();
+        let fp = self.renderer.padding() * 0.4;
+        let max_h = h / 3.0;
+        let footer_h =
+            lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h);
+        if footer_h <= 0.0 {
+            return None;
+        }
+        // footer 区域 = 窗格底部 footer_h 像素带
+        Some((x, y + h - footer_h, w, footer_h))
+    }
+
+    /// 当前鼠标位置是否落在焦点窗格的 footer 区域内（Compose/可见态）。
+    #[cfg(feature = "input-editor")]
+    fn mouse_on_footer(&self) -> bool {
+        let Some((fx, fy, fw, fh)) = self.focused_footer_rect_px() else {
+            return false;
+        };
+        let (mx, my) = self.mouse_pos;
+        mx >= fx as f64 && my >= fy as f64 && mx < (fx + fw) as f64 && my < (fy + fh) as f64
+    }
+
+    /// 当前鼠标物理像素位置换算为 footer 内相对坐标（相对 footer 左上角）。
+    /// 返回 (rel_x, rel_y, cell_w, cell_h, footer_padding, lines)，
+    /// 便于调用 `footer_mouse::pixel_to_position`。
+    #[cfg(feature = "input-editor")]
+    fn mouse_footer_relative(&self) -> Option<(f32, f32, f32, f32, f32, Vec<String>)> {
+        let (fx, fy, _fw, _fh) = self.focused_footer_rect_px()?;
+        let (mx, my) = self.mouse_pos;
+        let rel_x = mx as f32 - fx;
+        let rel_y = my as f32 - fy;
+        let (cell_w, cell_h) = self.renderer.cell_size();
+        let fp = self.renderer.padding() * 0.4;
+        let pane = self.focused_pane();
+        let lines: Vec<String> = pane.editor.view().lines().map(|l| l.to_owned()).collect();
+        Some((rel_x, rel_y, cell_w, cell_h, fp, lines))
     }
 
     /// 焦点窗格的物理像素矩形 (x, y, w, h)。首帧布局前/结构刚变更
@@ -1898,6 +2103,14 @@ impl App {
             history: history_store,
             #[cfg(feature = "input-editor")]
             ghost_cache: (0, None),
+            #[cfg(feature = "input-editor")]
+            footer_dragging: false,
+            #[cfg(feature = "input-editor")]
+            footer_drag_anchor: lumen_editor::Position::default(),
+            #[cfg(feature = "input-editor")]
+            footer_click_state: footer_mouse::ClickState::default(),
+            #[cfg(feature = "input-editor")]
+            footer_context_menu_at: None,
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -2571,6 +2784,9 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         state.ghost_cache.1.is_some()
                     },
+                    // 第十一轮：编辑器选区非空（Ctrl+C 第一级 / Ctrl+X 判断）
+                    #[cfg(feature = "input-editor")]
+                    has_editor_selection: state.tabs[ti].panes[pi].editor.view().has_selection(),
                 };
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
@@ -2739,8 +2955,46 @@ impl ApplicationHandler<PtyWake> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
-                if state.focused_pane().selecting {
-                    // 拖选跟随焦点窗格：端点按窗格矩形换算（cell_at 已
+
+                // ── footer 拖选跟踪（第十一轮，input-editor feature）────
+                #[cfg(feature = "input-editor")]
+                if state.footer_dragging {
+                    if let Some((rel_x, rel_y, cell_w, cell_h, fp, lines)) =
+                        state.mouse_footer_relative()
+                    {
+                        let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                        let cursor_pos = footer_mouse::clamped_position(
+                            rel_x, rel_y, cell_w, cell_h, fp, &line_refs,
+                        );
+                        let anchor = state.footer_drag_anchor;
+                        let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                        let old_sel = state.tabs[ti].panes[pi].editor.view().selection();
+                        let new_sel = lumen_editor::Selection {
+                            anchor,
+                            cursor: cursor_pos,
+                        };
+                        if old_sel != new_sel {
+                            state.dispatch(
+                                action::Action::Edit(action::EditAction::SetSelection(
+                                    action::Selection {
+                                        anchor: action::Position {
+                                            line: anchor.line,
+                                            byte: anchor.byte,
+                                        },
+                                        head: action::Position {
+                                            line: cursor_pos.line,
+                                            byte: cursor_pos.byte,
+                                        },
+                                    },
+                                )),
+                                ti,
+                                pi,
+                            );
+                        }
+                    }
+                    // 不再走终端拖选
+                } else if state.focused_pane().selecting {
+                    // 终端区拖选跟随焦点窗格：端点按窗格矩形换算（cell_at 已
                     // 夹紧，拖出窗格边界即收在边缘行列）。
                     if let Some(head) = state.sel_point_at_mouse() {
                         let mut moved = false;
@@ -2788,6 +3042,66 @@ impl ApplicationHandler<PtyWake> for App {
                     };
                     state.terminal_focused = true;
                     state.focus_pane(pi);
+
+                    // ── footer 区域分流（第十一轮，input-editor feature）─
+                    // Compose/可见态下点击 footer 区域时，不建终端选区，
+                    // 转入编辑器鼠标处理路径。键盘续走编辑器（terminal_focused=true 保持）。
+                    #[cfg(feature = "input-editor")]
+                    if state.mouse_on_footer() {
+                        if let Some((rel_x, rel_y, cell_w, cell_h, fp, lines)) =
+                            state.mouse_footer_relative()
+                        {
+                            let line_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+                            // 像素 → 编辑器位置
+                            let pos = footer_mouse::pixel_to_position(
+                                rel_x, rel_y, cell_w, cell_h, fp, &line_refs,
+                            );
+                            // 显示列（用于 click-count 位移检测）
+                            let display_col = (rel_x / cell_w.max(1.0)).floor() as usize;
+                            let row = pos.line;
+                            let kind = state.footer_click_state.record_click(
+                                row,
+                                display_col,
+                                std::time::Instant::now(),
+                            );
+
+                            let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+
+                            let action = match kind {
+                                footer_mouse::ClickKind::Single => {
+                                    let shift = state.modifiers.shift_key();
+                                    let cur_anchor =
+                                        state.tabs[ti].panes[pi].editor.view().selection().anchor;
+                                    footer_mouse::single_click_action(pos, shift, cur_anchor)
+                                }
+                                footer_mouse::ClickKind::Double => {
+                                    let line_text =
+                                        lines.get(pos.line).map(|s| s.as_str()).unwrap_or("");
+                                    let sel = footer_mouse::word_selection(pos, line_text);
+                                    lumen_editor::EditAction::SetSelection(sel)
+                                }
+                                footer_mouse::ClickKind::Triple => {
+                                    let line_text =
+                                        lines.get(pos.line).map(|s| s.as_str()).unwrap_or("");
+                                    let sel = footer_mouse::line_selection(pos, line_text);
+                                    lumen_editor::EditAction::SetSelection(sel)
+                                }
+                            };
+
+                            // 将 lumen_editor::EditAction 包装为 app 层 Action
+                            // 单击时记录锚点（拖选用）
+                            let app_action = lumen_editor_action_to_app_action(action);
+                            state.dispatch(app_action, ti, pi);
+
+                            // 记录拖选锚点（单击/双击/三击都可能继续拖）
+                            let new_anchor =
+                                state.tabs[ti].panes[pi].editor.view().selection().anchor;
+                            state.footer_drag_anchor = new_anchor;
+                            state.footer_dragging = true;
+                        }
+                        return;
+                    }
+
                     // 选区在点中的窗格（即新焦点窗格）建立。
                     let Some(p) = state.sel_point_at_mouse() else {
                         return;
@@ -2799,6 +3113,13 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Released) => {
+                    // footer 拖选结束（input-editor feature）。
+                    #[cfg(feature = "input-editor")]
+                    if state.footer_dragging {
+                        state.footer_dragging = false;
+                        return;
+                    }
+
                     // 本次按下不在窗格上（点的是 egui 面板）则与终端无关。
                     if !state.focused_pane().selecting {
                         return;
@@ -2826,7 +3147,18 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     };
                     state.focus_pane(pidx);
-                    // 右键：有选区则复制，否则粘贴（Windows Terminal 惯例）。
+                    state.terminal_focused = true;
+
+                    // ── footer 区域右键：弹出编辑器上下文菜单（第十一轮）─
+                    #[cfg(feature = "input-editor")]
+                    if state.mouse_on_footer() {
+                        // 记录弹出位置，egui 帧内渲染菜单（见 RedrawRequested 处理）
+                        state.footer_context_menu_at = Some(state.mouse_pos);
+                        state.window.request_redraw();
+                        return;
+                    }
+
+                    // 右键（终端区）：有选区则复制，否则粘贴（Windows Terminal 惯例）。
                     // 字段级下标：clipboard 需要同时可变借用。
                     let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
                     if state.tabs[ti].panes[pi].copy_selection(&mut state.clipboard) {
@@ -3194,6 +3526,11 @@ impl ApplicationHandler<PtyWake> for App {
                 // M3.8：传入当前窗口最大化态，顶栏据此切换最大化/还原图标。
                 let is_maximized = state.window.is_maximized();
                 let mut shell_out = None;
+                // footer 右键菜单请求（第十一轮）：egui Area 在帧内弹出。
+                #[cfg(feature = "input-editor")]
+                let footer_ctx_menu_req = state.footer_context_menu_at.take();
+                #[cfg(feature = "input-editor")]
+                let mut footer_ctx_action: Option<action::Action> = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
                     shell_out = Some(shell::show(
                         ui,
@@ -3202,6 +3539,61 @@ impl ApplicationHandler<PtyWake> for App {
                         app_settings,
                         is_maximized,
                     ));
+
+                    // ── footer 右键菜单（第十一轮，input-editor feature）──
+                    #[cfg(feature = "input-editor")]
+                    if let Some((mx, my)) = footer_ctx_menu_req {
+                        let scale = ui.ctx().pixels_per_point();
+                        // 物理像素 → egui 逻辑点
+                        let lx = mx as f32 / scale;
+                        let ly = my as f32 / scale;
+                        let s = crate::i18n::strings();
+                        // 查询编辑器选区（用于灰显判断）
+                        let has_sel = {
+                            let ti = state.active_tab;
+                            let pi = state.tabs[ti].focused;
+                            state.tabs[ti].panes[pi].editor.view().has_selection()
+                        };
+
+                        let area_resp = egui::Area::new(egui::Id::new("footer_ctx_menu"))
+                            .fixed_pos(egui::pos2(lx, ly))
+                            .order(egui::Order::Foreground)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    // 复制（有选区时可用）
+                                    let copy_btn =
+                                        ui.add_enabled(has_sel, egui::Button::new(s.ctx_menu_copy));
+                                    if copy_btn.clicked() {
+                                        // 复制编辑器选区（dispatch 内处理）
+                                        footer_ctx_action = Some(action::Action::Term(
+                                            action::TermAction::CopyEditorSelection,
+                                        ));
+                                    }
+                                    // 剪切（有选区时可用）
+                                    let cut_btn =
+                                        ui.add_enabled(has_sel, egui::Button::new(s.ctx_menu_cut));
+                                    if cut_btn.clicked() {
+                                        footer_ctx_action = Some(action::Action::Term(
+                                            action::TermAction::CutEditorSelection,
+                                        ));
+                                    }
+                                    // 粘贴（始终可用）
+                                    if ui.button(s.ctx_menu_paste).clicked() {
+                                        footer_ctx_action = Some(action::Action::Term(
+                                            action::TermAction::PasteClipboard,
+                                        ));
+                                    }
+                                    // 全选
+                                    if ui.button(s.ctx_menu_select_all).clicked() {
+                                        footer_ctx_action = Some(action::Action::Edit(
+                                            action::EditAction::SelectAll,
+                                        ));
+                                    }
+                                });
+                            });
+                        // Esc 或点击菜单外：关闭（Area 自然消失，不处理关闭信号）
+                        let _ = area_resp;
+                    }
                 });
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
@@ -3209,6 +3601,15 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.term_clicked {
                     state.terminal_focused = true;
                 }
+
+                // ── footer 右键菜单动作 dispatch（第十一轮）───────────────
+                #[cfg(feature = "input-editor")]
+                if let Some(ctx_action) = footer_ctx_action {
+                    let ti = state.active_tab;
+                    let pi = state.tabs[ti].focused;
+                    state.dispatch(ctx_action, ti, pi);
+                }
+
                 // 底部状态栏「经典模式」按钮：复用 ToggleFallback 同路径（M4.1 批E）。
                 #[cfg(feature = "input-editor")]
                 if shell_out.toggle_fallback {

@@ -173,6 +173,12 @@ pub enum TermAction {
     PasteClipboard,
     /// 切换经典直通模式（Ctrl+Shift+E，全模式可用）。
     ToggleFallback,
+    /// 复制编辑器选区文本到剪贴板（Compose 态 Ctrl+C 第一级，第十一轮）。
+    /// 有选区时复制选区；无选区时不操作（调用方已检查）。
+    CopyEditorSelection,
+    /// 剪切编辑器选区：复制选区 + 删除选区（Compose 态 Ctrl+X，第十一轮）。
+    /// 有选区时剪切；无选区时透传（直通 PTY）。
+    CutEditorSelection,
 }
 
 /// 翻屏方向。

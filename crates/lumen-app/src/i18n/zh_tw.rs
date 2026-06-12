@@ -167,6 +167,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名稱不能包含控制字元",
     validate_name_bad_chars: "名稱不能包含 \\ / : * ? \" < > | 字元",
     validate_name_trailing: "名稱不能以點或空格結尾",
+    // 輸入框右鍵選單（第十一輪）
+    ctx_menu_copy: "複製",
+    ctx_menu_cut: "剪下",
+    ctx_menu_paste: "貼上",
+    ctx_menu_select_all: "全選",
     // 側欄標題列（R8）
     sidebar_new_session_tip: "新增工作階段 (Ctrl+T)",
     // 頂欄三視圖切換按鈕（問題7）

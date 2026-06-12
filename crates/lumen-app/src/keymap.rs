@@ -111,6 +111,10 @@ pub struct GuardState {
     /// true = 有联想可接受；false = 无联想，→/End 正常移动光标。
     #[cfg(feature = "input-editor")]
     pub ghost_exists: bool,
+    /// Compose 态编辑器是否有非空选区（第十一轮）。
+    /// Ctrl+C 第一级（编辑器选区复制，优先于终端选区）、Ctrl+X 判断用。
+    #[cfg(feature = "input-editor")]
+    pub has_editor_selection: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -452,17 +456,30 @@ pub fn lookup_input(
             return Some(LookupResult::PassThrough);
         }
 
-        // 9-m: Ctrl+C（Compose 态三级逻辑）——设计稿 §4
-        //   选区非空 → 复制选区（第一级，M2 现状保留）
-        //   选中块 → 复制块输出（第二级，M2 现状保留）
+        // 9-m: Ctrl+C（Compose 态四级逻辑）——设计稿 §4 + 第十一轮
+        //   ★编辑器选区非空 → 复制编辑器选区（新增第一级，焦点在编辑器时优先）
+        //   终端选区非空 → 复制终端选区（第二级，M2 现状保留）
+        //   选中块 → 复制块输出（第三级，M2 现状保留）
         //   缓冲非空 → CancelLine（清空存放弃稿）
         //   缓冲为空 → Interrupt（下穿 ETX，逃生舱）
+        //
+        // E9 铁律：Running/AltScreen/Fallback 态在层 5 已无条件 Interrupt，
+        // 此层仅在 Compose 态可达，安全规则不受影响。
         if ctrl && !shift && is_char(input, 'c') {
+            // 第一级（新增）：编辑器选区非空 → 复制编辑器选区文本
+            #[cfg(feature = "input-editor")]
+            if guard.has_editor_selection {
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopyEditorSelection,
+                )));
+            }
+            // 第二级：终端选区非空 → 复制终端选区
             if guard.has_selection {
                 return Some(LookupResult::TerminalAction(Action::Term(
                     TermAction::CopySelection,
                 )));
             }
+            // 第三级：选中块 → 复制块输出
             if guard.has_selected_block {
                 return Some(LookupResult::TerminalAction(Action::Term(
                     TermAction::CopyBlock,
@@ -479,6 +496,20 @@ pub fn lookup_input(
                     ComposerAction::CancelLine,
                 )));
             }
+        }
+
+        // 9-m2: Ctrl+X（Compose 态剪切，第十一轮）
+        //   编辑器选区非空 → CutEditorSelection（复制+删除）
+        //   无选区 → 透传（直通 PTY，终端 Ctrl+X 原语义保留）
+        if ctrl && !shift && is_char(input, 'x') {
+            #[cfg(feature = "input-editor")]
+            if guard.has_editor_selection {
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CutEditorSelection,
+                )));
+            }
+            // 无选区：直通 PTY
+            return Some(LookupResult::PassThrough);
         }
 
         // 9-n: Ctrl+D
@@ -2013,6 +2044,158 @@ mod tests {
                 )))
             ),
             "Compose 态 Shift+→ 文末 + ghost → 应扩选而非接受 ghost"
+        );
+    }
+
+    // ── 第十一轮：Ctrl+C 编辑器选区第一级 / Ctrl+X ──────────────────────
+
+    #[test]
+    fn compose_ctrl_c_editor_selection_is_copy_editor_first() {
+        // 第十一轮：编辑器有选区时，Ctrl+C 第一级 → CopyEditorSelection
+        // 优先于终端选区（has_selection）、选中块（has_selected_block）
+        let guard = GuardState {
+            terminal_focused: true,
+            #[cfg(feature = "input-editor")]
+            has_editor_selection: true,
+            // 同时有终端选区：编辑器选区仍应优先
+            has_selection: true,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        #[cfg(feature = "input-editor")]
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopyEditorSelection
+                )))
+            ),
+            "Compose 态 Ctrl+C 编辑器有选区 → CopyEditorSelection（最高优先级）"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_c_no_editor_selection_falls_through_to_terminal_selection() {
+        // 编辑器无选区 + 终端有选区 → CopySelection（原第一级行为保留）
+        let guard = GuardState {
+            terminal_focused: true,
+            #[cfg(feature = "input-editor")]
+            has_editor_selection: false,
+            has_selection: true,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopySelection
+                )))
+            ),
+            "Compose 态 Ctrl+C 编辑器无选区 + 终端有选区 → CopySelection"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_x_with_editor_selection_is_cut() {
+        // 编辑器有选区时 Ctrl+X → CutEditorSelection
+        let guard = GuardState {
+            terminal_focused: true,
+            #[cfg(feature = "input-editor")]
+            has_editor_selection: true,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "x",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        #[cfg(feature = "input-editor")]
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CutEditorSelection
+                )))
+            ),
+            "Compose 态 Ctrl+X 有编辑器选区 → CutEditorSelection"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_x_no_editor_selection_is_passthrough() {
+        // 编辑器无选区时 Ctrl+X → PassThrough（直通 PTY）
+        let guard = GuardState {
+            terminal_focused: true,
+            #[cfg(feature = "input-editor")]
+            has_editor_selection: false,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "x",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "Compose 态 Ctrl+X 无编辑器选区 → PassThrough（直通 PTY）"
+        );
+    }
+
+    #[test]
+    fn running_ctrl_x_is_passthrough() {
+        // E9 自查：Running 态 Ctrl+X 直通无新增拦截
+        let result = lookup_char(
+            "x",
+            ModifiersState::CONTROL,
+            InputMode::Running,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "Running 态 Ctrl+X 应 PassThrough（不被拦截）"
+        );
+    }
+
+    #[test]
+    fn altscreen_ctrl_x_is_passthrough() {
+        // E9 自查：AltScreen 态 Ctrl+X 直通无新增拦截
+        let guard = GuardState {
+            terminal_focused: true,
+            is_alt_screen: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "x",
+            ModifiersState::CONTROL,
+            InputMode::AltScreen,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "AltScreen 态 Ctrl+X 应 PassThrough（不被拦截）"
         );
     }
 }

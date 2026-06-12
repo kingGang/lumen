@@ -161,6 +161,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "名称不能包含控制字符",
     validate_name_bad_chars: "名称不能包含 \\ / : * ? \" < > | 字符",
     validate_name_trailing: "名称不能以点或空格结尾",
+    // 输入框右键菜单（第十一轮）
+    ctx_menu_copy: "复制",
+    ctx_menu_cut: "剪切",
+    ctx_menu_paste: "粘贴",
+    ctx_menu_select_all: "全选",
     // 侧栏标题栏（R8）
     sidebar_new_session_tip: "新建会话 (Ctrl+T)",
     // 顶栏三视图切换按钮（问题7）

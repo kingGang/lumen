@@ -163,6 +163,11 @@ pub static STRINGS: Strings = Strings {
     validate_name_control_chars: "Name cannot contain control characters",
     validate_name_bad_chars: "Name cannot contain \\ / : * ? \" < > | characters",
     validate_name_trailing: "Name cannot end with a dot or space",
+    // Input box context menu (round 11)
+    ctx_menu_copy: "Copy",
+    ctx_menu_cut: "Cut",
+    ctx_menu_paste: "Paste",
+    ctx_menu_select_all: "Select All",
     // Sidebar title bar (R8)
     sidebar_new_session_tip: "New session (Ctrl+T)",
     // Topbar view-toggle buttons (issue 7)

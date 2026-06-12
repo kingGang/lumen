@@ -352,6 +352,20 @@ pub struct Strings {
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub composer_placeholder: &'static str,
 
+    // ── 输入框右键菜单（第十一轮）────────────────────────────────────
+    /// 右键菜单：复制
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub ctx_menu_copy: &'static str,
+    /// 右键菜单：剪切
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub ctx_menu_cut: &'static str,
+    /// 右键菜单：粘贴
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub ctx_menu_paste: &'static str,
+    /// 右键菜单：全选
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub ctx_menu_select_all: &'static str,
+
     // ── filetree 名字校验错误（UI 侧翻译）──────────────────────────
     /// 名称不能为空
     pub validate_name_empty: &'static str,
