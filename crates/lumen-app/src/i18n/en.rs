@@ -148,6 +148,10 @@ pub static STRINGS: Strings = Strings {
     footer_label_compose: "Compose",
     footer_running_text: "Running… (passthrough)",
     footer_label_running: "Running",
+    // M4.1 batch D1: Compose mode placeholder hints + Fallback status text
+    toast_compose_tab_hint: "Tab completion coming soon (M3.4)",
+    toast_compose_history_hint: "History search coming soon (D2)",
+    footer_fallback_text: "Shell integration inactive (classic passthrough)",
     // Login validation
     login_err_invalid_email: "Invalid email (expected format: name@example.com)",
     login_err_empty_password: "Please enter a password",

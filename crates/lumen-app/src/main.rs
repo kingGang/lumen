@@ -414,6 +414,84 @@ struct AppState {
     force_fallback: bool,
 }
 
+/// 提交文本编码为 PTY 载荷（M4.1 批D1）——设计稿 §3.2 步骤 2。
+///
+/// - 单行：`text + "\r"`
+/// - 多行：`"\x1b[200~" + text + "\x1b[201~\r"`（括号粘贴协议包裹）
+///
+/// 此纯函数无副作用，可独立单测。
+#[cfg(feature = "input-editor")]
+fn encode_submit(text: &str) -> Vec<u8> {
+    let line_count = text.lines().count();
+    if line_count > 1 {
+        let mut buf = Vec::with_capacity(text.len() + 14);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~\r");
+        buf
+    } else {
+        let mut buf = text.as_bytes().to_vec();
+        buf.push(b'\r');
+        buf
+    }
+}
+
+/// 将 app 层 [`action::EditAction`] 转换为 `lumen_editor::EditAction`（M4.1 批D1）。
+///
+/// 两个枚举结构相同；M4 阶段 app 层将直接引用 lumen_editor 的类型，届时此函数删除。
+///
+/// # Errors
+/// 本函数不返回 Result；任何映射失败（两枚举不同步）在编译期即可发现。
+#[cfg(feature = "input-editor")]
+fn app_to_editor_action(ea: &action::EditAction) -> lumen_editor::EditAction {
+    use action::{EditAction as AEa, Motion as AMotion};
+    use lumen_editor::EditAction as EEa;
+    use lumen_editor::Motion as EMotion;
+
+    /// 将 app 层 Motion 转为 editor 层 Motion。
+    fn to_motion(m: &AMotion) -> EMotion {
+        match m {
+            AMotion::GraphemeLeft => EMotion::GraphemeLeft,
+            AMotion::GraphemeRight => EMotion::GraphemeRight,
+            AMotion::WordLeft => EMotion::WordLeft,
+            AMotion::WordRight => EMotion::WordRight,
+            AMotion::LineStart => EMotion::LineStart,
+            AMotion::LineEnd => EMotion::LineEnd,
+            AMotion::Up => EMotion::Up,
+            AMotion::Down => EMotion::Down,
+            AMotion::DocStart => EMotion::DocStart,
+            AMotion::DocEnd => EMotion::DocEnd,
+        }
+    }
+
+    match ea {
+        AEa::InsertText(s) => EEa::InsertText(s.clone()),
+        AEa::InsertNewline => EEa::InsertNewline,
+        AEa::DeleteBackward => EEa::DeleteBackward,
+        AEa::DeleteForward => EEa::DeleteForward,
+        AEa::DeleteWordBackward => EEa::DeleteWordBackward,
+        AEa::Move { motion, extend } => EEa::Move {
+            motion: to_motion(motion),
+            extend: *extend,
+        },
+        AEa::SetSelection(s) => EEa::SetSelection(lumen_editor::Selection {
+            anchor: lumen_editor::Position {
+                line: s.anchor.line,
+                byte: s.anchor.byte,
+            },
+            cursor: lumen_editor::Position {
+                line: s.head.line,
+                byte: s.head.byte,
+            },
+        }),
+        AEa::SelectAll => EEa::SelectAll,
+        AEa::SetText(s) => EEa::SetText(s.clone()),
+        AEa::Undo => EEa::Undo,
+        AEa::Redo => EEa::Redo,
+        AEa::Clear => EEa::Clear,
+    }
+}
+
 impl AppState {
     /// 性能埋点：LUMEN_PERF 启用时写一行带时间戳的记录。
     fn perf_log(&mut self, msg: std::fmt::Arguments<'_>) {
@@ -524,14 +602,80 @@ impl AppState {
         let mut events = Vec::new();
 
         match action {
-            // ── Edit：批D 接编辑器时填充 ──────────────────────────────
+            // ── Edit：M4.1 批D1 —— 发给编辑器状态机 ──────────────────
+            #[cfg(feature = "input-editor")]
+            Action::Edit(ref ea) => {
+                // 双重门控：必须在 Compose 态才走编辑器路径
+                let current_mode =
+                    mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+                if current_mode == mode::InputMode::Compose {
+                    // app 层 EditAction → lumen_editor::EditAction 转换
+                    let editor_action = app_to_editor_action(ea);
+                    let _outcome = self.tabs[ti].panes[pi].editor.apply(&editor_action);
+                    // 编辑器变更驱动 request_redraw，走设计稿 §7.4「节拍纪律」；
+                    // 不走 PTY debounce（编辑器修改不触发 pty 写入）。
+                    self.window.request_redraw();
+                    events.push(StateEvent::EditorRevision(
+                        self.tabs[ti].panes[pi].editor.revision(),
+                    ));
+                } else {
+                    log::debug!("[dispatch] Edit({ea:?}) 非 Compose 态（{current_mode:?}）拒绝");
+                }
+            }
+            #[cfg(not(feature = "input-editor"))]
             Action::Edit(ea) => {
-                log::debug!("[dispatch] Edit({ea:?}) 批D 接线，暂忽略");
+                log::debug!("[dispatch] Edit({ea:?}) input-editor feature 未启用，忽略");
             }
 
-            // ── Composer：批D 接历史/补全时填充 ───────────────────────
+            // ── Composer：M4.1 批D1 —— 提交全链路 ────────────────────
+            #[cfg(feature = "input-editor")]
+            Action::Composer(ref ca) => {
+                use action::ComposerAction;
+                let current_mode =
+                    mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
+                match ca {
+                    ComposerAction::Submit if current_mode == mode::InputMode::Compose => {
+                        // 步骤 1：门控（双重检查，keymap 已检查过一次）
+                        // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴）
+                        let raw_text = self.tabs[ti].panes[pi].editor.view().text();
+                        let payload = encode_submit(&raw_text);
+                        // 步骤 3：滚动到底 + 写 PTY
+                        self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                        if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
+                            log::error!("提交写 PTY 失败: {e:#}");
+                        }
+                        // 步骤 4：清空编辑器缓冲 + 记录 pending_submit
+                        let submitted = String::from_utf8_lossy(&payload).into_owned();
+                        self.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::Clear);
+                        self.tabs[ti].panes[pi].pending_submit =
+                            Some((submitted.clone(), std::time::Instant::now()));
+                        events.push(StateEvent::SubmittedText(submitted));
+                        self.window.request_redraw();
+                    }
+                    ComposerAction::CancelLine if current_mode == mode::InputMode::Compose => {
+                        // Ctrl+C 缓冲非空：清空并存放弃稿
+                        let text = self.tabs[ti].panes[pi].editor.view().text();
+                        self.tabs[ti].panes[pi].editor.stash_abandoned(text);
+                        self.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::Clear);
+                        self.window.request_redraw();
+                        events.push(StateEvent::EditorRevision(
+                            self.tabs[ti].panes[pi].editor.revision(),
+                        ));
+                    }
+                    _ => {
+                        log::debug!(
+                            "[dispatch] Composer({ca:?}) 非 Compose 态（{current_mode:?}）或占位 variant，忽略"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "input-editor"))]
             Action::Composer(ca) => {
-                log::debug!("[dispatch] Composer({ca:?}) 批D 接线，暂忽略");
+                log::debug!("[dispatch] Composer({ca:?}) input-editor feature 未启用，忽略");
             }
 
             // ── Term：本批完整实现 ─────────────────────────────────────
@@ -738,7 +882,7 @@ impl AppState {
         #[cfg(feature = "input-editor")]
         let footer_px = {
             let mode = mode::effective_mode(&self.focused_pane().term, self.force_fallback);
-            let cv = composer::compose_view_for_mode(mode);
+            let cv = composer::compose_view_for_mode(mode, self.focused_pane().editor.view());
             let (_, cell_h) = self.renderer.cell_size();
             let fp = self.renderer.padding() * 0.4;
             let max_h = h / 3.0;
@@ -2080,7 +2224,11 @@ impl ApplicationHandler<PtyWake> for App {
                     terminal_focused: state.terminal_focused,
                     win32_input: state.tabs[ti].panes[pi].term.win32_input()
                         && std::env::var_os("LUMEN_WIN32_INPUT").is_some(),
-                    shift_pressed: state.modifiers.shift_key(),
+                    // M4.1 批D1：Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D）
+                    #[cfg(feature = "input-editor")]
+                    compose_buf_empty: state.tabs[ti].panes[pi].editor.view().text().is_empty(),
+                    #[cfg(not(feature = "input-editor"))]
+                    compose_buf_empty: true,
                 };
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
@@ -2169,6 +2317,31 @@ impl ApplicationHandler<PtyWake> for App {
 
                     Some(keymap::LookupResult::Consumed) => {
                         // 按键已消费（如 Ctrl+Shift+C 无选区），不写 PTY。
+                    }
+
+                    Some(keymap::LookupResult::ComposeTab) => {
+                        // Compose 态 Tab：M3.4 补全占位，显示提示状态条。
+                        let s = i18n::strings();
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Info, s.toast_compose_tab_hint);
+                    }
+
+                    Some(keymap::LookupResult::ComposeHistorySearch) => {
+                        // Compose 态 Ctrl+R：D2 历史搜索占位，显示提示状态条。
+                        let s = i18n::strings();
+                        state
+                            .shell_state
+                            .toast
+                            .push(shell::toast::ToastKind::Info, s.toast_compose_history_hint);
+                    }
+
+                    Some(keymap::LookupResult::ComposeEsc) => {
+                        // Compose 态 Esc：关浮层 / 清选区（D1 内不清编辑器文本）。
+                        // 批D1：仅清选区；浮层（历史面板等）D2 接入。
+                        state.tabs[ti].panes[pi].selection = None;
+                        state.window.request_redraw();
                     }
 
                     Some(keymap::LookupResult::TerminalAction(action)) => {
@@ -2307,10 +2480,30 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.terminal_focused {
                     return;
                 }
+                // M4.1 批D1：IME 分流——设计稿 §7.3
+                // Compose 态：提交文本进编辑器（InsertText），不写 PTY。
+                // 其余态：与按键路径一致，回滚到底部后写 PTY。
+                let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                #[cfg(feature = "input-editor")]
+                {
+                    let mode =
+                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                    if mode == mode::InputMode::Compose {
+                        // IME 提交进编辑器（走 dispatch 确保门控逻辑一致）
+                        state.dispatch(
+                            action::Action::Edit(action::EditAction::InsertText(text)),
+                            ti,
+                            pi,
+                        );
+                        return;
+                    }
+                }
+                // 非 Compose 态（含 feature 未开启）：直通 PTY
                 // 与按键路径一致：输入即回滚到底部——翻看历史时提交
                 // 中文，视图不跳回底部会看不到自己的回显。
+                let s = state.tabs[ti].panes[pi].term.grid_mut();
+                s.scroll_to_bottom();
                 let s = state.focused_pane_mut();
-                s.term.grid_mut().scroll_to_bottom();
                 if let Err(e) = s.write_user_input(text.as_bytes()) {
                     error!("写入 PTY 失败: {e:#}");
                 }
@@ -3151,7 +3344,7 @@ impl ApplicationHandler<PtyWake> for App {
                             if is_focused {
                                 let pane = &state.tabs[state.active_tab].panes[i];
                                 let mode = mode::effective_mode(&pane.term, state.force_fallback);
-                                let cv = composer::compose_view_for_mode(mode);
+                                let cv = composer::compose_view_for_mode(mode, pane.editor.view());
                                 let (_, cell_h) = state.renderer.cell_size();
                                 let fp = state.renderer.padding() * 0.4;
                                 let max_h = th as f32 / 3.0;
@@ -3244,7 +3437,7 @@ impl ApplicationHandler<PtyWake> for App {
                     let footer_view = {
                         let focused = state.focused_pane();
                         let mode = mode::effective_mode(&focused.term, state.force_fallback);
-                        composer::compose_view_for_mode(mode)
+                        composer::compose_view_for_mode(mode, focused.editor.view())
                     };
 
                     for (i, skip) in skip_pane.iter().enumerate() {
@@ -3263,12 +3456,11 @@ impl ApplicationHandler<PtyWake> for App {
                         // 批D 起按各窗格独立模式组装（多窗格各自有 footer）。
                         #[cfg(feature = "input-editor")]
                         let render_result = {
-                            let composer_view =
-                                if state.tabs[state.active_tab].focused == i {
-                                    Some(&footer_view)
-                                } else {
-                                    None
-                                };
+                            let composer_view = if state.tabs[state.active_tab].focused == i {
+                                Some(&footer_view)
+                            } else {
+                                None
+                            };
                             state.renderer.render_with_composer(
                                 s.id,
                                 &s.term,
@@ -3523,5 +3715,50 @@ mod tests {
         // NaN/Inf 防御：不写。
         assert!(!width_worth_persisting(f32::NAN, 180.0, 140.0, 320.0));
         assert!(!width_worth_persisting(f32::INFINITY, 180.0, 140.0, 320.0));
+    }
+
+    // ── M4.1 批D1：提交编码纯函数测试（设计稿 §3.2 步骤 2）─────────
+
+    #[cfg(feature = "input-editor")]
+    mod submit_encoding {
+        use super::super::encode_submit;
+
+        #[test]
+        fn 单行文本_末尾加_cr() {
+            let payload = encode_submit("echo hello");
+            assert_eq!(payload, b"echo hello\r", "单行提交应为 text + CR");
+        }
+
+        #[test]
+        fn 空文本_仍加_cr() {
+            let payload = encode_submit("");
+            assert_eq!(payload, b"\r", "空文本提交应为单个 CR");
+        }
+
+        #[test]
+        fn 多行文本_括号粘贴协议包裹() {
+            let text = "line1\nline2";
+            let payload = encode_submit(text);
+            assert!(
+                payload.starts_with(b"\x1b[200~"),
+                "多行提交应以 ESC[200~ 开头"
+            );
+            assert!(
+                payload.ends_with(b"\x1b[201~\r"),
+                "多行提交应以 ESC[201~CR 结尾"
+            );
+            let inner = &payload[6..payload.len() - 7];
+            assert_eq!(inner, text.as_bytes(), "多行提交括号内容应为原始文本");
+        }
+
+        #[test]
+        fn 两行判定阈值_仅两行走括号粘贴() {
+            // 恰好两行（含一个 \n）→ 括号粘贴
+            let payload = encode_submit("a\nb");
+            assert!(
+                payload.starts_with(b"\x1b[200~"),
+                "两行文本应走括号粘贴协议"
+            );
+        }
     }
 }

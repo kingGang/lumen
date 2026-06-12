@@ -146,6 +146,10 @@ pub static STRINGS: Strings = Strings {
     footer_label_compose: "编辑",
     footer_running_text: "运行中…（直通模式）",
     footer_label_running: "运行中",
+    // M4.1 批D1：Compose 态占位提示 + Fallback 状态文案
+    toast_compose_tab_hint: "Tab 补全功能即将上线（M3.4）",
+    toast_compose_history_hint: "历史搜索功能即将上线（D2）",
+    footer_fallback_text: "shell 集成未生效（经典直通模式）",
     // 登录校验
     login_err_invalid_email: "邮箱格式不正确（需形如 name@example.com）",
     login_err_empty_password: "请输入密码",

@@ -303,6 +303,17 @@ pub struct Strings {
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub footer_label_running: &'static str,
 
+    // ── M4.1 批D1：Compose 态键位占位提示 + Fallback 状态文案 ───────
+    /// Compose 态 Tab 键占位提示 toast（M3.4 补全未实现）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub toast_compose_tab_hint: &'static str,
+    /// Compose 态 Ctrl+R 占位提示 toast（D2 历史搜索未实现）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub toast_compose_history_hint: &'static str,
+    /// Fallback 态状态条文案（shell 集成未生效时显示）
+    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    pub footer_fallback_text: &'static str,
+
     // ── profile 校验错误（UI 侧翻译）────────────────────────────────
     /// 邮箱格式不正确
     pub login_err_invalid_email: &'static str,

@@ -27,7 +27,7 @@
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey as WinitNamedKey};
 
-use crate::action::{Action, ScrollDir, TermAction};
+use crate::action::{Action, ComposerAction, EditAction, Motion, ScrollDir, TermAction};
 use crate::mode::InputMode;
 
 // ─────────────────────────────────────────────────────────────────
@@ -94,10 +94,9 @@ pub struct GuardState {
     pub terminal_focused: bool,
     /// win32-input-mode 已开启（LUMEN_WIN32_INPUT=1）。
     pub win32_input: bool,
-    /// Ctrl+Shift+C 时是否应阻止下穿（Shift 修饰时无选区不下发 ^C）。
-    // ALLOW: 批D Composer 接入时才会读取此字段做 Ctrl+Shift+C 精细判断。
-    #[allow(dead_code)]
-    pub shift_pressed: bool,
+    /// Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D 的行为）。
+    /// M4.1 批D1：仅在 input-editor feature 开启时有意义。
+    pub compose_buf_empty: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -147,11 +146,12 @@ pub fn lookup(
 /// 4. 终端聚焦闸（非聚焦直接返回 None）
 /// 5. Ctrl+Shift+E（经典直通切换，全模式可用）
 /// 6. 安全规则：Ctrl+C Running/AltScreen/Fallback 无条件 Interrupt（最高优先级）
-/// 7. Shift+PgUp/PgDn 翻屏，Shift+Insert 粘贴
+/// 7. Shift+PgUp/PgDn 翻屏，Shift+Insert 粘贴（Compose 态 Shift+Insert 进编辑器）
 /// 8. Ctrl+↑/↓ 块跳转（非 alt screen）
-/// 9. Ctrl+C 三级逻辑（Compose 态）
-/// 10. Ctrl+V 粘贴
-/// 11. 兜底直通编码
+/// 9. **Compose 态开闸**（M4.1 批D1）：设计稿 §4 完整键位语义表
+/// 10. Ctrl+C 三级逻辑（非 Compose 态兜底 / Compose 态已在层 9 处理）
+/// 11. Ctrl+V 粘贴（非 Compose 态）
+/// 12. 兜底直通编码
 ///
 /// 返回 None 表示此键位无 keymap 命中（终端非聚焦等情况），调用方不写 PTY。
 pub fn lookup_input(
@@ -163,7 +163,7 @@ pub fn lookup_input(
 ) -> Option<LookupResult> {
     let ctrl = mods.control_key();
     let shift = mods.shift_key();
-    let _alt = mods.alt_key();
+    let alt = mods.alt_key();
 
     // ── 层 1：抬起事件（win32-input-mode）──────────────────────────────
     // 抬起事件（pressed=false）仅在 win32-input-mode 下投递。
@@ -257,6 +257,7 @@ pub fn lookup_input(
     }
 
     // ── 层 6：Shift+PgUp / Shift+PgDn 翻屏，Shift+Insert 粘贴 ─────────
+    // Compose 态 Shift+Insert → 进编辑器（PasteClipboard 走 dispatch）；其余态直通。
     if shift && !ctrl {
         if is_named(input, WinitNamedKey::PageUp) {
             return Some(LookupResult::TerminalAction(Action::Term(
@@ -269,6 +270,8 @@ pub fn lookup_input(
             )));
         }
         if is_named(input, WinitNamedKey::Insert) {
+            // Compose 态：粘贴进编辑器（dispatch 内按 bracketed_paste 状态包装）
+            // Running/AltScreen/Fallback 态：与 Ctrl+V 同语义直通 PTY
             return Some(LookupResult::TerminalAction(Action::Term(
                 TermAction::PasteClipboard,
             )));
@@ -289,12 +292,205 @@ pub fn lookup_input(
         }
     }
 
-    // ── 层 8：Ctrl+C 三级（Compose 态与无模式守卫的兜底）──────────────
-    // Compose / Running 共享此逻辑（批B 两态行为相同）：
-    //   选区非空 → 复制选区（第一级）
-    //   选中块 → 复制块输出（第二级）
-    //   Ctrl+Shift+C 无选区 → 不下发
-    //   纯 Ctrl+C 无选区 → 中断（第三级，ETX）
+    // ── 层 9：Compose 态开闸（M4.1 批D1）——设计稿 §4 ──────────────────
+    // Running/AltScreen/Fallback 态跳过此层，走后续兜底直通。
+    // E9 铁律：Running/AltScreen/Fallback 的 Ctrl+C 已在层 5 无条件 Interrupt，
+    // 此层逻辑对非 Compose 态完全不可达（模式检查保证）。
+    if mode == InputMode::Compose {
+        // 9-a: Enter → Composer(Submit)
+        if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Enter) {
+            return Some(LookupResult::TerminalAction(Action::Composer(
+                ComposerAction::Submit,
+            )));
+        }
+
+        // 9-b: Shift+Enter / Alt+Enter → InsertNewline（多行编辑）
+        if is_named(input, WinitNamedKey::Enter) && (shift || alt) && !ctrl {
+            return Some(LookupResult::TerminalAction(Action::Edit(
+                EditAction::InsertNewline,
+            )));
+        }
+
+        // 9-c: Ctrl+A → 全选
+        if ctrl && !shift && is_char(input, 'a') {
+            return Some(LookupResult::TerminalAction(Action::Edit(
+                EditAction::SelectAll,
+            )));
+        }
+
+        // 9-d: Backspace → DeleteBackward
+        if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Backspace) {
+            return Some(LookupResult::TerminalAction(Action::Edit(
+                EditAction::DeleteBackward,
+            )));
+        }
+
+        // 9-e: Delete → DeleteForward
+        if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Delete) {
+            return Some(LookupResult::TerminalAction(Action::Edit(
+                EditAction::DeleteForward,
+            )));
+        }
+
+        // 9-f: Ctrl+Backspace → DeleteWordBackward
+        if ctrl && !shift && is_named(input, WinitNamedKey::Backspace) {
+            return Some(LookupResult::TerminalAction(Action::Edit(
+                EditAction::DeleteWordBackward,
+            )));
+        }
+
+        // 9-g: 方向键移动（Shift 扩选；Ctrl+↑/↓ 已在层 7 为块跳转，不在此处理）
+        if !ctrl {
+            if is_named(input, WinitNamedKey::ArrowLeft) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeLeft,
+                        extend: shift,
+                    },
+                )));
+            }
+            if is_named(input, WinitNamedKey::ArrowRight) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeRight,
+                        extend: shift,
+                    },
+                )));
+            }
+            // ↑/↓：行间移动；首末行 no-op（D2 历史导航占位）
+            if is_named(input, WinitNamedKey::ArrowUp) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::Up,
+                        extend: shift,
+                    },
+                )));
+            }
+            if is_named(input, WinitNamedKey::ArrowDown) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::Down,
+                        extend: shift,
+                    },
+                )));
+            }
+        }
+
+        // 9-h: Home / End（Shift 扩选）
+        if !ctrl {
+            if is_named(input, WinitNamedKey::Home) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::LineStart,
+                        extend: shift,
+                    },
+                )));
+            }
+            if is_named(input, WinitNamedKey::End) {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::LineEnd,
+                        extend: shift,
+                    },
+                )));
+            }
+        }
+
+        // 9-i: Tab → 无操作 + 状态条提示（M3.4 补全占位）
+        if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Tab) {
+            return Some(LookupResult::ComposeTab);
+        }
+
+        // 9-j: Ctrl+R → 无操作（D2 历史面板占位）
+        if ctrl && !shift && is_char(input, 'r') {
+            return Some(LookupResult::ComposeHistorySearch);
+        }
+
+        // 9-k: Esc → 关浮层 → 清选区 → 空操作
+        if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Escape) {
+            return Some(LookupResult::ComposeEsc);
+        }
+
+        // 9-l: Ctrl+L → 直通（清屏是 shell 行为）
+        if ctrl && !shift && is_char(input, 'l') {
+            return Some(LookupResult::PassThrough);
+        }
+
+        // 9-m: Ctrl+C（Compose 态三级逻辑）——设计稿 §4
+        //   选区非空 → 复制选区（第一级，M2 现状保留）
+        //   选中块 → 复制块输出（第二级，M2 现状保留）
+        //   缓冲非空 → CancelLine（清空存放弃稿）
+        //   缓冲为空 → Interrupt（下穿 ETX，逃生舱）
+        if ctrl && !shift && is_char(input, 'c') {
+            if guard.has_selection {
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopySelection,
+                )));
+            }
+            if guard.has_selected_block {
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopyBlock,
+                )));
+            }
+            if guard.compose_buf_empty {
+                // 缓冲为空：下穿 ETX（逃生舱，模式误判时可中断）
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::Interrupt,
+                )));
+            } else {
+                // 缓冲非空：清空存放弃稿
+                return Some(LookupResult::TerminalAction(Action::Composer(
+                    ComposerAction::CancelLine,
+                )));
+            }
+        }
+
+        // 9-n: Ctrl+D
+        //   缓冲空 → 直通 \x04（退 shell）
+        //   缓冲非空 → DeleteForward
+        if ctrl && !shift && is_char(input, 'd') {
+            if guard.compose_buf_empty {
+                return Some(LookupResult::PassThrough);
+            } else {
+                return Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::DeleteForward,
+                )));
+            }
+        }
+
+        // 9-o: Ctrl+V → 粘贴进编辑器（走 dispatch 按 bracketed_paste 包装）
+        if ctrl && !shift && is_char(input, 'v') {
+            return Some(LookupResult::TerminalAction(Action::Term(
+                TermAction::PasteClipboard,
+            )));
+        }
+
+        // 9-p: 普通字符键 / Space → InsertText（已过滤 ctrl/alt 修饰）
+        if !ctrl && !alt {
+            // 提取字符串（Character 变体包含字符，Named::Space 特殊处理）
+            let text_opt: Option<String> = match &input.logical_key {
+                Key::Character(s) => Some(s.to_string()),
+                Key::Named(WinitNamedKey::Space) => Some(" ".to_string()),
+                _ => None,
+            };
+            if let Some(text) = text_opt {
+                if !text.is_empty() {
+                    return Some(LookupResult::TerminalAction(Action::Edit(
+                        EditAction::InsertText(text),
+                    )));
+                }
+            }
+        }
+
+        // Compose 态未命中的其余键：消费但不写 PTY（不下穿直通）。
+        // 例如：F1-F12、Ctrl+字母（未在上方处理的）等。
+        return Some(LookupResult::Consumed);
+    }
+
+    // ── 层 10（非 Compose 态）：Ctrl+C 三级兜底 ─────────────────────────
+    // Compose 态已在层 9 处理 Ctrl+C，此层仅对 Running/Fallback 以下（
+    // AltScreen 的 Ctrl+C 已在层 5 安全规则处理）。
+    // 此处逻辑保持批B 原状（Running/Fallback 无选区 = Interrupt）。
     if ctrl && is_char(input, 'c') {
         if guard.has_selection {
             return Some(LookupResult::TerminalAction(Action::Term(
@@ -316,14 +512,14 @@ pub fn lookup_input(
         )));
     }
 
-    // ── 层 9：Ctrl+V 粘贴 ─────────────────────────────────────────────
+    // ── 层 11：Ctrl+V 粘贴（非 Compose 态）────────────────────────────
     if ctrl && is_char(input, 'v') {
         return Some(LookupResult::TerminalAction(Action::Term(
             TermAction::PasteClipboard,
         )));
     }
 
-    // ── 层 10：兜底直通编码 ────────────────────────────────────────────
+    // ── 层 12：兜底直通编码 ────────────────────────────────────────────
     // 所有未匹配的按键通过 input::encode_key / encode_key_win32 编码后写 PTY。
     Some(LookupResult::PassThrough)
 }
@@ -345,6 +541,12 @@ pub enum LookupResult {
     Consumed,
     /// 兜底直通：调用方用 encode_key / encode_key_win32 编码后写 PTY。
     PassThrough,
+    /// Compose 态 Tab 键（M3.4 补全占位）——main.rs 显示状态条提示。
+    ComposeTab,
+    /// Compose 态 Ctrl+R（D2 历史搜索占位）——main.rs 显示状态条提示。
+    ComposeHistorySearch,
+    /// Compose 态 Esc（关浮层/清选区/空操作）——main.rs 处理浮层清理。
+    ComposeEsc,
 }
 
 /// 外壳级动作枚举（不走 dispatch，由 main.rs 外壳逻辑直接处理）。
@@ -551,6 +753,8 @@ mod tests {
 
     #[test]
     fn compose_ctrl_shift_c_no_selection_consumed() {
+        // Ctrl+Shift+C 在 Compose 态：层 9-m 要求 !shift，不命中；
+        // 层 9-p 要求 !ctrl，不命中；Compose 兜底 → Consumed。
         let result = lookup_char(
             "c",
             ModifiersState::CONTROL | ModifiersState::SHIFT,
@@ -565,13 +769,45 @@ mod tests {
     }
 
     #[test]
-    fn compose_ctrl_c_no_selection_is_interrupt() {
+    fn compose_ctrl_c_buf_nonempty_is_cancel_line() {
+        // compose_buf_empty = false（默认值） → 缓冲非空 → CancelLine（清空存放弃稿）
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
         let result = lookup_char(
             "c",
             ModifiersState::CONTROL,
             InputMode::Compose,
             true,
-            &default_guard(),
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Composer(
+                    ComposerAction::CancelLine
+                )))
+            ),
+            "Compose 态 Ctrl+C 缓冲非空 → CancelLine（清空存放弃稿）"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_c_empty_buf_is_interrupt() {
+        // compose_buf_empty = true → 缓冲为空 → Interrupt（ETX 逃生舱）
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_buf_empty: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
         );
         assert!(
             matches!(
@@ -580,7 +816,7 @@ mod tests {
                     TermAction::Interrupt
                 )))
             ),
-            "Compose 态 Ctrl+C 无选区 → ETX 中断（逃生舱）"
+            "Compose 态 Ctrl+C 缓冲为空 → Interrupt（ETX 逃生舱）"
         );
     }
 
@@ -1088,6 +1324,405 @@ mod tests {
                 Some(LookupResult::ShellAction(ShellAction::ToggleSettings))
             ),
             "overlay 打开时 Ctrl+, 应仍可触发（关闭设置页）"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // M4.1 批D1：Compose 态完整键位语义单测（设计稿 §4）
+    // ────────────────────────────────────────────────────────────────
+
+    // ── Enter → Submit ───────────────────────────────────────────────
+
+    #[test]
+    fn compose_enter_无修饰_是_submit() {
+        let result = lookup_named(
+            WinitNamedKey::Enter,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Composer(
+                    ComposerAction::Submit
+                )))
+            ),
+            "Compose 态 Enter → Submit"
+        );
+    }
+
+    #[test]
+    fn compose_shift_enter_是_insert_newline() {
+        let result = lookup_named(
+            WinitNamedKey::Enter,
+            ModifiersState::SHIFT,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::InsertNewline
+                )))
+            ),
+            "Compose 态 Shift+Enter → InsertNewline"
+        );
+    }
+
+    #[test]
+    fn running_enter_是_passthrough_不是_submit() {
+        // Running 态 Enter 不走 Compose 层，兜底直通
+        let result = lookup_named(
+            WinitNamedKey::Enter,
+            ModifiersState::empty(),
+            InputMode::Running,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "Running 态 Enter 应直通（不走 Compose 层）"
+        );
+    }
+
+    // ── 删除键 ───────────────────────────────────────────────────────
+
+    #[test]
+    fn compose_backspace_是_delete_backward() {
+        let result = lookup_named(
+            WinitNamedKey::Backspace,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::DeleteBackward
+                )))
+            ),
+            "Compose 态 Backspace → DeleteBackward"
+        );
+    }
+
+    #[test]
+    fn compose_delete_是_delete_forward() {
+        let result = lookup_named(
+            WinitNamedKey::Delete,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::DeleteForward
+                )))
+            ),
+            "Compose 态 Delete → DeleteForward"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_backspace_是_delete_word_backward() {
+        let result = lookup_named(
+            WinitNamedKey::Backspace,
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::DeleteWordBackward
+                )))
+            ),
+            "Compose 态 Ctrl+Backspace → DeleteWordBackward"
+        );
+    }
+
+    // ── 移动键 ───────────────────────────────────────────────────────
+
+    #[test]
+    fn compose_left_是_grapheme_left() {
+        let result = lookup_named(
+            WinitNamedKey::ArrowLeft,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeLeft,
+                        extend: false,
+                    }
+                )))
+            ),
+            "Compose 态 ← → GraphemeLeft (no extend)"
+        );
+    }
+
+    #[test]
+    fn compose_shift_right_是_grapheme_right_extend() {
+        let result = lookup_named(
+            WinitNamedKey::ArrowRight,
+            ModifiersState::SHIFT,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::GraphemeRight,
+                        extend: true,
+                    }
+                )))
+            ),
+            "Compose 态 Shift+→ → GraphemeRight extend=true"
+        );
+    }
+
+    #[test]
+    fn compose_home_是_line_start() {
+        let result = lookup_named(
+            WinitNamedKey::Home,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::LineStart,
+                        extend: false,
+                    }
+                )))
+            ),
+            "Compose 态 Home → LineStart"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_a_是_select_all() {
+        let result = lookup_char(
+            "a",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::SelectAll
+                )))
+            ),
+            "Compose 态 Ctrl+A → SelectAll"
+        );
+    }
+
+    // ── Tab / Ctrl+R / Esc ───────────────────────────────────────────
+
+    #[test]
+    fn compose_tab_是_compose_tab_结果() {
+        let result = lookup_named(
+            WinitNamedKey::Tab,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::ComposeTab)),
+            "Compose 态 Tab → ComposeTab 占位"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_r_是_compose_history_search_结果() {
+        let result = lookup_char(
+            "r",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::ComposeHistorySearch)),
+            "Compose 态 Ctrl+R → ComposeHistorySearch 占位"
+        );
+    }
+
+    #[test]
+    fn compose_esc_是_compose_esc_结果() {
+        let result = lookup_named(
+            WinitNamedKey::Escape,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::ComposeEsc)),
+            "Compose 态 Esc → ComposeEsc"
+        );
+    }
+
+    // ── Ctrl+L 直通（设计稿 §4）──────────────────────────────────────
+
+    #[test]
+    fn compose_ctrl_l_是_passthrough() {
+        let result = lookup_char(
+            "l",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "Compose 态 Ctrl+L → PassThrough（清屏是 shell 行为）"
+        );
+    }
+
+    // ── Ctrl+D 两态（设计稿 §4）──────────────────────────────────────
+
+    #[test]
+    fn compose_ctrl_d_empty_buf_是_passthrough() {
+        // 缓冲为空 → 直通 \x04（退 shell）
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_buf_empty: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "d",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(result, Some(LookupResult::PassThrough)),
+            "Compose 态 Ctrl+D 缓冲空 → PassThrough（退 shell）"
+        );
+    }
+
+    #[test]
+    fn compose_ctrl_d_nonempty_buf_是_delete_forward() {
+        // 缓冲非空 → DeleteForward
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_buf_empty: false,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "d",
+            ModifiersState::CONTROL,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::DeleteForward
+                )))
+            ),
+            "Compose 态 Ctrl+D 缓冲非空 → DeleteForward"
+        );
+    }
+
+    // ── 普通字符 → InsertText ─────────────────────────────────────────
+
+    #[test]
+    fn compose_普通字符_是_insert_text() {
+        let result = lookup_char(
+            "h",
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::InsertText(_)
+                )))
+            ),
+            "Compose 态普通字符 → InsertText"
+        );
+    }
+
+    // ── E9 铁律自查：Running/AltScreen Ctrl+C 路径无新增拦截 ─────────
+
+    #[test]
+    fn e9_running_ctrl_c_无选区_interrupt() {
+        // E9 铁律：Running 态 Ctrl+C 无条件 Interrupt（层 5 安全规则）
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Running,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::Interrupt
+                )))
+            ),
+            "E9 铁律：Running 态 Ctrl+C → Interrupt（不受 compose_buf_empty 影响）"
+        );
+    }
+
+    #[test]
+    fn e9_altscreen_ctrl_c_无选区_interrupt() {
+        // E9 铁律：AltScreen 态 Ctrl+C 无条件 Interrupt（层 5 安全规则）
+        let guard = GuardState {
+            terminal_focused: true,
+            is_alt_screen: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::AltScreen,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::Interrupt
+                )))
+            ),
+            "E9 铁律：AltScreen 态 Ctrl+C → Interrupt（不受 compose_buf_empty 影响）"
         );
     }
 }

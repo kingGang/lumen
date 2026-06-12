@@ -17,6 +17,8 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use log::{error, info};
+#[cfg(feature = "input-editor")]
+use lumen_editor::Editor;
 use lumen_pty::{PtyEvent, PtySession};
 use lumen_term::{Selection, Terminal};
 use winit::event_loop::EventLoopProxy;
@@ -157,6 +159,14 @@ pub struct Session {
     pub term_frame_due_since: Option<Instant>,
     /// 后台期间有新输出（tab 未读点；切换到本会话时清除）。
     pub has_unseen_output: bool,
+    /// M4.1 批D1：焦点窗格的输入编辑器（`input-editor` feature 门控）。
+    /// 挂在窗格生命周期内，模式切换不清缓冲（草稿保全）。
+    #[cfg(feature = "input-editor")]
+    pub editor: Editor,
+    /// M4.1 批D1：pending_submit — 提交但尚未看到 C 标记的在途命令。
+    /// `(提交文本, 提交时刻)`；C 标记到达后（块切 Running）清空。
+    #[cfg(feature = "input-editor")]
+    pub pending_submit: Option<(String, std::time::Instant)>,
 }
 
 impl Session {
@@ -220,6 +230,10 @@ impl Session {
             redraw_abs_at: None,
             term_frame_due_since: None,
             has_unseen_output: false,
+            #[cfg(feature = "input-editor")]
+            editor: Editor::default(),
+            #[cfg(feature = "input-editor")]
+            pending_submit: None,
         })
     }
 

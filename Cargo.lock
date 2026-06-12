@@ -1525,6 +1525,7 @@ dependencies = [
  "env_logger",
  "image",
  "log",
+ "lumen-editor",
  "lumen-pty",
  "lumen-renderer",
  "lumen-term",

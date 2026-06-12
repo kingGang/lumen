@@ -10,14 +10,16 @@ name = "lumen"
 path = "src/main.rs"
 
 [features]
-## 输入编辑器 footer 渲染（M4.1 批C）——设计稿 §7.1。
+## 输入编辑器 footer 渲染（M4.1 批C/D1）——设计稿 §7.1。
 ## 默认开启；剔除时所有 footer 渲染/占高逻辑被完全移除，
 ## 行为与旧版逐字节一致。
-input-editor = ["lumen-renderer/input-editor"]
+input-editor = ["lumen-renderer/input-editor", "dep:lumen-editor"]
 default = ["input-editor"]
 
 [dependencies]
 anyhow.workspace = true
+# 输入编辑器状态机（M4.1 批D1）；仅 input-editor feature 开启时引入。
+lumen-editor = { workspace = true, optional = true }
 arboard.workspace = true
 crossbeam-channel.workspace = true
 egui.workspace = true
