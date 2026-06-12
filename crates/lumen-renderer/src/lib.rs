@@ -1061,6 +1061,39 @@ impl Renderer {
                                 bufs.push((usize::MAX, buf, text_y, bottom_clamp, badge_x));
                             }
                         }
+
+                        // R8.2 修复：footer label（如 "Running"/"编辑"/"运行中"）
+                        // 之前只存在于 cv.label 字段而从未被渲染，导致括号内无文字。
+                        // 修复：用 fg_dim 色（前景色 50% alpha）在 footer 右端绘制 label。
+                        // 格式：[ label ] 靠右对齐，行垂直居中。
+                        if !cv.label.is_empty() {
+                            let fg = self.theme.foreground;
+                            // fg_dim = 前景色 50% alpha，与外壳 fg_dim 同语义
+                            let dim_color = glyphon::Color::rgba(fg.0, fg.1, fg.2, 128);
+                            let dim_attrs = base_attrs.clone().color(dim_color);
+                            // 格式化为 "[ label ]"，括号使用半角方括号，更易辨读
+                            let label_text = format!("[ {} ]", cv.label);
+                            let label_char_count = label_text.chars().count() as f32;
+                            // 预估文字宽度（等宽字体：字符数 × cell_w）
+                            let label_w = label_char_count * cw;
+                            // 靠右：留 fp 右边距
+                            let label_x = (target_w as f32 - label_w - fp).max(fp);
+                            let text_y = footer_top + (footer_px - ch) / 2.0;
+                            let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
+                            if label_x > fp && text_y >= footer_top {
+                                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                                buf.set_size(&mut self.font_system, None, Some(ch));
+                                buf.set_text(
+                                    &mut self.font_system,
+                                    &label_text,
+                                    &dim_attrs,
+                                    Shaping::Advanced,
+                                    None,
+                                );
+                                // line_idx = usize::MAX - 3 区分 label 行
+                                bufs.push((usize::MAX - 3, buf, text_y, bottom_clamp, label_x));
+                            }
+                        }
                     }
                 }
             }

@@ -12,11 +12,14 @@
 //!   自动放置（RTL 下靠右排、左移 cursor），painter 按返回 rect 画图。
 //!
 //! R8 图标精绘（统一 codicon 族系几何）：
-//! - ①侧栏：圆角外框 15×12 + 左 1/3 竖分隔线；可见态左舱填充。
-//! - ②文件树：竖干 + 三横枝树形（无外框）。
-//! - ③还原窗格：圆角外框 14×12 + 内部十字分隔（田字）。
+//! - ①侧栏：圆角外框 18×14 + 左 1/3 竖分隔线；可见态左舱填充。
+//! - ②文件树：竖干 + 三横枝树形（无外框，横枝长 9/6.5/4 层次分明）。
+//! - ③还原窗格：圆角外框 16×14 + 内部十字分隔（田字）。
 //!
-//! 统一规格：线宽 1.2，热区 28×26，组左缘距 10。
+//! 统一规格：线宽 1.2，热区 28×26，组左缘距 10，组内间距 4。
+//!
+//! R8.2 变更：图标视觉盒从 ~16×12 扩到 ~18×14；按钮间距 2→4；
+//! 树形横枝长度差拉大为 9/6.5/4（高 DPI 下层次可辨）。
 //!
 //! M3.8 变更：
 //! - 窗口无边框后，窗控三按钮并入顶栏右端（Warp/VSCode 形态）。
@@ -47,8 +50,8 @@ const VIEW_BTN_W: f32 = 28.0;
 const VIEW_BTN_H: f32 = 26.0;
 /// 左端按钮组前缘内边距。
 const LEFT_GROUP_MARGIN: f32 = 10.0;
-/// 按钮组内间距。
-const VIEW_BTN_GAP: f32 = 2.0;
+/// 按钮组内间距（R8.2：2→4，增强分组感）。
+const VIEW_BTN_GAP: f32 = 4.0;
 /// 头像直径。
 const AVATAR_SIZE: f32 = 24.0;
 /// 下拉菜单宽度。
@@ -381,12 +384,12 @@ pub fn show(
     out
 }
 
-// ── 图标绘制子函数（R8 精绘，统一规格）──────────────────────────────────────
-// 视觉盒约 16×12 逻辑 px 居中于 28×26 热区；线宽 1.2；
+// ── 图标绘制子函数（R8.2 精绘，统一规格）──────────────────────────────────
+// 视觉盒 18×14 逻辑 px 居中于 28×26 热区（R8.2：从 16×12 扩大）；线宽 1.2；
 // 颜色常态 fg_dim，hover fg；hover 圆角底 bg_highlight（圆角 4）。
 
 /// ① 侧栏切换图标（codicon layout-sidebar-left 风格）：
-/// 圆角外框 15×12（圆角 2.5）+ 距左 1/3 处竖分隔线；
+/// 圆角外框 18×14（圆角 2.5）+ 距左 1/3 处竖分隔线；
 /// 侧栏可见态左舱填充（fg_dim 40% 透明度），隐藏态仅线框。
 fn draw_icon_sidebar(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
     let painter = ui.painter();
@@ -397,9 +400,9 @@ fn draw_icon_sidebar(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palet
     let fg = if visible { pal.fg } else { pal.fg_dim };
     let stroke = egui::Stroke::new(1.2, fg);
     let c = rect.center();
-    // 外框 15×12，圆角 2.5，像素对齐
-    let bw = 15.0_f32;
-    let bh = 12.0_f32;
+    // 外框 18×14，圆角 2.5，像素对齐（R8.2：从 15×12 扩大）
+    let bw = 18.0_f32;
+    let bh = 14.0_f32;
     let ox = (c.x - bw / 2.0 + 0.5).floor() - 0.5; // round to 0.5
     let oy = (c.y - bh / 2.0 + 0.5).floor() - 0.5;
     let frame = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));
@@ -433,8 +436,8 @@ fn draw_icon_sidebar(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palet
 }
 
 /// ② 文件树切换图标（codicon list-tree 风格）：
-/// 无外框；左侧竖干线（高 12）+ 向右三条横枝（y 均分，长 7~8）。
-/// 可见态 fg，隐藏态 fg_dim。
+/// 无外框；左侧竖干线（高 14）+ 向右三条横枝（y 均分，长度 9/6.5/4）。
+/// 层次差拉大（9/6.5/4）使高 DPI 下层次可辨；可见态 fg，隐藏态 fg_dim。
 fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Palette) {
     let painter = ui.painter();
     if ui.rect_contains_pointer(rect) {
@@ -443,8 +446,9 @@ fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Pale
     let fg = if visible { pal.fg } else { pal.fg_dim };
     let stroke = egui::Stroke::new(1.2, fg);
     let c = rect.center();
-    let tree_h = 12.0_f32;
-    let trunk_x = (c.x - 7.0 + 0.5).floor() - 0.5; // 竖干 x，像素对齐
+    // R8.2：树形高度随视觉盒扩大到 14，竖干偏左 8px
+    let tree_h = 14.0_f32;
+    let trunk_x = (c.x - 8.0 + 0.5).floor() - 0.5; // 竖干 x，像素对齐
     let top_y = (c.y - tree_h / 2.0 + 0.5).floor() - 0.5;
     let bot_y = top_y + tree_h;
     // 竖干
@@ -452,8 +456,8 @@ fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Pale
         [egui::pos2(trunk_x, top_y), egui::pos2(trunk_x, bot_y)],
         stroke,
     );
-    // 三条横枝（y 分别在 top+2, top+6, top+10，长度 8/6/5）
-    let branches: [(f32, f32); 3] = [(top_y + 2.0, 8.0), (top_y + 6.0, 6.0), (top_y + 10.0, 5.0)];
+    // 三条横枝（y 均分于 top+2/top+7/top+12；R8.2 长度差拉大 9/6.5/4）
+    let branches: [(f32, f32); 3] = [(top_y + 2.0, 9.0), (top_y + 7.0, 6.5), (top_y + 12.0, 4.0)];
     for (by, branch_len) in branches {
         let by = (by + 0.5).floor() - 0.5;
         painter.line_segment(
@@ -467,8 +471,8 @@ fn draw_icon_filetree(ui: &egui::Ui, rect: egui::Rect, visible: bool, pal: &Pale
 }
 
 /// ③ 还原窗格图标（田字格风格）：
-/// 圆角外框 14×12（圆角 2.5）+ 内部横竖中线十字分隔（2×2 田字）。
-/// 不画四个分离小方块（避免显碎）。
+/// 圆角外框 16×14（圆角 2.5）+ 内部横竖中线十字分隔（2×2 田字）。
+/// 不画四个分离小方块（避免显碎）。R8.2：从 14×12 扩大。
 fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette) {
     let painter = ui.painter();
     let hovered = ui.rect_contains_pointer(rect);
@@ -484,8 +488,9 @@ fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette)
     };
     let stroke = egui::Stroke::new(1.2, fg);
     let c = rect.center();
-    let bw = 14.0_f32;
-    let bh = 12.0_f32;
+    // R8.2：从 14×12 扩大到 16×14，比例对齐侧栏/树形框
+    let bw = 16.0_f32;
+    let bh = 14.0_f32;
     let ox = (c.x - bw / 2.0 + 0.5).floor() - 0.5;
     let oy = (c.y - bh / 2.0 + 0.5).floor() - 0.5;
     let frame = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));

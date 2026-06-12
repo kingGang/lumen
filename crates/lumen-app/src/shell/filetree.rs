@@ -1243,9 +1243,17 @@ fn add_node(
         NodeKind::File => {
             let path = load.nodes[id].path.clone();
             let name = display_name(&path);
+            // R8.2：用 label_ui + truncate() 确保长文件名带省略号截断，
+            // 避免宽度超出面板导致横向溢出（egui_ltreeview 默认 label() 不截断）。
             builder.node(
                 NodeBuilder::leaf(id)
-                    .label(name)
+                    .label_ui(move |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&name))
+                                .selectable(false)
+                                .truncate(),
+                        );
+                    })
                     .context_menu(move |ui| file_context_menu(ui, &path, menu)),
             );
         }
@@ -1294,7 +1302,14 @@ fn add_node(
                     .activatable(true)
                     .default_open(id == 0)
                     .drop_allowed(false)
-                    .label(name)
+                    // R8.2：用 label_ui + truncate() 确保目录名带省略号截断。
+                    .label_ui(move |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&name))
+                                .selectable(false)
+                                .truncate(),
+                        );
+                    })
                     .context_menu(move |ui| dir_context_menu(ui, &path, is_root, menu)),
             );
             if open {
