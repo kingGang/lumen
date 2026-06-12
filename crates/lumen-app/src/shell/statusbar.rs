@@ -18,11 +18,11 @@
 //! - hover 文字色：关闭态 hover 时提亮为 fg；开启态始终 accent_fg
 //! - 文字字号 11，垂直居中
 //!
-//! # 垂直居中规格（第十五轮问题2：按钮贴顶修复）
-//! - 状态栏高度 24px；按钮高度 18px，allocate 只占 18px（不撑满 24px）
-//! - horizontal 布局 Align::Center 自动垂直居中 → 上下各 3px 间距，满足 ≥2px 与上边框间隙
-//! - 原因：旧版 allocate_exact_size(ui.available_height()) 把整栏高度分配，
-//!   感知区域从栏顶（紧贴 panel_outline 描边线）开始，视觉上零间距
+//! # 垂直居中规格（第十五轮问题2 + 海风哥两轮压线反馈）
+//! - 状态栏高度 28px；按钮高度 18px，满高 cell + `from_center_size` 显式垂直居中 → 上下各 5px
+//! - 第十五轮曾依赖 horizontal(Align::Center) 自动居中 allocate_exact_size(btn_h)，
+//!   但实测未生效（按钮贴顶压上边描边线）；改为显式 from_center_size 强制居中，
+//!   并将栏高 24→28px 增大间距（24px 下 3px 仍显挤、贴线）
 //!
 //! # 设计原则
 //! - 状态栏高度常驻（不影响 footer 的 resize 链，两者独立）
@@ -33,7 +33,10 @@ use super::theme::Palette;
 use crate::mode::InputMode;
 
 /// 底部状态栏高度（逻辑像素）。
-pub const HEIGHT: f32 = 24.0;
+///
+/// 28px（第十五轮 24px + 海风哥两轮压线反馈 +4px）：24px 下按钮 18px 居中仅
+/// 上下各 3px，视觉仍挤、贴线；加高到 28px 后间距 5px，呼吸感足。
+pub const HEIGHT: f32 = 28.0;
 
 /// 状态栏 UI 的产出。
 #[derive(Default)]
@@ -62,6 +65,11 @@ pub fn show(
 ) -> StatusBarOutput {
     let mut out = StatusBarOutput::default();
     let s = crate::i18n::strings();
+
+    // panel 内容区矩形（在 horizontal 布局之前捕获）——按钮垂直定位用它的中心。
+    // 四轮踩坑后确定：horizontal 闭包内的 ui.max_rect()/available_height() 在本
+    // 上下文都不是全栏高，导致按钮被顶在栏顶压线；这个外层 rect 才是可靠的全栏矩形。
+    let panel_rect = root.available_rect_before_wrap();
 
     // 顶边 1px 描边（与全 app 面板描边一致）
     {
@@ -150,16 +158,27 @@ pub fn show(
         // horizontal(Align::Center) 自动垂直居中 → 上下各 3px，满足与上边框 ≥2px 间距。
         // （旧版分配 ui.available_height()=24px，感知区从栏顶开始，视觉零间距。）
 
-        // 按钮高度（18px）：allocate 只占此值，不撑满 24px 栏高
+        // 按钮高度（18px）：在 28px 栏内垂直居中，上下各 (HEIGHT-btn_h)/2 = 5px 间距。
         let btn_h = 18.0_f32;
         // 按钮宽度：与上方 btn_w_approx 公式一致（ASCII 7px + CJK 12px，加 12px 内边距）。
         let btn_w = btn_text_w + 12.0;
 
-        // 使用 allocate_exact_size 分配 btn_h（非 available_height），
-        // horizontal Align::Center 保证自动垂直居中 → 上下各 3px 间距
-        let (btn_rect, resp) =
-            ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::click());
-        let resp = resp.on_hover_text(s.statusbar_classic_tip);
+        // 垂直定位（四轮踩坑后确定方案）：用 horizontal 外捕获的 panel_rect 中心
+        // 绝对定位按钮，彻底绕开 egui horizontal 的垂直对齐 / max_rect /
+        // available_height（三者实测都把按钮顶在栏顶）。allocate 仅占住水平位置
+        // 拿 x；感知区用 ui.interact(btn_rect) 与实际绘制矩形对齐。
+        let (cell_rect, _) = ui.allocate_exact_size(egui::vec2(btn_w, btn_h), egui::Sense::hover());
+        let btn_rect = egui::Rect::from_center_size(
+            egui::pos2(cell_rect.center().x, panel_rect.center().y),
+            egui::vec2(btn_w, btn_h),
+        );
+        let resp = ui
+            .interact(
+                btn_rect,
+                ui.id().with("statusbar_classic_btn"),
+                egui::Sense::click(),
+            )
+            .on_hover_text(s.statusbar_classic_tip);
 
         if ui.is_rect_visible(btn_rect) {
             let painter = ui.painter();
@@ -303,10 +322,10 @@ mod tests {
         assert!(!all_empty, "非空编辑器 lines 不应全为空串");
     }
 
-    // ── 按钮垂直居中几何纯函数测试（第十五轮 #2）──────────────────────────
-    // 钉住「状态栏高 24px / 按钮高 18px → 上下各 3px 间距」的数学约束。
-    // 这是 allocate_exact_size(btn_h) + horizontal(Align::Center) 的预期行为：
-    // egui 在 Align::Center 布局中将分配区域垂直居中于可用区域。
+    // ── 按钮垂直居中几何纯函数测试（第十五轮 #2 + 海风哥两轮压线反馈）─────────
+    // 钉住「状态栏高 28px / 按钮高 18px → 上下各 5px 间距」的数学约束。
+    // 实现用满高 cell + from_center_size 显式居中（非 egui 自动居中，后者实测未生效）；
+    // center_y_offset 是该居中的纯数学定义（无 egui 依赖）。
 
     /// 计算 horizontal(Align::Center) 布局中，在高度为 `bar_h` 的区域里
     /// 分配高度为 `btn_h` 的元素时，元素顶边相对于区域顶边的 y 偏移。
@@ -317,11 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn 按钮垂直居中_栏高24_按钮高18_偏移3px() {
+    fn 按钮垂直居中_栏高28_按钮高18_偏移5px() {
         let offset = center_y_offset(HEIGHT, 18.0);
         assert_eq!(
-            offset, 3.0,
-            "状态栏高 {HEIGHT}px / 按钮高 18px 应居中，上下各 3px 间距，实际 {offset}px"
+            offset, 5.0,
+            "状态栏高 {HEIGHT}px / 按钮高 18px 应居中，上下各 5px 间距，实际 {offset}px"
         );
     }
 
