@@ -697,6 +697,57 @@ impl Renderer {
                                 color: self.theme.foreground.to_linear_f32(0.9),
                             });
                         }
+
+                        // M4.1 批D2：IME preedit 下划线。
+                        // preedit.text 绘制在光标处（内嵌方式），下划线跨越整个预编辑段。
+                        // 精确字形宽度 M4.2 精化；此处按字符数 × cell_w 粗估。
+                        if let Some(pre) = &cv.preedit {
+                            if !pre.text.is_empty() {
+                                let pre_char_count = pre.text.chars().count() as f32;
+                                let underline_x = cursor_x;
+                                let underline_y = cursor_y + ch - 2.0;
+                                let underline_w = (pre_char_count * cw).min(footer_w - underline_x);
+                                if underline_w > 0.0 && underline_y < target_h as f32 {
+                                    // 下划线：前景色 70% 透明度，高 1.5px。
+                                    instances.push(rect::RectInstance {
+                                        pos: [underline_x, underline_y],
+                                        size: [underline_w, 1.5],
+                                        color: self.theme.foreground.to_linear_f32(0.7),
+                                    });
+                                }
+                            }
+                        }
+
+                        // M4.1 批D2：退出码角标（exit_badge）。
+                        // 显示在 footer 右侧：✓（绿）或 ✗（红）+ 耗时。
+                        // 用一个小色块（角标背景）在右角提示。
+                        if let Some(badge) = &cv.exit_badge {
+                            // 角标色：成功绿 = ansi[2]，失败红 = ansi[1]。
+                            let badge_color = if badge.exit_code == 0 {
+                                self.theme.ansi[2] // 绿
+                            } else {
+                                self.theme.ansi[1] // 红
+                            };
+                            // 角标宽度：约 3 个字符宽（✓/✗ + 空格 + 耗时简写）。
+                            // 精确文字宽度 M4.2 精化；此处固定小色块。
+                            let badge_w = cw * 6.0_f32.min(footer_w / 4.0);
+                            let badge_h = ch * 0.8;
+                            let badge_x = (footer_w - badge_w - fp).max(fp);
+                            let badge_y = footer_top + (footer_px - badge_h) / 2.0;
+                            if badge_x > fp && badge_y > footer_top {
+                                instances.push(rect::RectInstance {
+                                    pos: [badge_x, badge_y],
+                                    size: [badge_w, badge_h],
+                                    color: badge_color.to_linear_f32(0.25),
+                                });
+                                // 角标左缘细竖线（1px，颜色全亮）。
+                                instances.push(rect::RectInstance {
+                                    pos: [badge_x, badge_y],
+                                    size: [1.5, badge_h],
+                                    color: badge_color.to_linear_f32(0.9),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -841,30 +892,86 @@ impl Renderer {
         // 生命周期纪律：footer_buffers 必须先于 text_areas 声明，二者同作用域，
         // TextArea 借用 footer_buffers 中的元素，在 prepare 调用后一起 drop。
         #[cfg(feature = "input-editor")]
-        let footer_buffers: Vec<(usize, TextBuffer, f32, i32)> = {
-            // 元素：(line_idx, buf, text_y, bottom_clamp)
-            let mut bufs: Vec<(usize, TextBuffer, f32, i32)> = Vec::new();
+        let footer_buffers: Vec<(usize, TextBuffer, f32, i32, f32)> = {
+            // 元素：(line_idx, buf, text_y, bottom_clamp, left_x)
+            let mut bufs: Vec<(usize, TextBuffer, f32, i32, f32)> = Vec::new();
             if footer_px > 0.0 {
                 if let Some(cv) = composer {
                     if cv.is_visible() {
                         let footer_top = target_h as f32 - footer_px;
                         let fp = self.padding * 0.4;
+
+                        // 编辑器正文行（Compose 态/Running 态文案）。
                         for (li, line_text) in cv.lines.iter().enumerate() {
                             if line_text.is_empty() {
                                 continue;
                             }
+                            // Compose 态：若有 preedit，在正文末尾内嵌预编辑文本。
+                            let display_text = if cv.kind == composer_view::FooterKind::Composer {
+                                if let Some(pre) = &cv.preedit {
+                                    if li == cv.cursor.0 {
+                                        // 在光标处插入预编辑文本（内嵌）。
+                                        let base = line_text.clone();
+                                        let byte_pos = cv.cursor.1.min(base.len());
+                                        let mut s =
+                                            String::with_capacity(base.len() + pre.text.len());
+                                        s.push_str(&base[..byte_pos]);
+                                        s.push_str(&pre.text);
+                                        s.push_str(&base[byte_pos..]);
+                                        s
+                                    } else {
+                                        line_text.clone()
+                                    }
+                                } else {
+                                    line_text.clone()
+                                }
+                            } else {
+                                line_text.clone()
+                            };
+
                             let mut buf = TextBuffer::new(&mut self.font_system, metrics);
                             buf.set_size(&mut self.font_system, None, Some(ch));
                             buf.set_text(
                                 &mut self.font_system,
-                                line_text,
+                                &display_text,
                                 &base_attrs,
                                 Shaping::Advanced,
                                 None,
                             );
                             let text_y = footer_top + fp + li as f32 * ch;
                             let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
-                            bufs.push((li, buf, text_y, bottom_clamp));
+                            bufs.push((li, buf, text_y, bottom_clamp, fp));
+                        }
+
+                        // M4.1 批D2：退出码角标文字（✓/✗ + 耗时）。
+                        // 仅 Compose 态且有角标时绘制（Running 态不显示角标文字）。
+                        if cv.kind == composer_view::FooterKind::Composer {
+                            if let Some(badge) = &cv.exit_badge {
+                                let symbol = if badge.exit_code == 0 { "✓" } else { "✗" };
+                                let ms = badge.duration_ms;
+                                let duration_str = if ms < 1000 {
+                                    format!("{ms}ms")
+                                } else {
+                                    format!("{:.1}s", ms as f64 / 1000.0)
+                                };
+                                let badge_text = format!("{symbol} {duration_str}");
+                                let mut buf = TextBuffer::new(&mut self.font_system, metrics);
+                                buf.set_size(&mut self.font_system, None, Some(ch));
+                                buf.set_text(
+                                    &mut self.font_system,
+                                    &badge_text,
+                                    &base_attrs,
+                                    Shaping::Advanced,
+                                    None,
+                                );
+                                // 角标文字靠右对齐：近似用 badge_w 对齐
+                                let badge_w = cw * 6.0_f32.min(target_w as f32 / 4.0);
+                                let badge_x = (target_w as f32 - badge_w - fp - fp).max(fp + fp);
+                                let text_y = footer_top + (footer_px - ch) / 2.0;
+                                let bottom_clamp = ((text_y + ch) as i32).min(target_h as i32);
+                                // 用一个特殊 line_idx=usize::MAX 区分角标行
+                                bufs.push((usize::MAX, buf, text_y, bottom_clamp, badge_x));
+                            }
                         }
                     }
                 }
@@ -899,11 +1006,10 @@ impl Renderer {
         // footer TextArea（借用 footer_buffers 元素，生命周期随 text_areas drop 同帧结束）。
         #[cfg(feature = "input-editor")]
         {
-            let fp = self.padding * 0.4;
-            for (_li, buf, text_y, bottom_clamp) in &footer_buffers {
+            for (_li, buf, text_y, bottom_clamp, left_x) in &footer_buffers {
                 text_areas.push(TextArea {
                     buffer: buf,
-                    left: fp,
+                    left: *left_x,
                     top: *text_y,
                     scale: 1.0,
                     bounds: TextBounds {

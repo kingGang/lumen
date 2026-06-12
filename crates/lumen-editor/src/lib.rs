@@ -165,6 +165,14 @@ impl Editor {
         self.abandoned.is_some()
     }
 
+    /// 只读查看放弃稿（不消费）。
+    ///
+    /// 用于 app 层同步 abandoned 到历史库——不 take，保留 editor 内的副本
+    /// （下次 ↑ 导航时 editor 侧可能仍需它；历史库 take 只在 navigate_up 里发生）。
+    pub fn abandoned(&self) -> Option<&str> {
+        self.abandoned.as_deref()
+    }
+
     /// M3.2 预留：检测是否需要续行（未闭合引号/括号/行尾管道等）。
     /// 当前批次仅返回 `false`（占位；M3.2 实现 PowerShell tokenizer 后填充）。
     pub fn needs_continuation(&self) -> bool {

@@ -24,7 +24,7 @@ pub enum FooterKind {
     Hidden,
 }
 
-/// app 组装、renderer 消费的 footer 只读视图（M4.1 批C）。
+/// app 组装、renderer 消费的 footer 只读视图（M4.1 批C/D2）。
 ///
 /// renderer 仅读本结构，不感知 lumen-editor 内部状态。
 ///
@@ -33,6 +33,8 @@ pub enum FooterKind {
 /// - `lines`：文本行内容（Compose 态为编辑内容，Running 态为 `["状态文案"]`）。
 /// - `cursor`：光标位置 `(行索引, 字节偏移)`，仅 Compose 态有意义。
 /// - `label`：模式提示标签（如 "Compose" / "直通中" / 空串）。
+/// - `preedit`：IME 预编辑文本（Compose 态；None 表示无预编辑）。M4.1 批D2。
+/// - `exit_badge`：退出码角标（None 表示无需显示）。M4.1 批D2。
 #[derive(Debug, Clone)]
 pub struct ComposerView {
     /// footer 形态。
@@ -43,6 +45,31 @@ pub struct ComposerView {
     pub cursor: (usize, usize),
     /// 模式提示标签（状态条右侧角落，可为空串）。
     pub label: String,
+    /// IME 预编辑文本（M4.1 批D2）：Some 时在光标处内嵌绘制（下划线样式）。
+    /// 不进文档模型、不参与 undo；Ime::Commit 时清空。
+    pub preedit: Option<PreeditState>,
+    /// 退出码角标（M4.1 批D2）：None 表示不显示；任意按键后由 app 层清空。
+    pub exit_badge: Option<ExitBadge>,
+}
+
+/// IME 预编辑状态（M4.1 批D2，设计稿 §7.3）。
+#[derive(Debug, Clone, Default)]
+pub struct PreeditState {
+    /// 预编辑文本内容。
+    pub text: String,
+    /// 预编辑活动区间（字节偏移，[start, end)），None 表示整段均激活。
+    pub cursor_range: Option<(usize, usize)>,
+}
+
+/// 退出码角标（M4.1 批D2，设计稿 §3.2 第⑥步）。
+///
+/// 任意按键后由 app 层清空（dispatcher 收到任意键盘事件时 clear）。
+#[derive(Debug, Clone)]
+pub struct ExitBadge {
+    /// 退出码（0 = 成功绿色 ✓，非零 = 失败红色 ✗）。
+    pub exit_code: i32,
+    /// 命令耗时（毫秒），用于显示耗时文本。
+    pub duration_ms: u64,
 }
 
 impl ComposerView {
@@ -58,6 +85,8 @@ impl ComposerView {
             lines: vec![String::new()],
             cursor: (0, 0),
             label: label.into(),
+            preedit: None,
+            exit_badge: None,
         }
     }
 
@@ -72,6 +101,8 @@ impl ComposerView {
             lines: vec![status_text.into()],
             cursor: (0, 0),
             label: label.into(),
+            preedit: None,
+            exit_badge: None,
         }
     }
 
@@ -82,6 +113,8 @@ impl ComposerView {
             lines: Vec::new(),
             cursor: (0, 0),
             label: String::new(),
+            preedit: None,
+            exit_badge: None,
         }
     }
 

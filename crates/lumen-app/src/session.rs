@@ -26,6 +26,9 @@ use winit::event_loop::EventLoopProxy;
 use crate::shell::layout::PaneLayout;
 use crate::PtyWake;
 
+#[cfg(feature = "input-editor")]
+use lumen_renderer::composer_view::PreeditState;
+
 /// 会话唯一标识。自增分配、关闭后不复用——退出列表/侧栏动作等按
 /// id 寻会话，复用会与滞后引用相撞；通道里的残留事件随本会话的
 /// Receiver 一并丢弃，无需按 id 过滤。
@@ -164,9 +167,28 @@ pub struct Session {
     #[cfg(feature = "input-editor")]
     pub editor: Editor,
     /// M4.1 批D1：pending_submit — 提交但尚未看到 C 标记的在途命令。
-    /// `(提交文本, 提交时刻)`；C 标记到达后（块切 Running）清空。
+    /// `(提交文本, 提交时刻, 历史库条目下标)`；C 标记到达后（块切 Running）清空。
     #[cfg(feature = "input-editor")]
-    pub pending_submit: Option<(String, std::time::Instant)>,
+    pub pending_submit: Option<(String, std::time::Instant, usize)>,
+    /// M4.1 批D2：上次已消费的已闭合块总数（闭合块计数去重探针）。
+    /// `advance()` 后若闭合块数增加，说明有新 OSC 133 D 事件，即块刚闭合。
+    #[cfg(feature = "input-editor")]
+    pub last_seen_closed_blocks: usize,
+    /// M4.1 批D2：IME 预编辑状态（Compose 态 Preedit 事件更新，Commit/离开 Compose 时清空）。
+    #[cfg(feature = "input-editor")]
+    pub preedit: Option<PreeditState>,
+    /// M4.1 批D2：退出码角标（块闭合时设置，任意键盘事件时清空）。
+    #[cfg(feature = "input-editor")]
+    pub exit_badge: Option<lumen_renderer::composer_view::ExitBadge>,
+    /// M4.1 批D2：footer 目标像素高度（用于增高防抖）。
+    #[cfg(feature = "input-editor")]
+    pub footer_target_h: f32,
+    /// M4.1 批D2：footer 目标高度上次变化时刻（增高防抖计时）。
+    #[cfg(feature = "input-editor")]
+    pub footer_h_changed_at: std::time::Instant,
+    /// M4.1 批D2：当前已提交给 renderer 的 footer 高度（防抖实际生效值）。
+    #[cfg(feature = "input-editor")]
+    pub footer_committed_h: f32,
 }
 
 impl Session {
@@ -234,6 +256,18 @@ impl Session {
             editor: Editor::default(),
             #[cfg(feature = "input-editor")]
             pending_submit: None,
+            #[cfg(feature = "input-editor")]
+            last_seen_closed_blocks: 0,
+            #[cfg(feature = "input-editor")]
+            preedit: None,
+            #[cfg(feature = "input-editor")]
+            exit_badge: None,
+            #[cfg(feature = "input-editor")]
+            footer_target_h: 0.0,
+            #[cfg(feature = "input-editor")]
+            footer_h_changed_at: std::time::Instant::now(),
+            #[cfg(feature = "input-editor")]
+            footer_committed_h: 0.0,
         })
     }
 

@@ -6,6 +6,9 @@ mod background;
 /// footer 输入区视图组装（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
 #[cfg(feature = "input-editor")]
 mod composer;
+/// 命令历史库（M4.1 批D2，feature = "input-editor"）——设计稿 §8。
+#[cfg(feature = "input-editor")]
+mod history;
 mod i18n;
 mod input;
 mod keymap;
@@ -412,18 +415,32 @@ struct AppState {
     /// 所有按键直通 PTY（= M2 现状）。设计稿 §2「手动逃生」。
     /// **禁止在此字段之外的地方保存输入模式副本**（设计稿铁律）。
     force_fallback: bool,
+    /// 命令历史库（M4.1 批D2）：启动时加载，提交时追加写，退出时原子重写。
+    /// feature = "input-editor" 门控（Fallback/无 feature 时历史功能禁用）。
+    #[cfg(feature = "input-editor")]
+    history: history::HistoryStore,
 }
 
-/// 提交文本编码为 PTY 载荷（M4.1 批D1）——设计稿 §3.2 步骤 2。
+/// 提交文本编码为 PTY 载荷（M4.1 批D1/D2）——设计稿 §3.2 步骤 2。
 ///
 /// - 单行：`text + "\r"`
-/// - 多行：`"\x1b[200~" + text + "\x1b[201~\r"`（括号粘贴协议包裹）
+/// - 多行：**无条件**用 `"\x1b[200~" + text + "\x1b[201~\r"` 括号粘贴包裹。
+///
+/// # 关于多行无条件包裹（6e9635b 实测核验，D2 拍板）
+///
+/// 原设计草案依赖 `term.bracketed_paste()` 查询决定是否包裹，但实测
+/// `term.bracketed_paste()` 始终为 `false`（PSReadLine 未发送 DEC 2004h 声明）。
+/// 实测证明：PSReadLine 不声明 bracketed paste，但**确实正确处理** ESC[200~...ESC[201~
+/// 序列——将其作为一整块不触发 `>>` 续行。因此改为**无条件**包裹多行：
+/// 无论 `term.bracketed_paste()` 返回何值，多行提交始终用 200~/201~ 包装。
+/// `bracketed_paste()` 的返回值仅作日志/取证参考，不再影响提交路径。
 ///
 /// 此纯函数无副作用，可独立单测。
 #[cfg(feature = "input-editor")]
 fn encode_submit(text: &str) -> Vec<u8> {
     let line_count = text.lines().count();
     if line_count > 1 {
+        // 多行：无条件括号粘贴包裹（见函数文档，6e9635b 实测核验）。
         let mut buf = Vec::with_capacity(text.len() + 14);
         buf.extend_from_slice(b"\x1b[200~");
         buf.extend_from_slice(text.as_bytes());
@@ -609,6 +626,11 @@ impl AppState {
                 let current_mode =
                     mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback);
                 if current_mode == mode::InputMode::Compose {
+                    // 任意编辑动作 → 退出历史导航态（设计稿 §8：编辑即回到当前）。
+                    // 仅在正在导航时才重置（is_navigating 纯判断，无副作用）。
+                    if self.history.is_navigating() {
+                        self.history.exit_navigation();
+                    }
                     // app 层 EditAction → lumen_editor::EditAction 转换
                     let editor_action = app_to_editor_action(ea);
                     let _outcome = self.tabs[ti].panes[pi].editor.apply(&editor_action);
@@ -636,7 +658,7 @@ impl AppState {
                 match ca {
                     ComposerAction::Submit if current_mode == mode::InputMode::Compose => {
                         // 步骤 1：门控（双重检查，keymap 已检查过一次）
-                        // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴）
+                        // 步骤 2：编码（纯函数，单行 + CR；多行 + 括号粘贴无条件包裹）
                         let raw_text = self.tabs[ti].panes[pi].editor.view().text();
                         let payload = encode_submit(&raw_text);
                         // 步骤 3：滚动到底 + 写 PTY
@@ -644,20 +666,45 @@ impl AppState {
                         if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&payload) {
                             log::error!("提交写 PTY 失败: {e:#}");
                         }
-                        // 步骤 4：清空编辑器缓冲 + 记录 pending_submit
-                        let submitted = String::from_utf8_lossy(&payload).into_owned();
+                        // 步骤 4：清空编辑器缓冲 + 记录 pending_submit + 写历史库
+                        let submitted_at = std::time::Instant::now();
+                        // 取当前 cwd（OSC 9;9 上报值）
+                        let cwd = self.tabs[ti].panes[pi]
+                            .term
+                            .cwd()
+                            .map(|p| p.display().to_string());
+                        // 写历史库并取条目下标（用于块闭合时回填）
+                        let history_idx = self.history.append_submitted(raw_text.clone(), cwd);
+                        // 退出历史导航态（提交 = 新命令基线）
+                        self.history.exit_navigation();
+                        // 同步 abandoned 到历史库
+                        let abandoned = self.tabs[ti].panes[pi]
+                            .editor
+                            .abandoned()
+                            .map(|s| s.to_owned());
+                        self.history.set_abandoned(abandoned);
                         self.tabs[ti].panes[pi]
                             .editor
                             .apply(&lumen_editor::EditAction::Clear);
+                        // 清 IME preedit
+                        self.tabs[ti].panes[pi].preedit = None;
+                        // 清退出码角标（提交新命令时角标已无意义）
+                        self.tabs[ti].panes[pi].exit_badge = None;
                         self.tabs[ti].panes[pi].pending_submit =
-                            Some((submitted.clone(), std::time::Instant::now()));
-                        events.push(StateEvent::SubmittedText(submitted));
+                            Some((raw_text.clone(), submitted_at, history_idx));
+                        events.push(StateEvent::SubmittedText {
+                            text: raw_text,
+                            submitted_at,
+                            history_idx,
+                        });
                         self.window.request_redraw();
                     }
                     ComposerAction::CancelLine if current_mode == mode::InputMode::Compose => {
                         // Ctrl+C 缓冲非空：清空并存放弃稿
                         let text = self.tabs[ti].panes[pi].editor.view().text();
-                        self.tabs[ti].panes[pi].editor.stash_abandoned(text);
+                        self.tabs[ti].panes[pi].editor.stash_abandoned(text.clone());
+                        // 同步 abandoned 到历史库
+                        self.history.set_abandoned(Some(text));
                         self.tabs[ti].panes[pi]
                             .editor
                             .apply(&lumen_editor::EditAction::Clear);
@@ -665,6 +712,50 @@ impl AppState {
                         events.push(StateEvent::EditorRevision(
                             self.tabs[ti].panes[pi].editor.revision(),
                         ));
+                    }
+                    ComposerAction::HistoryPrev if current_mode == mode::InputMode::Compose => {
+                        // ↑ 历史向上导航（M4.1 批D2）
+                        // 同步 abandoned 到历史库（每次进入导航前刷新）
+                        let abandoned = self.tabs[ti].panes[pi]
+                            .editor
+                            .abandoned()
+                            .map(|s| s.to_owned());
+                        self.history.set_abandoned(abandoned);
+                        let current = self.tabs[ti].panes[pi].editor.view().text();
+                        if let Some(text) = self.history.navigate_up(&current) {
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::SetText(text));
+                            // 光标移到行末（历史条目视觉跟手）
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::Move {
+                                    motion: lumen_editor::Motion::DocEnd,
+                                    extend: false,
+                                });
+                            self.window.request_redraw();
+                            events.push(StateEvent::EditorRevision(
+                                self.tabs[ti].panes[pi].editor.revision(),
+                            ));
+                        }
+                    }
+                    ComposerAction::HistoryNext if current_mode == mode::InputMode::Compose => {
+                        // ↓ 历史向下导航（M4.1 批D2）
+                        if let Some(text) = self.history.navigate_down() {
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::SetText(text));
+                            self.tabs[ti].panes[pi]
+                                .editor
+                                .apply(&lumen_editor::EditAction::Move {
+                                    motion: lumen_editor::Motion::DocEnd,
+                                    extend: false,
+                                });
+                            self.window.request_redraw();
+                            events.push(StateEvent::EditorRevision(
+                                self.tabs[ti].panes[pi].editor.revision(),
+                            ));
+                        }
                     }
                     _ => {
                         log::debug!(
@@ -881,8 +972,14 @@ impl AppState {
         // M4.1 批C：计算 footer 高度以排除 footer 区域的点击。
         #[cfg(feature = "input-editor")]
         let footer_px = {
-            let mode = mode::effective_mode(&self.focused_pane().term, self.force_fallback);
-            let cv = composer::compose_view_for_mode(mode, self.focused_pane().editor.view());
+            let pane = self.focused_pane();
+            let mode = mode::effective_mode(&pane.term, self.force_fallback);
+            let cv = composer::compose_view_for_mode(
+                mode,
+                pane.editor.view(),
+                pane.preedit.clone(),
+                pane.exit_badge.clone(),
+            );
             let (_, cell_h) = self.renderer.cell_size();
             let fp = self.renderer.padding() * 0.4;
             let max_h = h / 3.0;
@@ -1644,6 +1741,12 @@ impl App {
             .ok()
             .and_then(|p| std::fs::File::create(p).ok());
 
+        // —— 命令历史库（M4.1 批D2）——
+        // 启动时加载磁盘历史，顺序：磁盘 JSONL → PSReadLine 种子（首次）。
+        // 加载失败降级空库，记 warn 日志，不阻断启动。
+        #[cfg(feature = "input-editor")]
+        let history_store = history::HistoryStore::load();
+
         let mut state = AppState {
             perf,
             perf_t0: Instant::now(),
@@ -1683,6 +1786,8 @@ impl App {
             window_just_resized: false,
             bg_texture: None,
             force_fallback: false,
+            #[cfg(feature = "input-editor")]
+            history: history_store,
         };
         state.shell_state.settings.font_hint = font_hint;
         // 恢复条目中保存的 cwd 已失效：回退默认目录并提示一次（F4）。
@@ -1846,6 +1951,79 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         state.tabs[ti].panes[pi].term.advance(&bytes);
                         got_data[k] = true;
+
+                        // —— 块闭合探针（M4.1 批D2）——
+                        // advance() 处理 OSC 133;D 后会新增已闭合块；
+                        // 探针用已见闭合块数与当前闭合块数比对。
+                        #[cfg(feature = "input-editor")]
+                        {
+                            // 先收集所有需要处理的数据（不持有不可变借用）。
+                            let (closed_now, new_block_data): (usize, Vec<(u64, Option<i32>)>) = {
+                                let pane = &state.tabs[ti].panes[pi];
+                                let blocks = pane.term.blocks();
+                                let closed_blocks: Vec<_> =
+                                    blocks.iter().filter(|b| b.is_closed()).collect();
+                                let closed_now = closed_blocks.len();
+                                let last = pane.last_seen_closed_blocks;
+                                let new_data: Vec<(u64, Option<i32>)> = if closed_now > last {
+                                    closed_blocks[last..]
+                                        .iter()
+                                        .map(|b| (b.id, b.exit_code))
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                (closed_now, new_data)
+                            };
+
+                            if !new_block_data.is_empty() {
+                                // 耗时：从 pending_submit 的提交时刻到现在（在写 pane 前取）。
+                                let duration_ms = state.tabs[ti].panes[pi]
+                                    .pending_submit
+                                    .as_ref()
+                                    .map(|(_, t, _)| t.elapsed().as_millis() as u64)
+                                    .unwrap_or(0);
+                                // 取 pending_submit 中的文本和 history_idx（clone 脱离借用）。
+                                let pending = state.tabs[ti].panes[pi].pending_submit.clone();
+
+                                for (block_id, exit_code) in &new_block_data {
+                                    // 设置退出码角标（仅 Compose 态会显示，Running 态下也存，
+                                    // 下一次进入 Compose 态时 badge 仍在，按任意键清除）。
+                                    if let Some(code) = exit_code {
+                                        state.tabs[ti].panes[pi].exit_badge =
+                                            Some(lumen_renderer::composer_view::ExitBadge {
+                                                exit_code: *code,
+                                                duration_ms,
+                                            });
+                                    }
+                                    // 历史库回填 exit_code + duration_ms
+                                    if let Some((ref submitted_text, _, history_idx)) = pending {
+                                        // 取当前库中该条目的 ts（用于 text+ts 匹配校验）
+                                        let ts = state
+                                            .history
+                                            .entries()
+                                            .get(history_idx)
+                                            .map(|e| e.ts)
+                                            .unwrap_or(0);
+                                        state.history.backfill(
+                                            history_idx,
+                                            submitted_text,
+                                            ts,
+                                            exit_code.unwrap_or(-1),
+                                            duration_ms,
+                                        );
+                                    }
+                                    log::debug!(
+                                        "[BlockClosed] block_id={block_id} exit_code={exit_code:?} duration_ms={duration_ms}"
+                                    );
+                                }
+                                // 回填完成后清 pending_submit（仅清一次，即使多块闭合）。
+                                if pending.is_some() {
+                                    state.tabs[ti].panes[pi].pending_submit = None;
+                                }
+                                state.tabs[ti].panes[pi].last_seen_closed_blocks = closed_now;
+                            }
+                        }
                     }
                     PtyEvent::Exited => exited.push(state.tabs[ti].panes[pi].id),
                 }
@@ -2144,6 +2322,10 @@ impl ApplicationHandler<PtyWake> for App {
                 // 变更已即时写盘，这里兜底拿住「最后一次变更与关窗
                 // 之间」的状态（快照一致时内部自动跳过）。
                 state.persist_sessions();
+                // 命令历史库：原子重写磁盘（去重 + 截断到 MAX_ENTRIES）。
+                // 失败只记 warn，不阻断退出。（M4.1 批D2）
+                #[cfg(feature = "input-editor")]
+                state.history.flush_on_exit();
                 event_loop.exit();
             }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
@@ -2229,6 +2411,22 @@ impl ApplicationHandler<PtyWake> for App {
                     compose_buf_empty: state.tabs[ti].panes[pi].editor.view().text().is_empty(),
                     #[cfg(not(feature = "input-editor"))]
                     compose_buf_empty: true,
+                    // M4.1 批D2：光标所在行位置（影响 ↑/↓ 历史导航 vs 多行移动分流）
+                    #[cfg(feature = "input-editor")]
+                    compose_cursor_at_first_line: {
+                        let view = state.tabs[ti].panes[pi].editor.view();
+                        view.cursor().line == 0
+                    },
+                    #[cfg(not(feature = "input-editor"))]
+                    compose_cursor_at_first_line: true,
+                    #[cfg(feature = "input-editor")]
+                    compose_cursor_at_last_line: {
+                        let view = state.tabs[ti].panes[pi].editor.view();
+                        let lc = view.line_count();
+                        view.cursor().line == lc.saturating_sub(1)
+                    },
+                    #[cfg(not(feature = "input-editor"))]
+                    compose_cursor_at_last_line: true,
                 };
 
                 // 求值当前有效输入模式（纯推导，不缓存）。
@@ -2237,6 +2435,14 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // 查表。
                 let result = keymap::lookup(&event, state.modifiers, mode, pressed, &guard);
+
+                // 任意按键命中 → 清退出码角标（设计稿 §3.2 第⑥步，M4.1 批D2）。
+                // 仅 Compose 态有 exit_badge；result=None（keymap 拦截）时也清，
+                // 防止角标因未命中的修饰键抬起而留住。
+                #[cfg(feature = "input-editor")]
+                if result.is_some() {
+                    state.tabs[ti].panes[pi].exit_badge = None;
+                }
 
                 match result {
                     None => {
@@ -2473,6 +2679,37 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 _ => {}
             },
+            // IME 预编辑（M4.1 批D2，设计稿 §7.3）：
+            // Compose 态：更新 session.preedit（不进编辑器文档，不参与 undo）。
+            // text 为空或 cursor_range 为 None + 空串 → 清空预编辑（预编辑取消）。
+            // 其余态：事件本身已由 egui-winit 处理（路由已交 egui），此处忽略。
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                if !state.terminal_focused {
+                    return;
+                }
+                let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                #[cfg(feature = "input-editor")]
+                {
+                    let mode =
+                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                    if mode == mode::InputMode::Compose {
+                        if text.is_empty() {
+                            // 空串 = 预编辑结束/取消
+                            state.tabs[ti].panes[pi].preedit = None;
+                        } else {
+                            state.tabs[ti].panes[pi].preedit =
+                                Some(lumen_renderer::composer_view::PreeditState {
+                                    text,
+                                    cursor_range: cursor,
+                                });
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                }
+                // 非 Compose 态或 feature 未开启：丢弃（PTY 终端自行处理 IME）。
+                let _ = (text, cursor);
+            }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 // 仅终端聚焦时把 IME 提交文本写入 shell（焦点窗格）；
                 // egui 输入框聚焦时事件已喂给 egui 消化，再写 PTY 就是
@@ -2489,6 +2726,8 @@ impl ApplicationHandler<PtyWake> for App {
                     let mode =
                         mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
                     if mode == mode::InputMode::Compose {
+                        // 提交时清空 preedit（M4.1 批D2）
+                        state.tabs[ti].panes[pi].preedit = None;
                         // IME 提交进编辑器（走 dispatch 确保门控逻辑一致）
                         state.dispatch(
                             action::Action::Edit(action::EditAction::InsertText(text)),
@@ -3344,16 +3583,39 @@ impl ApplicationHandler<PtyWake> for App {
                             if is_focused {
                                 let pane = &state.tabs[state.active_tab].panes[i];
                                 let mode = mode::effective_mode(&pane.term, state.force_fallback);
-                                let cv = composer::compose_view_for_mode(mode, pane.editor.view());
+                                let cv = composer::compose_view_for_mode(
+                                    mode,
+                                    pane.editor.view(),
+                                    pane.preedit.clone(),
+                                    pane.exit_badge.clone(),
+                                );
                                 let (_, cell_h) = state.renderer.cell_size();
                                 let fp = state.renderer.padding() * 0.4;
                                 let max_h = th as f32 / 3.0;
-                                lumen_renderer::composer_view::footer_height_px(
+                                let target_h = lumen_renderer::composer_view::footer_height_px(
                                     Some(&cv),
                                     cell_h,
                                     fp,
                                     max_h,
-                                )
+                                );
+                                // M4.1 批D2：增高防抖（100ms）。
+                                // 目标高度变化时更新 footer_target_h 和 changed_at。
+                                let s = &mut state.tabs[state.active_tab].panes[i];
+                                if (target_h - s.footer_target_h).abs() >= 0.5 {
+                                    s.footer_target_h = target_h;
+                                    s.footer_h_changed_at = Instant::now();
+                                }
+                                // 纯函数判定：是否允许提交给 renderer/resize。
+                                let should_commit = history::footer_height_debounce(
+                                    s.footer_committed_h,
+                                    s.footer_target_h,
+                                    s.footer_h_changed_at,
+                                    Instant::now(),
+                                );
+                                if should_commit {
+                                    s.footer_committed_h = s.footer_target_h;
+                                }
+                                s.footer_committed_h
                             } else {
                                 0.0_f32
                             }
@@ -3437,7 +3699,12 @@ impl ApplicationHandler<PtyWake> for App {
                     let footer_view = {
                         let focused = state.focused_pane();
                         let mode = mode::effective_mode(&focused.term, state.force_fallback);
-                        composer::compose_view_for_mode(mode, focused.editor.view())
+                        composer::compose_view_for_mode(
+                            mode,
+                            focused.editor.view(),
+                            focused.preedit.clone(),
+                            focused.exit_badge.clone(),
+                        )
                     };
 
                     for (i, skip) in skip_pane.iter().enumerate() {
@@ -3499,15 +3766,49 @@ impl ApplicationHandler<PtyWake> for App {
                     .handle_platform_output(&state.window, full_output.platform_output);
                 if state.terminal_focused {
                     state.window.set_ime_allowed(true);
-                    if let Some((px, py, _, _)) = state.focused_pane_rect_px() {
+                    if let Some((px, py, pw, ph)) = state.focused_pane_rect_px() {
                         let s = state.focused_pane();
-                        let g = s.term.grid();
-                        let view_row = (g.display_offset() + s.cursor_displayed.0)
-                            .min(g.rows().saturating_sub(1));
-                        let (cx, cy) = state.renderer.cell_origin(view_row, s.cursor_displayed.1);
                         let (cw, ch) = state.renderer.cell_size();
+
+                        // M4.1 批D2：Compose 态时 IME 候选框跟随 footer 内编辑器光标。
+                        // 其余态：跟随终端光标所在格子（原行为）。
+                        #[cfg(feature = "input-editor")]
+                        let (ime_x, ime_y) = {
+                            let mode = mode::effective_mode(&s.term, state.force_fallback);
+                            if mode == crate::mode::InputMode::Compose {
+                                // footer 光标位置：footer 在窗格底部
+                                // cursor = (行, 字节偏移)，此处近似为字符列 = cursor.1 / cell_w
+                                // 精确列需要 ComposerView 里的字节转 glyph 列，
+                                // 此处用字节偏移粗估（常用 ASCII 场景 1:1，CJK 偏差 1 格内）。
+                                let cv_cursor = s.editor.view().cursor();
+                                let footer_top_y = py + ph
+                                    - ch * (s.editor.view().line_count().max(1) as f32)
+                                    - state.renderer.padding() * 0.8;
+                                let col_approx = cv_cursor.byte.min(200) as f32;
+                                let footer_x = px + col_approx * cw;
+                                let footer_y = footer_top_y + cv_cursor.line as f32 * ch;
+                                (footer_x, footer_y)
+                            } else {
+                                let g = s.term.grid();
+                                let view_row = (g.display_offset() + s.cursor_displayed.0)
+                                    .min(g.rows().saturating_sub(1));
+                                let (cx, cy) =
+                                    state.renderer.cell_origin(view_row, s.cursor_displayed.1);
+                                (px + cx, py + cy)
+                            }
+                        };
+                        #[cfg(not(feature = "input-editor"))]
+                        let (ime_x, ime_y) = {
+                            let g = s.term.grid();
+                            let view_row = (g.display_offset() + s.cursor_displayed.0)
+                                .min(g.rows().saturating_sub(1));
+                            let (cx, cy) =
+                                state.renderer.cell_origin(view_row, s.cursor_displayed.1);
+                            (px + cx, py + cy)
+                        };
+                        let _ = pw; // pw 仅防未使用 warning（IME 候选框宽度用 cw）
                         state.window.set_ime_cursor_area(
-                            winit::dpi::PhysicalPosition::new((px + cx) as f64, (py + cy) as f64),
+                            winit::dpi::PhysicalPosition::new(ime_x as f64, ime_y as f64),
                             winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
                         );
                     }

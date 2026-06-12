@@ -97,6 +97,12 @@ pub struct GuardState {
     /// Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D 的行为）。
     /// M4.1 批D1：仅在 input-editor feature 开启时有意义。
     pub compose_buf_empty: bool,
+    /// Compose 态光标是否在首行（↑ 触发历史导航，而非行间移动）。
+    /// M4.1 批D2：仅在 input-editor feature 开启时有意义。
+    pub compose_cursor_at_first_line: bool,
+    /// Compose 态光标是否在末行（↓ 触发历史导航，而非行间移动）。
+    /// M4.1 批D2：仅在 input-editor feature 开启时有意义。
+    pub compose_cursor_at_last_line: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -357,8 +363,14 @@ pub fn lookup_input(
                     },
                 )));
             }
-            // ↑/↓：行间移动；首末行 no-op（D2 历史导航占位）
+            // ↑：光标在首行且无选区 → 历史导航 HistoryPrev；否则行间移动。
+            // M4.1 批D2 实现（守卫字段 compose_cursor_at_first_line）。
             if is_named(input, WinitNamedKey::ArrowUp) {
+                if !shift && guard.compose_cursor_at_first_line {
+                    return Some(LookupResult::TerminalAction(Action::Composer(
+                        ComposerAction::HistoryPrev,
+                    )));
+                }
                 return Some(LookupResult::TerminalAction(Action::Edit(
                     EditAction::Move {
                         motion: Motion::Up,
@@ -366,7 +378,13 @@ pub fn lookup_input(
                     },
                 )));
             }
+            // ↓：光标在末行且无选区 → 历史导航 HistoryNext；否则行间移动。
             if is_named(input, WinitNamedKey::ArrowDown) {
+                if !shift && guard.compose_cursor_at_last_line {
+                    return Some(LookupResult::TerminalAction(Action::Composer(
+                        ComposerAction::HistoryNext,
+                    )));
+                }
                 return Some(LookupResult::TerminalAction(Action::Edit(
                     EditAction::Move {
                         motion: Motion::Down,
@@ -1674,6 +1692,115 @@ mod tests {
                 )))
             ),
             "Compose 态普通字符 → InsertText"
+        );
+    }
+
+    // ── M4.1 批D2：历史导航 ↑/↓ ────────────────────────────────────
+
+    #[test]
+    fn compose_up_首行无选区_是_history_prev() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_first_line: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowUp,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Composer(
+                    ComposerAction::HistoryPrev
+                )))
+            ),
+            "Compose 态首行 ↑ → HistoryPrev"
+        );
+    }
+
+    #[test]
+    fn compose_up_非首行_是_move_up() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_first_line: false,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowUp,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::Up,
+                        extend: false,
+                    }
+                )))
+            ),
+            "Compose 态非首行 ↑ → Move Up"
+        );
+    }
+
+    #[test]
+    fn compose_down_末行无选区_是_history_next() {
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_last_line: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowDown,
+            ModifiersState::empty(),
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Composer(
+                    ComposerAction::HistoryNext
+                )))
+            ),
+            "Compose 态末行 ↓ → HistoryNext"
+        );
+    }
+
+    #[test]
+    fn compose_shift_up_首行_是_move_up_extend() {
+        // Shift+↑ 即使在首行也是扩选移动，不触发历史导航。
+        let guard = GuardState {
+            terminal_focused: true,
+            compose_cursor_at_first_line: true,
+            ..Default::default()
+        };
+        let result = lookup_named(
+            WinitNamedKey::ArrowUp,
+            ModifiersState::SHIFT,
+            InputMode::Compose,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Edit(
+                    EditAction::Move {
+                        motion: Motion::Up,
+                        extend: true,
+                    }
+                )))
+            ),
+            "Compose 态 Shift+↑ 首行 → Move Up extend=true（不触发历史导航）"
         );
     }
 

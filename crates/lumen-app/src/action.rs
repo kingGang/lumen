@@ -333,21 +333,29 @@ impl KeyMods {
 ///
 /// M3 阶段：驱动状态条 / 历史库；M4：即状态增量同步的事件源。
 /// 批B：只定义枚举 + dispatch 返回骨架，消费方后批接。
-// ALLOW: 骨架变体（ModeChanged/SubmittedText/BlockClosed/EditorRevision）批D/E 接消费方时才引用。
-// FallbackToggled(bool) 的 bool 字段表示开/关状态，是有意义的载荷，不改成 ()。
+// ALLOW: ModeChanged 变体目前只在事件推导中产生，消费方在 M4 状态增量接通时引用。
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum StateEvent {
     /// 输入模式发生了切换（模式纯函数值变化）。
     ModeChanged(crate::mode::InputMode),
     /// 用户提交了文本（批D 接 Composer 时填充）。
-    SubmittedText(String),
-    /// 命令块闭合（退出码已知），附 block_id 与 exit_code。
+    SubmittedText {
+        /// 提交的原始文本。
+        text: String,
+        /// 提交时刻（用于 pending_submit 时序计算）。
+        submitted_at: std::time::Instant,
+        /// 历史库条目下标（用于块闭合时回填 exit_code）。
+        history_idx: usize,
+    },
+    /// 命令块闭合（退出码已知，M4.1 批D2 接消费方）。
     BlockClosed {
         /// 命令块 id。
         block_id: u64,
         /// 进程退出码。
         exit_code: Option<i32>,
+        /// 命令耗时（毫秒；从 pending_submit.submitted_at 到块闭合的时长）。
+        duration_ms: u64,
     },
     /// 编辑器 revision 变更（批D 接编辑器时填充）。
     EditorRevision(u64),

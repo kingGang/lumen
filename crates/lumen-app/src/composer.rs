@@ -17,6 +17,8 @@ use lumen_renderer::composer_view::ComposerView;
 
 #[cfg(feature = "input-editor")]
 use lumen_editor::EditorView;
+#[cfg(feature = "input-editor")]
+use lumen_renderer::composer_view::{ExitBadge, PreeditState};
 
 /// 按当前有效输入模式组装 [`ComposerView`]。
 ///
@@ -33,8 +35,15 @@ use lumen_editor::EditorView;
 /// # Arguments
 /// * `mode` - 当前有效输入模式（由 [`crate::mode::effective_mode`] 推导）。
 /// * `editor_view` - Compose 态时的编辑器只读视图（仅 Compose 态读取内容）。
+/// * `preedit` - IME 预编辑状态（M4.1 批D2，仅 Compose 态有效）。
+/// * `exit_badge` - 退出码角标（M4.1 批D2，仅 Compose 态显示）。
 #[cfg(feature = "input-editor")]
-pub fn compose_view_for_mode(mode: InputMode, editor_view: EditorView<'_>) -> ComposerView {
+pub fn compose_view_for_mode(
+    mode: InputMode,
+    editor_view: EditorView<'_>,
+    preedit: Option<PreeditState>,
+    exit_badge: Option<ExitBadge>,
+) -> ComposerView {
     let s = i18n::strings();
     match mode {
         InputMode::Compose => {
@@ -57,6 +66,8 @@ pub fn compose_view_for_mode(mode: InputMode, editor_view: EditorView<'_>) -> Co
                 lines,
                 cursor: (cur.line, cur.byte),
                 label: s.footer_label_compose.to_owned(),
+                preedit,    // M4.1 批D2：IME 预编辑
+                exit_badge, // M4.1 批D2：退出码角标
             }
         }
         InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
@@ -99,7 +110,7 @@ mod tests {
         #[test]
         fn compose_模式_产出_composer_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Compose, editor.view());
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::Composer,
@@ -111,7 +122,7 @@ mod tests {
         #[test]
         fn compose_空编辑器_一行() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Compose, editor.view());
+            let v = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
             assert_eq!(v.lines.len(), 1, "空编辑器应有 1 行");
             assert_eq!(v.cursor, (0, 0), "空编辑器光标在原点");
         }
@@ -119,7 +130,7 @@ mod tests {
         #[test]
         fn running_模式_产出_statusbar_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Running, editor.view());
+            let v = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::StatusBar,
@@ -131,7 +142,7 @@ mod tests {
         #[test]
         fn altscreen_模式_产出_hidden_形态() {
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::AltScreen, editor.view());
+            let v = compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::Hidden,
@@ -144,7 +155,7 @@ mod tests {
         fn fallback_模式_产出_statusbar_形态() {
             // 批D1：Fallback 不再隐藏，改为等高状态条显示"shell 集成未生效"
             let editor = empty_view();
-            let v = compose_view_for_mode(InputMode::Fallback, editor.view());
+            let v = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None);
             assert_eq!(
                 v.kind,
                 FooterKind::StatusBar,
@@ -158,8 +169,8 @@ mod tests {
         fn compose_与_running_等高() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_compose = compose_view_for_mode(InputMode::Compose, editor.view());
-            let v_running = compose_view_for_mode(InputMode::Running, editor.view());
+            let v_compose = compose_view_for_mode(InputMode::Compose, editor.view(), None, None);
+            let v_running = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
             let h_c = footer_height_px(Some(&v_compose), 20.0, 6.0, 1000.0);
             let h_r = footer_height_px(Some(&v_running), 20.0, 6.0, 1000.0);
             assert_eq!(
@@ -173,7 +184,7 @@ mod tests {
         fn altscreen_高度为零() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_alt = compose_view_for_mode(InputMode::AltScreen, editor.view());
+            let v_alt = compose_view_for_mode(InputMode::AltScreen, editor.view(), None, None);
             assert_eq!(
                 footer_height_px(Some(&v_alt), 20.0, 6.0, 1000.0),
                 0.0,
@@ -186,8 +197,8 @@ mod tests {
         fn fallback_与_running_等高() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
-            let v_fb = compose_view_for_mode(InputMode::Fallback, editor.view());
-            let v_run = compose_view_for_mode(InputMode::Running, editor.view());
+            let v_fb = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None);
+            let v_run = compose_view_for_mode(InputMode::Running, editor.view(), None, None);
             let h_fb = footer_height_px(Some(&v_fb), 20.0, 6.0, 1000.0);
             let h_run = footer_height_px(Some(&v_run), 20.0, 6.0, 1000.0);
             assert_eq!(h_fb, h_run, "Fallback({h_fb}) 与 Running({h_run}) 应等高");
