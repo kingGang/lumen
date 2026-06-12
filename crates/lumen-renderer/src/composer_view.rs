@@ -649,4 +649,58 @@ mod tests {
         let (_x1, _y1, w1, _h1) = rects[1];
         assert!((w1 - 6.0 * 8.0).abs() < 0.01, "中间整行 w = 6列×cw");
     }
+
+    // ── CJK 光标列与选区端点列一致性（三连绿必测项）────────────────────
+
+    /// "你好ab" 光标在 byte 6（"你好" 之后）→ 显示列 4。
+    ///
+    /// "你" = 3 字节，2 列；"好" = 3 字节，2 列；合计 byte=6 → col=4。
+    /// 这是修复前 chars().count() 会给出 2（字符数）而非 4（显示列数）的典型场景。
+    #[test]
+    fn cjk行_光标字节偏移转列_你好ab() {
+        // "你好ab"：你(3B,2col) 好(3B,2col) a(1B,1col) b(1B,1col)
+        let line = "你好ab";
+        assert_eq!(footer_byte_to_col(line, 0), 0, "行首 = 列 0");
+        assert_eq!(footer_byte_to_col(line, 3), 2, "你 之后 = 列 2");
+        assert_eq!(footer_byte_to_col(line, 6), 4, "你好 之后 = 列 4");
+        assert_eq!(footer_byte_to_col(line, 7), 5, "你好a 之后 = 列 5");
+        assert_eq!(footer_byte_to_col(line, 8), 6, "你好ab 之后 = 列 6");
+    }
+
+    /// 光标列 == 选区端点列一致性：CJK 行中 cursor 落在选区 end 字节处，
+    /// 二者计算出的列数必须相等（保证光标与高亮右边缘对齐）。
+    #[test]
+    fn cjk行_光标列等于选区端点列() {
+        // 行 "你好ab"，选区覆盖 "你好"（字节 0..6），光标在 byte 6。
+        let line = "你好ab".to_string();
+        let lines = vec![line.clone()];
+        let sel = FooterSelection {
+            start: (0, 0),
+            end: (0, 6),
+        };
+
+        // 选区右边界列（selection_rects 内部等价于 footer_byte_to_col(line, 6)）
+        let sel_end_col = footer_byte_to_col(&line, 6);
+        // 光标列（footer_byte_to_col，与 render_impl 中修复后的算法相同）
+        let cursor_col = footer_byte_to_col(&line, 6);
+        assert_eq!(
+            sel_end_col, cursor_col,
+            "CJK 行光标列应等于选区端点列（两处算法统一后必须相等）"
+        );
+
+        // 进一步验证 selection_rects 算出的右边界 x 与光标 x 一致。
+        let fp = 4.0_f32;
+        let cw = 8.0_f32;
+        let rects = selection_rects(&sel, &lines, 0.0, fp, 500.0, cw, 20.0);
+        assert_eq!(rects.len(), 1, "单行选区应有 1 个矩形");
+        let (sel_x, _sy, sel_w, _sh) = rects[0];
+        // 选区右边缘 x = sel_x + sel_w
+        let sel_right = sel_x + sel_w;
+        // 光标 x（与 render_impl 修复后一致）
+        let cursor_x = fp + cursor_col as f32 * cw;
+        assert!(
+            (sel_right - cursor_x).abs() < 0.01,
+            "选区右边缘 ({sel_right}) 应与光标 x ({cursor_x}) 重合"
+        );
+    }
 }

@@ -712,12 +712,12 @@ impl Renderer {
                         }
 
                         let (cur_line, cur_byte) = cv.cursor;
-                        // 首期等宽：字节偏移按 ASCII 宽度估算（unicode-width M4.2 精化）。
                         // 安全：lines 至少有 1 行（compose_empty 保证）。
                         let line_text = cv.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
-                        // 统计光标前字节的等宽列数（每字节宽 = 1，与网格规则一致）。
-                        // M4.2 起改为 unicode-width 宽字符 2 列。
-                        let col = line_text[..cur_byte.min(line_text.len())].chars().count() as f32;
+                        // 使用 footer_byte_to_col 统一字节→列换算（CJK/emoji 宽字符各占 2 列）。
+                        // 与选区几何 selection_rects 调用的是同一函数，保证光标与选区端点对齐。
+                        // 取代原 chars().count()——后者对 CJK 每字符计 1 列而非 2 列，会低估列数。
+                        let col = composer_view::footer_byte_to_col(line_text, cur_byte) as f32;
                         let cursor_x = fp + col * cw;
                         let cursor_y = footer_top + fp + cur_line as f32 * ch;
                         if cursor_x < footer_w && cursor_y + ch <= target_h as f32 {
@@ -730,13 +730,16 @@ impl Renderer {
 
                         // M4.1 批D2：IME preedit 下划线。
                         // preedit.text 绘制在光标处（内嵌方式），下划线跨越整个预编辑段。
-                        // 精确字形宽度 M4.2 精化；此处按字符数 × cell_w 粗估。
+                        // 使用 footer_byte_to_col 计算 preedit 显示列宽（CJK 各 2 列，不再用 chars().count()）。
                         if let Some(pre) = &cv.preedit {
                             if !pre.text.is_empty() {
-                                let pre_char_count = pre.text.chars().count() as f32;
+                                // preedit 整段显示列宽（byte=text.len() → 全段宽度）。
+                                let pre_col_w =
+                                    composer_view::footer_byte_to_col(&pre.text, pre.text.len())
+                                        as f32;
                                 let underline_x = cursor_x;
                                 let underline_y = cursor_y + ch - 2.0;
-                                let underline_w = (pre_char_count * cw).min(footer_w - underline_x);
+                                let underline_w = (pre_col_w * cw).min(footer_w - underline_x);
                                 if underline_w > 0.0 && underline_y < target_h as f32 {
                                     // 下划线：前景色 70% 透明度，高 1.5px。
                                     instances.push(rect::RectInstance {
@@ -1016,8 +1019,12 @@ impl Renderer {
                                         cv.lines.get(cur_line).map(|s| s.as_str()).unwrap_or("");
                                     // 光标在文末（字节偏移 ≥ 行长度）
                                     if cur_byte >= line_text.len() {
-                                        // ghost 文字的 x 位置 = 光标列 × cell_w + fp
-                                        let col = line_text.chars().count() as f32;
+                                        // ghost 文字的 x 位置 = 行末列 × cell_w + fp
+                                        // footer_byte_to_col(byte=len) 算出行末显示列（CJK 各 2 列）。
+                                        let col = composer_view::footer_byte_to_col(
+                                            line_text,
+                                            line_text.len(),
+                                        ) as f32;
                                         let ghost_x = fp + col * cw;
                                         let ghost_y = footer_top + fp + cur_line as f32 * ch;
                                         let bottom_clamp =
