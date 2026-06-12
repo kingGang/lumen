@@ -30,12 +30,12 @@ use lumen_renderer::composer_view::{normalize_selection, ExitBadge, PreeditState
 /// - [`InputMode::Compose`] → 完整编辑卡片，内容来自 `editor_view`（真实 EditorView 内容）
 /// - [`InputMode::Running`] → 等高状态条（文案 i18n）
 /// - [`InputMode::AltScreen`] → 隐藏（grid 收回全高）
-/// - [`InputMode::Fallback`] → 等高状态条（"shell 集成未生效"，批D1 真实化）
+/// - [`InputMode::Fallback`] → 隐藏（与 AltScreen 同路径；底部状态栏已有"经典直通"模式指示）
 ///
 /// # 设计稿铁律
 /// Compose ↔ Running 切换返回等高视图（均为 1 行），不改 footer 高度，
 /// 不触发 `term.resize` / `pty.resize`（防 resize 风暴，设计稿 §7.1）。
-/// Fallback 亦等高（隐藏改为状态条，确保与 Running 等高）。
+/// Fallback 隐藏（footer_px=0），grid 收回全高，与 AltScreen 行为一致。
 ///
 /// # Arguments
 /// * `mode` - 当前有效输入模式（由 [`crate::mode::effective_mode`] 推导）。
@@ -85,21 +85,19 @@ pub fn compose_view_for_mode(
                 kind: lumen_renderer::composer_view::FooterKind::Composer,
                 lines,
                 cursor: (cur.line, cur.byte),
-                selection, // M4.1 批F：文本选区（规范化后，None=纯光标）
-                label: s.footer_label_compose.to_owned(),
+                selection,   // M4.1 批F：文本选区（规范化后，None=纯光标）
                 preedit,     // M4.1 批D2：IME 预编辑
                 exit_badge,  // M4.1 批D2：退出码角标
                 placeholder, // M4.1 批E：占位提示（仅空编辑器显示）
                 ghost,       // M4.1 批3：历史联想后缀（有选区时为 None）
             }
         }
-        InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
+        InputMode::Running => ComposerView::running(s.footer_running_text),
         // AltScreen：全屏 TUI 让位，footer 隐藏，grid 收回全高。
         InputMode::AltScreen => ComposerView::hidden(),
-        // Fallback：shell integration 未生效，显示等高状态条说明（批D1 真实化）。
-        InputMode::Fallback => {
-            ComposerView::running(s.footer_fallback_text, s.footer_label_running)
-        }
+        // Fallback：shell integration 未生效，footer 隐藏（与 AltScreen 同路径，
+        // footer_px=0，grid 收回全高；底部状态栏已有"经典直通"模式指示）。
+        InputMode::Fallback => ComposerView::hidden(),
     }
 }
 
@@ -108,8 +106,8 @@ pub fn compose_view_for_mode(
 pub fn compose_view_for_mode(mode: InputMode) -> ComposerView {
     let s = i18n::strings();
     match mode {
-        InputMode::Compose => ComposerView::compose_empty(s.footer_label_compose),
-        InputMode::Running => ComposerView::running(s.footer_running_text, s.footer_label_running),
+        InputMode::Compose => ComposerView::compose_empty(),
+        InputMode::Running => ComposerView::running(s.footer_running_text),
         InputMode::AltScreen | InputMode::Fallback => ComposerView::hidden(),
     }
 }
@@ -175,16 +173,17 @@ mod tests {
         }
 
         #[test]
-        fn fallback_模式_产出_statusbar_形态() {
-            // 批D1：Fallback 不再隐藏，改为等高状态条显示"shell 集成未生效"
+        fn fallback_模式_产出_hidden_形态() {
+            // 第十四轮：Fallback 改为隐藏（与 AltScreen 同路径），
+            // footer_px=0，grid 收回全高；底部状态栏已有"经典直通"模式指示，无需重复。
             let editor = empty_view();
             let v = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
-                FooterKind::StatusBar,
-                "Fallback 模式应产出 StatusBar 形态（显示说明文案）"
+                FooterKind::Hidden,
+                "Fallback 模式应产出 Hidden 形态（底部状态栏已有模式指示）"
             );
-            assert!(v.is_visible(), "Fallback 形态应可见（等高状态条）");
+            assert!(!v.is_visible(), "Fallback 形态应隐藏");
         }
 
         /// Compose ↔ Running 等高铁律：两者均为 1 行，footer_height_px 返回相同值。
@@ -218,16 +217,14 @@ mod tests {
             );
         }
 
-        /// Fallback 等高状态条高度与 Running 一致（批D1 变更）。
+        /// Fallback 隐藏态高度为 0（第十四轮变更：与 AltScreen 同路径）。
         #[test]
-        fn fallback_与_running_等高() {
+        fn fallback_高度为零() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
             let v_fb = compose_view_for_mode(InputMode::Fallback, editor.view(), None, None, None);
-            let v_run = compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             let h_fb = footer_height_px(Some(&v_fb), 20.0, 6.0, 1000.0);
-            let h_run = footer_height_px(Some(&v_run), 20.0, 6.0, 1000.0);
-            assert_eq!(h_fb, h_run, "Fallback({h_fb}) 与 Running({h_run}) 应等高");
+            assert_eq!(h_fb, 0.0, "Fallback 隐藏态高度应为 0");
         }
 
         /// ghost text 传入 Compose 态时应被带入 ComposerView（M4.1 批3）。

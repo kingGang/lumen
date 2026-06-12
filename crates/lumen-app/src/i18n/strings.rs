@@ -281,26 +281,17 @@ pub struct Strings {
     // ── M4.1 批C：footer 状态条文案（input-editor feature）──────────
     // 字段在 feature 剔除时不被读取（dead_code）；用 cfg_attr 消除警告，
     // 字段仍保留在 struct 内（三语编译期完备性要求不能 cfg 删字段）。
-    /// Compose 态模式标签（footer 右角）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
-    pub footer_label_compose: &'static str,
     /// Running 态状态条主文案（等高状态条中央文本）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub footer_running_text: &'static str,
-    /// Running 态模式标签（footer 右角）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
-    pub footer_label_running: &'static str,
 
-    // ── M4.1 批D1：Compose 态键位占位提示 + Fallback 状态文案 ───────
+    // ── M4.1 批D1：Compose 态键位占位提示 ──────────────────────────
     /// Compose 态 Tab 键占位提示 toast（M3.4 补全未实现）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub toast_compose_tab_hint: &'static str,
     /// Compose 态 Ctrl+R 占位提示 toast（D2 历史搜索未实现）
     #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
     pub toast_compose_history_hint: &'static str,
-    /// Fallback 态状态条文案（shell 集成未生效时显示）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
-    pub footer_fallback_text: &'static str,
 
     // ── 侧栏标题栏（R8）─────────────────────────────────────────────────────
     /// 侧栏标题栏「＋」按钮 tooltip（新建会话，含快捷键）

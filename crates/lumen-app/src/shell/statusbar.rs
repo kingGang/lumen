@@ -303,7 +303,7 @@ mod tests {
         // （renderer 侧的渲染逻辑按此判断，app 侧组装时设 placeholder）
         use lumen_renderer::composer_view::ComposerView;
 
-        let mut v = ComposerView::compose_empty("Compose");
+        let mut v = ComposerView::compose_empty();
         v.placeholder = Some("占位提示".to_owned());
 
         // 空行（第一行为空字符串）：应显示 placeholder

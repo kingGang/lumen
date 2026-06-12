@@ -142,13 +142,10 @@ pub static STRINGS: Strings = Strings {
     toast_fallback_enabled: "傳統直通模式已開啟（Ctrl+Shift+E 關閉）",
     toast_fallback_disabled: "傳統直通模式已關閉，恢復智慧路由",
     // M4.1 批C：footer 狀態條文案
-    footer_label_compose: "編輯",
     footer_running_text: "執行中…（直通模式）",
-    footer_label_running: "執行中",
-    // M4.1 批D1：Compose 態占位提示 + Fallback 狀態文案
+    // M4.1 批D1：Compose 態占位提示
     toast_compose_tab_hint: "Tab 補全功能即將上線（M3.4）",
     toast_compose_history_hint: "歷史搜尋功能即將上線（D2）",
-    footer_fallback_text: "shell 整合未生效（傳統直通模式）",
     // M4.1 批E：底部狀態列
     statusbar_mode_compose: "✏ 編輯模式",
     statusbar_mode_running: "⇣ 直通中",

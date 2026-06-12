@@ -103,7 +103,6 @@ pub enum FooterKind {
 /// - `lines`：文本行内容（Compose 态为编辑内容，Running 态为 `["状态文案"]`）。
 /// - `cursor`：光标位置 `(行索引, 字节偏移)`，仅 Compose 态有意义。
 /// - `selection`：文本选区（规范化后的 [`FooterSelection`]，有选区时 Some）。M4.1 批F。
-/// - `label`：模式提示标签（如 "Compose" / "直通中" / 空串）。
 /// - `preedit`：IME 预编辑文本（Compose 态；None 表示无预编辑）。M4.1 批D2。
 /// - `exit_badge`：退出码角标（None 表示无需显示）。M4.1 批D2。
 /// - `placeholder`：占位提示文字（Compose 态 lines 全空时以 fg_dim 色显示）。M4.1 批E。
@@ -119,8 +118,6 @@ pub struct ComposerView {
     /// 文本选区（M4.1 批F）：anchor ≠ cursor 时为 Some；已由 app 侧规范化（start ≤ end）。
     /// None = 纯光标（无选区）；有选区时 ghost text 不显示（视觉冲突，与系统惯例一致）。
     pub selection: Option<FooterSelection>,
-    /// 模式提示标签（状态条右侧角落，可为空串）。
-    pub label: String,
     /// IME 预编辑文本（M4.1 批D2）：Some 时在光标处内嵌绘制（下划线样式）。
     /// 不进文档模型、不参与 undo；Ime::Commit 时清空。
     pub preedit: Option<PreeditState>,
@@ -161,16 +158,12 @@ impl ComposerView {
     /// 构造 Compose 态视图（空编辑器）。
     ///
     /// 本批（批C）内容在 app 侧尚未接管输入，传入空行+光标在原点。
-    ///
-    /// # Arguments
-    /// * `label` - 模式提示标签（通常为 "Compose"）。
-    pub fn compose_empty(label: impl Into<String>) -> Self {
+    pub fn compose_empty() -> Self {
         Self {
             kind: FooterKind::Composer,
             lines: vec![String::new()],
             cursor: (0, 0),
             selection: None,
-            label: label.into(),
             preedit: None,
             exit_badge: None,
             placeholder: None,
@@ -182,14 +175,12 @@ impl ComposerView {
     ///
     /// # Arguments
     /// * `status_text` - 状态条文案（三语 i18n 由 app 侧传入）。
-    /// * `label` - 模式提示标签（通常为 "Running"）。
-    pub fn running(status_text: impl Into<String>, label: impl Into<String>) -> Self {
+    pub fn running(status_text: impl Into<String>) -> Self {
         Self {
             kind: FooterKind::StatusBar,
             lines: vec![status_text.into()],
             cursor: (0, 0),
             selection: None,
-            label: label.into(),
             preedit: None,
             exit_badge: None,
             placeholder: None,
@@ -204,7 +195,6 @@ impl ComposerView {
             lines: Vec::new(),
             cursor: (0, 0),
             selection: None,
-            label: String::new(),
             preedit: None,
             exit_badge: None,
             placeholder: None,
@@ -243,7 +233,7 @@ impl ComposerView {
 /// ```
 /// use lumen_renderer::composer_view::{ComposerView, footer_height_px};
 ///
-/// let view = ComposerView::compose_empty("Compose");
+/// let view = ComposerView::compose_empty();
 /// let h = footer_height_px(Some(&view), 20.0, 6.0, 200.0);
 /// assert_eq!(h, 20.0 + 6.0 * 2.0); // 1 行 + 内边距
 /// ```
@@ -421,7 +411,7 @@ mod tests {
 
     #[test]
     fn compose_empty_形态正确() {
-        let v = ComposerView::compose_empty("Compose");
+        let v = ComposerView::compose_empty();
         assert_eq!(v.kind, FooterKind::Composer);
         assert_eq!(v.line_count(), 1, "Compose 空编辑器应有 1 行");
         assert!(v.is_visible());
@@ -429,7 +419,7 @@ mod tests {
 
     #[test]
     fn running_形态正确() {
-        let v = ComposerView::running("运行中", "Running");
+        let v = ComposerView::running("运行中");
         assert_eq!(v.kind, FooterKind::StatusBar);
         assert_eq!(v.line_count(), 1);
         assert!(v.is_visible());
@@ -448,7 +438,7 @@ mod tests {
     /// 1 行常驻：高度 = cell_h + padding*2。
     #[test]
     fn 单行等高_无上限() {
-        let v = ComposerView::compose_empty("Compose");
+        let v = ComposerView::compose_empty();
         let h = footer_height_px(Some(&v), 20.0, 6.0, 1000.0);
         assert_eq!(h, 20.0 + 12.0, "1 行：cell_h + padding*2");
     }
@@ -456,7 +446,7 @@ mod tests {
     /// 多行增高：3 行 × cell_h + padding*2。
     #[test]
     fn 三行增高() {
-        let mut v = ComposerView::compose_empty("Compose");
+        let mut v = ComposerView::compose_empty();
         v.lines = vec!["line1".to_owned(), "line2".to_owned(), "line3".to_owned()];
         let h = footer_height_px(Some(&v), 20.0, 6.0, 1000.0);
         assert_eq!(h, 3.0 * 20.0 + 12.0, "3 行：3*cell_h + padding*2");
@@ -465,7 +455,7 @@ mod tests {
     /// 1/3 窗高上限钳制。
     #[test]
     fn 超高被钳制() {
-        let mut v = ComposerView::compose_empty("Compose");
+        let mut v = ComposerView::compose_empty();
         // 20 行高度 = 20*20+12 = 412，但上限为 100。
         v.lines = (0..20).map(|i| format!("line{i}")).collect();
         let h = footer_height_px(Some(&v), 20.0, 6.0, 100.0);
@@ -490,8 +480,8 @@ mod tests {
     /// Running 态与 Compose 等高（同为 1 行，防 Compose↔Running 切换引发 resize）。
     #[test]
     fn running_与_compose_等高() {
-        let compose = ComposerView::compose_empty("Compose");
-        let running = ComposerView::running("运行中", "Running");
+        let compose = ComposerView::compose_empty();
+        let running = ComposerView::running("运行中");
         let h_compose = footer_height_px(Some(&compose), 20.0, 6.0, 1000.0);
         let h_running = footer_height_px(Some(&running), 20.0, 6.0, 1000.0);
         assert_eq!(
