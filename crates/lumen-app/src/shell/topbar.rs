@@ -560,3 +560,98 @@ fn menu_ui(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette, out: &mu
         }
     }
 }
+
+#[cfg(test)]
+mod topbar_layout_tests {
+    use super::*;
+    use crate::shell::theme;
+
+    /// RTL 布局哨兵（fb2610a 修复回归防线）：无头 egui 跑一帧顶栏布局，
+    /// 断言窗控按钮分配在面板右端——cursor().min 类手工矩形 bug 重现时此测试失败。
+    #[test]
+    fn 顶栏_最大化按钮分配在右端() {
+        let ctx = egui::Context::default();
+        let info = lumen_renderer::themes::find_or_default("lumen-dark");
+        let pal = theme::shell_palette(info);
+        let mut got: Option<egui::Rect> = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1200.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let tb = show(
+                ui,
+                "诊断标题",
+                1,
+                None,
+                &pal,
+                false,
+                ViewState {
+                    sidebar_visible: true,
+                    filetree_visible: true,
+                },
+            );
+            got = Some(tb.maximize_btn_rect.unwrap_or(egui::Rect::NOTHING));
+        });
+        let r = got.expect("应跑过一帧");
+        // 关闭按钮占最右 46px，最大化按钮应在其左：x ∈ [1200-92, 1200-46]
+        assert!(
+            r.max.x > 1100.0 && r.min.x > 1050.0,
+            "最大化按钮不在右端：{r:?}"
+        );
+        assert!(r.height() > 0.0, "按钮矩形退化：{r:?}");
+    }
+
+    /// 绘制哨兵：一帧的绘制图元里右端区域（x>1050）应存在窗控按钮的
+    /// 线段图元（✕/—/□ 画线）——按钮绘制被条件分支意外跳过时此测试失败。
+    #[test]
+    fn 顶栏_右端绘制图元存在() {
+        let ctx = egui::Context::default();
+        let info = lumen_renderer::themes::find_or_default("lumen-dark");
+        let pal = theme::shell_palette(info);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1200.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let full = ctx.run_ui(input, |ui| {
+            let _ = show(
+                ui,
+                "诊断标题",
+                1,
+                None,
+                &pal,
+                false,
+                ViewState {
+                    sidebar_visible: true,
+                    filetree_visible: true,
+                },
+            );
+        });
+        fn count_right_segments(shapes: &[egui::epaint::ClippedShape]) -> usize {
+            let mut n = 0;
+            for cs in shapes {
+                n += walk(&cs.shape);
+            }
+            n
+        }
+        fn walk(s: &egui::epaint::Shape) -> usize {
+            use egui::epaint::Shape;
+            match s {
+                Shape::LineSegment { points, .. } => {
+                    usize::from(points[0].x > 1050.0 || points[1].x > 1050.0)
+                }
+                Shape::Vec(v) => v.iter().map(walk).sum(),
+                _ => 0,
+            }
+        }
+        let segs = count_right_segments(&full.shapes);
+        // 窗控三按钮至少 4 条线段（✕ 两条 + — 一条 + □ 矩形另算）
+        assert!(segs >= 3, "右端线段图元过少：{segs} 条——按钮没画");
+    }
+}
