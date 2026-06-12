@@ -1537,6 +1537,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-editor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "lumen-pty"
 version = "0.1.0"
 dependencies = [

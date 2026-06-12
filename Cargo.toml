@@ -5,6 +5,7 @@ members = [
     "crates/lumen-term",
     "crates/lumen-renderer",
     "crates/lumen-app",
+    "crates/lumen-editor",
 ]
 
 [workspace.package]
@@ -17,6 +18,7 @@ repository = "https://github.com/jimhyliu/lumen"
 lumen-pty = { path = "crates/lumen-pty" }
 lumen-term = { path = "crates/lumen-term" }
 lumen-renderer = { path = "crates/lumen-renderer" }
+lumen-editor = { path = "crates/lumen-editor" }
 
 anyhow = "1"
 arboard = "3"
@@ -29,6 +31,10 @@ crossbeam-channel = "0.5"
 portable-pty = "0.9"
 vte = "0.15"
 unicode-width = "0.2"
+# grapheme cluster 边界（光标移动/退格按 grapheme 粒度）：emoji ZWJ 序列、
+# 中文组合字、组合变音均按 UAX#29 grapheme cluster 边界处理。
+# unicode-rs 官方库，纯算法零传递依赖；Helix/Zed/Alacritty 同款选型。
+unicode-segmentation = "1"
 winit = "0.30"
 wgpu = "29"
 serde = { version = "1", features = ["derive"] }

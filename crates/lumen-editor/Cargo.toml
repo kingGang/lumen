@@ -1,0 +1,24 @@
+[package]
+name = "lumen-editor"
+description = "Lumen 输入编辑器纯状态机：零 winit/wgpu/pty 依赖，apply() 是唯一可变入口，同一 Action 序列产生确定性终态（M4 远程一致性地基）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# serde derive：EditAction 第一天可序列化（设计稿铁律）。Motion 一同 derive
+# 以支持完整 Action 序列录制/重放（M4 远程控制同入口，无额外 schema 偏差）。
+serde = { workspace = true }
+# grapheme cluster 边界检测：emoji ZWJ 序列、中文组合字、组合变音符号均按
+# UAX#29 grapheme cluster 边界移动/删除。unicode-rs 官方库，纯算法零传递依赖。
+# 对比备选：unicode-segmentation 已是业界标准（Helix/Zed/Alacritty 同款），
+# 无需引入 icu4x（体积过大）或自写 grapheme break 状态机（正确性难保证）。
+unicode-segmentation = "1"
+# 显示宽度（CJK 占 2 列）：workspace 已冻结，Up/Down 目标列记忆用此。
+unicode-width.workspace = true
+# thiserror：lib 公共 API 自定义 error 类型，禁止暴露 anyhow::Error（设计稿铁律）。
+thiserror.workspace = true
+
+[dev-dependencies]
+# replay 测试：EditAction 序列 serde 往返验证（serde_json 已在 workspace）。
+serde_json.workspace = true
