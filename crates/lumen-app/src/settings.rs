@@ -172,6 +172,16 @@ pub struct Settings {
     /// 界面语言（F6）：`#[serde(default)]` 旧文件无此字段时补默认值
     /// [`crate::i18n::Language::ZhCn`]（简体中文）。
     pub language: crate::i18n::Language,
+    /// 经典直通模式开关（第十八轮持久化）：对应运行时 `AppState::force_fallback`。
+    ///
+    /// `true` 时启动即进入经典直通态（`force_fallback = true`），
+    /// 所有按键直通 PTY，不走 shell integration / Compose 态编辑器。
+    /// 默认 `false`（正常 AI-native 模式）。
+    ///
+    /// 变更来源：`TermAction::ToggleFallback`（Ctrl+Shift+E 快捷键
+    /// 与状态栏切换按钮同路径）——切换时同步写盘，重启后恢复。
+    #[serde(default)]
+    pub classic_mode: bool,
 }
 
 impl Default for Settings {
@@ -181,6 +191,7 @@ impl Default for Settings {
             appearance: AppearanceSettings::default(),
             layout: LayoutSettings::default(),
             language: crate::i18n::Language::default(),
+            classic_mode: false,
         }
     }
 }
@@ -364,6 +375,8 @@ impl Settings {
             crate::i18n::Language::default(),
             path,
         );
+        // classic_mode：旧文件（第十八轮前）无此字段时静默补 false（默认正常模式）。
+        s.classic_mode = lenient_field(root, "classic_mode", "classic_mode", false, path);
         s
     }
 
@@ -561,6 +574,8 @@ mod tests {
         assert_eq!(s.appearance.font_size, FONT_SIZE_DEFAULT);
         assert_eq!(s.layout.sidebar_width, SIDEBAR_WIDTH_DEFAULT);
         assert_eq!(s.layout.filetree_width, FILETREE_WIDTH_DEFAULT);
+        // classic_mode 默认 false（正常 AI-native 模式，非经典直通）。
+        assert!(!s.classic_mode, "classic_mode 默认值应为 false");
     }
 
     #[test]
@@ -582,12 +597,55 @@ mod tests {
                 sidebar_visible: true,
             },
             language: crate::i18n::Language::ZhTw,
+            classic_mode: false,
         };
         let p = temp_path("roundtrip");
         s.save_to(&p).expect("写盘失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn classic_mode_serde默认false() {
+        // #[serde(default)] 保证旧文件无此字段时加载补 false（不破坏已有用户）。
+        let p = temp_path("classic_mode_default");
+        // 旧格式 settings.json：无 classic_mode 字段。
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 16.0 } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            !loaded.classic_mode,
+            "旧文件缺 classic_mode 时应降级为 false（正常模式）"
+        );
+        assert_eq!(loaded.appearance.font_size, 16.0, "其余字段不受影响");
+    }
+
+    #[test]
+    fn classic_mode_序列化往返() {
+        // classic_mode=true 序列化再加载后应保持 true。
+        let p = temp_path("classic_mode_roundtrip");
+        let s = Settings {
+            classic_mode: true,
+            ..Settings::default()
+        };
+        s.save_to(&p).expect("写盘失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(loaded.classic_mode, "classic_mode=true 写盘后加载应为 true");
+    }
+
+    #[test]
+    fn classic_mode_旧文件兼容() {
+        // 显式写 classic_mode=false 的"新"文件，加载后也应为 false。
+        let p = temp_path("classic_mode_explicit_false");
+        std::fs::write(&p, r#"{ "classic_mode": false }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            !loaded.classic_mode,
+            "classic_mode=false 显式写盘后加载应为 false"
+        );
     }
 
     #[test]

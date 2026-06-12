@@ -1025,6 +1025,16 @@ impl AppState {
 
                 TermAction::ToggleFallback => {
                     self.force_fallback = !self.force_fallback;
+                    // 第十八轮：同步持久化设置并立即写盘，重启后恢复。
+                    // 对齐 language_changed 模式：直接调用 settings.save()，
+                    // 失败弹 toast 告知用户（写不进盘不影响终端使用）。
+                    self.settings.classic_mode = self.force_fallback;
+                    if let Some(err) = self.settings.save() {
+                        self.shell_state.toast.push(
+                            shell::toast::ToastKind::Error,
+                            i18n::fmt1(i18n::strings().toast_settings_save_failed_fmt, &err),
+                        );
+                    }
                     let s = i18n::strings();
                     let msg = if self.force_fallback {
                         s.toast_fallback_enabled
@@ -2088,6 +2098,9 @@ impl App {
         #[cfg(feature = "input-editor")]
         let history_store = history::HistoryStore::load();
 
+        // 在 app_settings 被 move 进 AppState 之前读出 classic_mode（第十八轮）。
+        let init_force_fallback = app_settings.classic_mode;
+
         let mut state = AppState {
             perf,
             perf_t0: Instant::now(),
@@ -2126,7 +2139,9 @@ impl App {
             shell_state: shell::ShellState::default(),
             window_just_resized: false,
             bg_texture: None,
-            force_fallback: false,
+            // 从持久化设置恢复经典直通状态（第十八轮）。
+            // settings.classic_mode 在 ToggleFallback 路径同步写盘，重启后还原。
+            force_fallback: init_force_fallback,
             #[cfg(feature = "input-editor")]
             history: history_store,
             #[cfg(feature = "input-editor")]
@@ -4376,9 +4391,20 @@ impl ApplicationHandler<PtyWake> for App {
                                 let text =
                                     state.tabs[ti2].panes[pi2].editor.view().text().to_owned();
                                 let ghost = if text.contains('\n') || text.is_empty() {
+                                    log::debug!(
+                                        "[ghost_cache] 跳过：text 为空或多行 len={} has_nl={}",
+                                        text.len(),
+                                        text.contains('\n')
+                                    );
                                     None
                                 } else {
-                                    state.history.find_ghost_prefix(&text)
+                                    let g = state.history.find_ghost_prefix(&text);
+                                    log::debug!(
+                                        "[ghost_cache] rev={rev} text={:?} ghost={:?}",
+                                        text,
+                                        g
+                                    );
+                                    g
                                 };
                                 state.ghost_cache = (rev, ghost);
                             }
