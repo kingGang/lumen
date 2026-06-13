@@ -188,6 +188,7 @@ pub static STRINGS: Strings = Strings {
     update_modal_title: "發現新版本",
     update_modal_version_fmt: "新版本 {}",
     update_modal_notes_label: "更新內容",
+    update_modal_ready_hint: "安裝包已下載完成，點「立即更新」即可安裝並重啟。",
     update_btn_install: "立即更新",
     update_btn_later: "稍後",
     update_btn_skip: "跳過此版本",

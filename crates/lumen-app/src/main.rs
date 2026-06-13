@@ -532,11 +532,17 @@ struct AppState {
     update_tx: crossbeam_channel::Sender<update::UpdateMsg>,
     /// 接收端（user_event 里 drain）。
     update_rx: crossbeam_channel::Receiver<update::UpdateMsg>,
-    /// 已发现的可更新版本（Some 时展示更新提示弹窗）。
+    /// 已发现的可更新版本（检测到即记录；随后后台静默下载，见
+    /// [`Self::update_ready`]）。
     update_available: Option<update::UpdateInfo>,
-    /// 安装包下载进行中（避免重复点「立即更新」）。
+    /// 安装包后台静默下载进行中（Warp 式：检测到新版即静默下载，下载完成
+    /// 才弹窗，不在下载期间打扰用户）。
     update_downloading: bool,
-    /// 本次运行「稍后」已点过：暂不再弹窗（重启或新版本会再弹）。
+    /// 已下载就绪的安装包路径（Some = 包已下好、可直接安装）。弹窗只在
+    /// **就绪后**出现（点「立即更新」直接拉起安装器、无需再等下载）。
+    update_ready: Option<std::path::PathBuf>,
+    /// 本次运行「稍后」已点过：暂不再弹窗（重启或新版本会再弹；已下载的
+    /// 包保留在 [`Self::update_ready`]，下次弹窗即用）。
     update_dismissed: bool,
     /// auto_check 设置的原子镜像：供运行期定时检查线程读取（设置页开关
     /// 改动时同步），关闭后定时线程跳过本轮，不再打网络。
@@ -1666,6 +1672,11 @@ impl AppState {
 
     /// F3：后台下载安装包，完成/失败经 channel 回主循环。
     fn spawn_update_download(&mut self, info: &update::UpdateInfo) {
+        // 防重入：已在下载则不再起第二个线程——否则两线程写同一
+        // installer_dest（File::create 截断）会并发写坏安装包。
+        if self.update_downloading {
+            return;
+        }
         let tx = self.update_tx.clone();
         let proxy = self.proxy.clone();
         let url = info.download_url.clone();
@@ -1681,10 +1692,13 @@ impl AppState {
         });
     }
 
-    /// F3：drain 更新消息（user_event 内调用）。返回 true = 请求优雅退出
-    /// （安装器已拉起，落盘后让它替换 exe）。
+    /// F3：drain 更新消息（user_event 内调用）。返回 true = 请求优雅退出。
+    ///
+    /// 注：静默预下载模型下，下载完成只标记就绪+弹窗（不退出）；真正拉起
+    /// 安装器+退出在用户点「立即更新」时由 window_event 的 Install 动作处理，
+    /// 故本函数恒返回 false（保留返回值与退出请求接口供未来用）。
     fn drain_update_msgs(&mut self) -> bool {
-        let mut want_exit = false;
+        let want_exit = false;
         while let Ok(msg) = self.update_rx.try_recv() {
             match msg {
                 update::UpdateMsg::Available(info) => {
@@ -1692,25 +1706,25 @@ impl AppState {
                     if self.settings.update.skip_version.as_deref() == Some(info.tag.as_str()) {
                         continue;
                     }
-                    // 正在下载该更新：不重复打扰。
-                    if self.update_downloading {
-                        continue;
-                    }
-                    // 同一版本已展示过（对话框开着或「稍后」隐藏）：定时复查
-                    // 不重复 toast/弹窗，仅「真·新版本」才再打扰（防 30 分钟
-                    // 一次的重复骚扰）。
+                    // 同一版本已记录：一律不重复下载/toast（无论下载中/已就绪/
+                    // 已失败）。失败重试交手动「检查更新」（它清 available 后重新
+                    // 触发），避免下载持续失败时定时复查每 30 分钟反复下载+toast。
                     if self.update_available.as_ref().map(|u| u.tag.as_str())
                         == Some(info.tag.as_str())
                     {
                         continue;
                     }
+                    // 新版本：记录并**后台静默下载**（Warp 式）——下载完成
+                    // （DownloadDone）才弹窗安装。启动时给一条轻提示让用户知道
+                    // 在后台下载（每个新版本仅一次，定时复查被上面的去重挡住）。
                     self.shell_state.toast.push(
                         shell::toast::ToastKind::Info,
-                        i18n::fmt1(i18n::strings().update_toast_available_fmt, info.version),
+                        i18n::strings().update_toast_downloading.to_owned(),
                     );
+                    self.update_ready = None;
                     self.update_dismissed = false;
+                    self.spawn_update_download(&info);
                     self.update_available = Some(info);
-                    self.window.request_redraw();
                 }
                 update::UpdateMsg::UpToDate => self.shell_state.toast.push(
                     shell::toast::ToastKind::Info,
@@ -1721,32 +1735,26 @@ impl AppState {
                     i18n::strings().update_toast_check_failed.to_owned(),
                 ),
                 update::UpdateMsg::DownloadDone(path) => {
-                    match update::launch_installer(&path) {
-                        Ok(()) => {
-                            self.shell_state.toast.push(
-                                shell::toast::ToastKind::Info,
-                                i18n::strings().update_toast_installing.to_owned(),
-                            );
-                            // 安装器已起：优雅退出，落盘后让它替换 exe。
-                            want_exit = true;
-                        }
-                        Err(e) => {
-                            log::error!("F3：{e}");
-                            self.update_downloading = false;
-                            self.shell_state.toast.push(
-                                shell::toast::ToastKind::Error,
-                                i18n::fmt1(i18n::strings().update_toast_download_failed_fmt, &e),
-                            );
-                        }
+                    // 静默下载完成：标记就绪并弹窗（点「立即更新」直接拉起已
+                    // 下好的安装器，无需再等下载）。
+                    self.update_downloading = false;
+                    self.update_ready = Some(path);
+                    self.update_dismissed = false;
+                    if let Some(v) = self.update_available.as_ref().map(|u| u.version) {
+                        self.shell_state.toast.push(
+                            shell::toast::ToastKind::Info,
+                            i18n::fmt1(i18n::strings().update_toast_available_fmt, v),
+                        );
                     }
+                    self.window.request_redraw();
                 }
                 update::UpdateMsg::DownloadFailed(e) => {
-                    log::error!("F3：下载失败 {e}");
+                    // 静默自动下载失败：debug 记录、清状态，下次检查再试。
+                    // 不弹窗/不 toast——自动下载失败不打扰用户（手动「检查更
+                    // 新」会重试）。
+                    log::debug!("F3：后台下载失败 {e}");
                     self.update_downloading = false;
-                    self.shell_state.toast.push(
-                        shell::toast::ToastKind::Error,
-                        i18n::fmt1(i18n::strings().update_toast_download_failed_fmt, &e),
-                    );
+                    self.update_ready = None;
                 }
             }
         }
@@ -2683,6 +2691,7 @@ impl App {
             update_rx,
             update_available: None,
             update_downloading: false,
+            update_ready: None,
             update_dismissed: false,
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             egui_ctx,
@@ -4493,6 +4502,11 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
+                // F3 更新弹窗配色（当前主题色板；app_settings 借用后用 disjoint
+                // 的 state.os_dark 求生效主题）。
+                let modal_pal = shell::theme::shell_palette(settings::theme_info(
+                    app_settings.effective_theme_id(state.os_dark),
+                ));
                 // M3.8：传入当前窗口最大化态，顶栏据此切换最大化/还原图标。
                 let is_maximized = state.window.is_maximized();
                 let mut shell_out = None;
@@ -4522,10 +4536,10 @@ impl ApplicationHandler<PtyWake> for App {
                         );
                         (pos, text)
                     });
-                // F3：发现新版且未「稍后」、未在下载时，本帧弹更新提示框。
-                let update_modal: Option<update::UpdateInfo> = if state.update_available.is_some()
+                // F3：安装包已就绪（静默下载完成）且未「稍后」时弹窗——点
+                // 「立即更新」直接拉起已下好的安装器（Warp 式预下载）。
+                let update_modal: Option<update::UpdateInfo> = if state.update_ready.is_some()
                     && !state.update_dismissed
-                    && !state.update_downloading
                 {
                     state.update_available.clone()
                 } else {
@@ -4563,40 +4577,142 @@ impl ApplicationHandler<PtyWake> for App {
                     // backdrop 聚焦并阻断下层，按钮动作帧后施加。
                     if let Some(info) = &update_modal {
                         let s = crate::i18n::strings();
-                        egui::Modal::new(egui::Id::new("lumen_update_modal")).show(
-                            ui.ctx(),
-                            |ui| {
-                                ui.set_max_width(440.0);
-                                ui.heading(s.update_modal_title);
-                                ui.add_space(4.0);
-                                ui.label(crate::i18n::fmt1(
-                                    s.update_modal_version_fmt,
-                                    info.version,
-                                ));
-                                ui.add_space(6.0);
-                                if !info.notes.trim().is_empty() {
-                                    ui.label(s.update_modal_notes_label);
-                                    egui::ScrollArea::vertical().max_height(220.0).show(
-                                        ui,
-                                        |ui| {
-                                            ui.label(&info.notes);
-                                        },
-                                    );
-                                    ui.add_space(8.0);
-                                }
+                        let p = &modal_pal;
+                        egui::Modal::new(egui::Id::new("lumen_update_modal"))
+                            .frame(
+                                egui::Frame::new()
+                                    .fill(p.bg_dark)
+                                    .corner_radius(egui::CornerRadius::same(10))
+                                    .inner_margin(egui::Margin::same(20)),
+                            )
+                            .show(ui.ctx(), |ui| {
+                                ui.set_width(404.0);
+                                // —— 标题行：accent 圆底下载图标 + 大标题 ——
                                 ui.horizontal(|ui| {
-                                    if ui.button(s.update_btn_install).clicked() {
+                                    let (r, _) = ui.allocate_exact_size(
+                                        egui::vec2(28.0, 28.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    {
+                                        let painter = ui.painter();
+                                        let c = r.center();
+                                        painter.circle_filled(c, 13.0, p.accent);
+                                        let st = egui::Stroke::new(1.8, p.accent_fg);
+                                        // 向下箭头（竖杆 + 两撇箭头头）
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(c.x, c.y - 5.5),
+                                                egui::pos2(c.x, c.y + 4.5),
+                                            ],
+                                            st,
+                                        );
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(c.x - 4.0, c.y + 0.5),
+                                                egui::pos2(c.x, c.y + 4.5),
+                                            ],
+                                            st,
+                                        );
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(c.x + 4.0, c.y + 0.5),
+                                                egui::pos2(c.x, c.y + 4.5),
+                                            ],
+                                            st,
+                                        );
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(s.update_modal_title)
+                                            .size(18.0)
+                                            .strong()
+                                            .color(p.fg),
+                                    );
+                                });
+                                ui.add_space(12.0);
+                                // —— 版本号 + 「已就绪」提示 ——
+                                ui.label(
+                                    egui::RichText::new(crate::i18n::fmt1(
+                                        s.update_modal_version_fmt,
+                                        info.version,
+                                    ))
+                                    .size(14.0)
+                                    .color(p.fg),
+                                );
+                                ui.add_space(3.0);
+                                ui.label(
+                                    egui::RichText::new(s.update_modal_ready_hint)
+                                        .size(12.0)
+                                        .color(p.fg_dim),
+                                );
+                                ui.add_space(14.0);
+                                // —— 更新内容：小标题 + 带边框可滚动卡片 ——
+                                if !info.notes.trim().is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(s.update_modal_notes_label)
+                                            .size(12.0)
+                                            .strong()
+                                            .color(p.fg_dim),
+                                    );
+                                    ui.add_space(5.0);
+                                    egui::Frame::new()
+                                        .fill(p.bg_highlight)
+                                        .corner_radius(egui::CornerRadius::same(6))
+                                        .inner_margin(egui::Margin::same(10))
+                                        .show(ui, |ui| {
+                                            egui::ScrollArea::vertical()
+                                                .max_height(176.0)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(info.notes.trim())
+                                                            .color(p.fg),
+                                                    );
+                                                });
+                                        });
+                                    ui.add_space(16.0);
+                                }
+                                // —— 按钮行：主 CTA 立即更新 / 稍后（左），跳过此版本（右弱化）——
+                                ui.horizontal(|ui| {
+                                    let install = egui::Button::new(
+                                        egui::RichText::new(s.update_btn_install)
+                                            .strong()
+                                            .color(p.accent_fg),
+                                    )
+                                    .fill(p.accent)
+                                    .min_size(egui::vec2(104.0, 32.0));
+                                    if ui.add(install).clicked() {
                                         update_action = Some(UpdateAction::Install);
                                     }
-                                    if ui.button(s.update_btn_later).clicked() {
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(s.update_btn_later)
+                                                .min_size(egui::vec2(60.0, 32.0)),
+                                        )
+                                        .clicked()
+                                    {
                                         update_action = Some(UpdateAction::Later);
                                     }
-                                    if ui.button(s.update_btn_skip).clicked() {
-                                        update_action = Some(UpdateAction::Skip);
-                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(s.update_btn_skip)
+                                                            .color(p.fg_dim),
+                                                    )
+                                                    .fill(egui::Color32::TRANSPARENT),
+                                                )
+                                                .clicked()
+                                            {
+                                                update_action = Some(UpdateAction::Skip);
+                                            }
+                                        },
+                                    );
                                 });
-                            },
-                        );
+                            });
                     }
 
                     // ── footer 右键菜单（第十一轮，input-editor feature）──
@@ -4657,12 +4773,34 @@ impl ApplicationHandler<PtyWake> for App {
                 // F3：更新提示框按钮动作（帧后施加）。
                 match update_action {
                     Some(UpdateAction::Install) => {
-                        if let Some(info) = state.update_available.clone() {
-                            state.shell_state.toast.push(
-                                shell::toast::ToastKind::Info,
-                                i18n::strings().update_toast_downloading.to_owned(),
-                            );
-                            state.spawn_update_download(&info);
+                        // 安装包已就绪（静默预下载完成）：直接拉起安装器，落盘后
+                        // 优雅退出（走 CloseRequested 同路径）让它覆盖安装并重启。
+                        if let Some(path) = state.update_ready.clone() {
+                            match update::launch_installer(&path) {
+                                Ok(()) => {
+                                    state.shell_state.toast.push(
+                                        shell::toast::ToastKind::Info,
+                                        i18n::strings().update_toast_installing.to_owned(),
+                                    );
+                                    state.update_dismissed = true;
+                                    state.persist_sessions();
+                                    #[cfg(feature = "input-editor")]
+                                    state.history.flush_on_exit();
+                                    event_loop.exit();
+                                    return;
+                                }
+                                Err(e) => {
+                                    log::error!("F3：拉起安装器失败 {e}");
+                                    state.update_dismissed = true;
+                                    state.shell_state.toast.push(
+                                        shell::toast::ToastKind::Error,
+                                        i18n::fmt1(
+                                            i18n::strings().update_toast_download_failed_fmt,
+                                            &e,
+                                        ),
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(UpdateAction::Skip) => {
@@ -4673,6 +4811,10 @@ impl ApplicationHandler<PtyWake> for App {
                             if let Some(err) = state.settings.save() {
                                 log::warn!("F3：写盘跳过版本失败: {err}");
                             }
+                        }
+                        // 跳过=不装这版：删掉已下好的安装包（清理临时文件）。
+                        if let Some(path) = state.update_ready.take() {
+                            let _ = std::fs::remove_file(path);
                         }
                         state.update_available = None;
                     }
@@ -5144,7 +5286,18 @@ impl ApplicationHandler<PtyWake> for App {
                         .store(state.settings.update.auto_check, Ordering::Relaxed);
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
+                // 手动检查清掉「已消解/已知版本」状态：用户主动检查即视为想重新
+                // 看到更新（绕过 drain 的同版本去重），故之前点过「稍后」/下载失败
+                // 消解的弹窗能再次弹出（重试入口）。
                 if shell_out.update_check_now {
+                    state.update_available = None;
+                    state.update_dismissed = false;
+                    // 清掉可能残留的就绪包（从干净态重新检查；旧包删除，重新
+                    // 检查若仍是该版本会重下覆盖）——避免 ready 残留而 available
+                    // 被清致弹窗门恒真但内容缺失、且留孤儿临时文件。
+                    if let Some(p) = state.update_ready.take() {
+                        let _ = std::fs::remove_file(p);
+                    }
                     state.shell_state.toast.push(
                         shell::toast::ToastKind::Info,
                         i18n::strings().update_toast_checking.to_owned(),

@@ -85,14 +85,25 @@ jobs:
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "SHA256：$hash"
 
-      # 创建/更新同名 Release 并附上安装包。body 走 GitHub 自动生成的更新
-      # 日志（基于提交/PR），开头附 SHA256——客户端 update.rs 会把 body
-      # 原样展示在「发现新版本」弹窗里。
+      # 更新说明取自 annotated tag 的注释正文（发版时手写的面向用户中文
+      # changelog）。客户端 update.rs 把它原样展示在「发现新版本」弹窗里，
+      # 故**不能**用 SHA256/自动生成的 compare 链接等技术噪音（海风哥 2026-
+      # 06-14：更新内容要给用户看）。tag 无注释时回落版本名。
+      - name: 提取更新说明（tag 注释）
+        id: notes
+        shell: pwsh
+        run: |
+          $notes = (git for-each-ref "refs/tags/${{ github.ref_name }}" --format='%(contents)') -join "`n"
+          if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "Lumen ${{ github.ref_name }}" }
+          $path = Join-Path $env:RUNNER_TEMP "release_notes.txt"
+          Set-Content -LiteralPath $path -Value $notes -Encoding utf8
+          "path=$path" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "更新说明：`n$notes"
+
+      # 创建/更新同名 Release 并附上安装包。
       - name: 创建 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Lumen ${{ github.ref_name }}
-          generate_release_notes: true
-          body: |
-            SHA256: `${{ steps.sha.outputs.sha256 }}`
+          body_path: ${{ steps.notes.outputs.path }}
           files: dist/Lumen-Setup-${{ steps.ver.outputs.version }}.exe

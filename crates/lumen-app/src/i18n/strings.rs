@@ -395,6 +395,8 @@ pub struct Strings {
     pub update_modal_version_fmt: &'static str,
     /// 弹窗「更新内容」小标题
     pub update_modal_notes_label: &'static str,
+    /// 弹窗「安装包已下载就绪」提示行（Warp 式静默预下载完成）
+    pub update_modal_ready_hint: &'static str,
     /// 立即更新按钮
     pub update_btn_install: &'static str,
     /// 稍后按钮

@@ -184,6 +184,7 @@ pub static STRINGS: Strings = Strings {
     update_modal_title: "Update available",
     update_modal_version_fmt: "Version {}",
     update_modal_notes_label: "What's new",
+    update_modal_ready_hint: "The update has been downloaded — click Update now to install and restart.",
     update_btn_install: "Update now",
     update_btn_later: "Later",
     update_btn_skip: "Skip this version",
