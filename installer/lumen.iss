@@ -52,8 +52,14 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
+; 中英双语。简体中文用 vendor 进仓库的官方 ChineseSimplified.isl（installer/
+; 下，UTF-8 BOM；Inno Setup 自带语言文件不含简体中文，故随仓库分发）。
+; 默认语言：Inno 按系统 UI 语言自动预选（LanguageDetectionMethod=uilanguage
+; 为默认）——中文系统选中文、英文系统选英文；系统语言无对应条目时回落到
+; **第一条 english**（海风哥 2026-06-14：找不到对应语言就默认英文）。
+; MessagesFile 相对路径相对 .iss 所在目录（installer/）解析。
 Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimp"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked

@@ -538,6 +538,9 @@ struct AppState {
     update_downloading: bool,
     /// 本次运行「稍后」已点过：暂不再弹窗（重启或新版本会再弹）。
     update_dismissed: bool,
+    /// auto_check 设置的原子镜像：供运行期定时检查线程读取（设置页开关
+    /// 改动时同步），关闭后定时线程跳过本轮，不再打网络。
+    update_auto_check: Arc<AtomicBool>,
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
@@ -1633,6 +1636,34 @@ impl AppState {
         });
     }
 
+    /// F3：运行期定时检查更新——每 [`UPDATE_POLL_INTERVAL`] 自动查一次（不
+    /// 只启动时），让长期开着 Lumen 不关的用户也能及时收到新版。
+    ///
+    /// `auto_check` 关闭时跳过本轮（共享原子镜像由设置页开关同步）。查到新版
+    /// 经与 [`Self::spawn_update_check`] 同一 channel 回主循环，
+    /// [`Self::drain_update_msgs`] 按 skip/下载态/同版本去重，不重复打扰。
+    /// 在 init 内调用一次，起一个长驻守护线程（不单独管理生命周期，随进程
+    /// 退出回收；主循环退出后 channel/proxy 发送失败即自行结束）。
+    fn spawn_periodic_update_check(&self) {
+        let tx = self.update_tx.clone();
+        let proxy = self.proxy.clone();
+        let enabled = self.update_auto_check.clone();
+        let _ = std::thread::Builder::new()
+            .name("lumen-update-poll".into())
+            .spawn(move || loop {
+                std::thread::sleep(UPDATE_POLL_INTERVAL);
+                if !enabled.load(Ordering::Relaxed) {
+                    continue; // 用户已关自动检查：本轮不打网络
+                }
+                if let update::CheckResult::Newer(info) = update::check_for_update() {
+                    if tx.send(update::UpdateMsg::Available(info)).is_err() {
+                        break; // 主循环已退出、通道关闭
+                    }
+                    let _ = proxy.send_event(PtyWake);
+                }
+            });
+    }
+
     /// F3：后台下载安装包，完成/失败经 channel 回主循环。
     fn spawn_update_download(&mut self, info: &update::UpdateInfo) {
         let tx = self.update_tx.clone();
@@ -1659,6 +1690,18 @@ impl AppState {
                 update::UpdateMsg::Available(info) => {
                     // 用户已「跳过」该版本则不打扰。
                     if self.settings.update.skip_version.as_deref() == Some(info.tag.as_str()) {
+                        continue;
+                    }
+                    // 正在下载该更新：不重复打扰。
+                    if self.update_downloading {
+                        continue;
+                    }
+                    // 同一版本已展示过（对话框开着或「稍后」隐藏）：定时复查
+                    // 不重复 toast/弹窗，仅「真·新版本」才再打扰（防 30 分钟
+                    // 一次的重复骚扰）。
+                    if self.update_available.as_ref().map(|u| u.tag.as_str())
+                        == Some(info.tag.as_str())
+                    {
                         continue;
                     }
                     self.shell_state.toast.push(
@@ -2605,6 +2648,8 @@ impl App {
 
         // 在 app_settings 被 move 进 AppState 之前读出 classic_mode（第十八轮）。
         let init_force_fallback = app_settings.classic_mode;
+        // auto_check 初值（app_settings 随后 move 进 settings 字段，先取出）。
+        let init_auto_check = app_settings.update.auto_check;
 
         // F3：后台更新线程 → 主循环的消息通道。
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
@@ -2639,6 +2684,7 @@ impl App {
             update_available: None,
             update_downloading: false,
             update_dismissed: false,
+            update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -2744,6 +2790,9 @@ impl App {
         {
             state.spawn_update_check(false);
         }
+        // F3：运行期定时检查（每 UPDATE_POLL_INTERVAL 查一次，不只启动时）——
+        // 长期开着 Lumen 不关也能收到新版。auto_check 关闭时线程内跳过。
+        state.spawn_periodic_update_check();
 
         // —— 启动消白块：揭幕窗口 ——
         // 窗口以 with_visible(false) 隐藏创建，至此渲染器/字体/主题/egui 全
@@ -2774,8 +2823,13 @@ impl App {
     }
 }
 
-/// F3 启动自动检查的最小间隔（6 小时）：避免频繁开关应用每次都打网络。
-const AUTO_CHECK_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
+/// F3 启动自动检查的最小间隔（30 分钟）：避免频繁开关应用每次都打网络，
+/// 同时不至于太久收不到新版（海风哥 2026-06-14：6 小时太保守，半小时即可）。
+const AUTO_CHECK_INTERVAL_MS: u64 = 30 * 60 * 1000;
+
+/// F3 运行期定时检查更新的间隔（30 分钟）：长期开着 Lumen 不关也能定时
+/// 收到新版（不只启动时查）。auto_check 关闭时跳过本轮。
+const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// F7② 会话前台进程轮询间隔：进程快照较重，限频到 ~0.8s（命令起止的
 /// 图标切换感知足够灵敏，开销可忽略）。
@@ -4502,14 +4556,19 @@ impl ApplicationHandler<PtyWake> for App {
                                 });
                             });
                     }
-                    // F3 更新提示框（居中模态窗，按钮动作帧后施加）。
+                    // F3 更新提示框：用 egui::Modal（**不是** Window）——设置页
+                    // 也是 Modal，后 show 的 Modal 层级更高，故更新框能压在设置
+                    // 面板之上、在任何界面都可见（修：原 Window 默认 Order::Middle
+                    // 被设置 Modal 盖住，用户在设置页点检查更新看不到弹窗）。
+                    // backdrop 聚焦并阻断下层，按钮动作帧后施加。
                     if let Some(info) = &update_modal {
                         let s = crate::i18n::strings();
-                        egui::Window::new(s.update_modal_title)
-                            .collapsible(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                            .show(ui.ctx(), |ui| {
+                        egui::Modal::new(egui::Id::new("lumen_update_modal")).show(
+                            ui.ctx(),
+                            |ui| {
+                                ui.set_max_width(440.0);
+                                ui.heading(s.update_modal_title);
+                                ui.add_space(4.0);
                                 ui.label(crate::i18n::fmt1(
                                     s.update_modal_version_fmt,
                                     info.version,
@@ -4536,7 +4595,8 @@ impl ApplicationHandler<PtyWake> for App {
                                         update_action = Some(UpdateAction::Skip);
                                     }
                                 });
-                            });
+                            },
+                        );
                     }
 
                     // ── footer 右键菜单（第十一轮，input-editor feature）──
@@ -5077,6 +5137,12 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_update_changed
                     || sidebar_changed
                     || filetree_changed;
+                // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。
+                if shell_out.settings_update_changed {
+                    state
+                        .update_auto_check
+                        .store(state.settings.update.auto_check, Ordering::Relaxed);
+                }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
                 if shell_out.update_check_now {
                     state.shell_state.toast.push(
