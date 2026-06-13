@@ -13,6 +13,12 @@ pub struct Completion {
     pub replacement: String,
     /// 是否为目录（UI 层可据此选颜色）。
     pub is_dir: bool,
+    /// 命令补全的替换区间（字节偏移，以行文本为基准）。
+    ///
+    /// `Some((byte_start, byte_end))` 时接受逻辑按此区间执行
+    /// `SetSelection` + `InsertText` 替换，忽略 `current_token` 推算。
+    /// `None` 时（文件路径补全）沿用批1 的 `current_token` 区间逻辑。
+    pub replace_range: Option<(usize, usize)>,
 }
 
 /// 从行文本 + 光标字节偏移提取「当前 token」。
@@ -154,6 +160,7 @@ pub fn complete_path(token: &str, cwd: &Path) -> Vec<Completion> {
             display,
             replacement,
             is_dir: true,
+            replace_range: None, // 文件路径补全使用 current_token 区间逻辑。
         });
     }
 
@@ -164,6 +171,7 @@ pub fn complete_path(token: &str, cwd: &Path) -> Vec<Completion> {
             display,
             replacement,
             is_dir: false,
+            replace_range: None, // 文件路径补全使用 current_token 区间逻辑。
         });
     }
 

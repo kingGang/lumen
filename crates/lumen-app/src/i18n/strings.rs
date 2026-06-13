@@ -286,8 +286,12 @@ pub struct Strings {
     pub footer_running_text: &'static str,
 
     // ── M4.1 批D1：Compose 态键位占位提示 ──────────────────────────
-    /// Compose 态 Tab 键占位提示 toast（M3.4 补全未实现）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    /// Compose 态 Tab 键占位提示 toast（M3.4 补全未实现；M4.4 批2 后降级路径仅在
+    /// `not(feature = "input-editor")` 分支使用，但需保留字段以维持三语文件编译完备性）
+    // ALLOW: 字段在 input-editor feature 启用时仅被 cfg(not(input-editor)) 分支使用，
+    // 看似 dead_code 实为多语言 Strings 结构体的完备性约束——删字段会导致三语实例
+    // 编译报错；故此处允许 dead_code，与同结构体的 toast_compose_history_hint 同款处理。
+    #[allow(dead_code)]
     pub toast_compose_tab_hint: &'static str,
     /// Compose 态 Ctrl+R 占位提示 toast（M4.3 面板已实现，此字段保留供降级/非 input-editor 模式）
     // ALLOW: M4.3 后 ComposeHistorySearch 直接打开面板，toast 路径不再走此字段；

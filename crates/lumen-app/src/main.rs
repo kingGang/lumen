@@ -6,6 +6,9 @@ mod background;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;
+/// 命令补全 sidecar 进程管理（M4.4 批2）：持久 pwsh 进程 + JSON 协议 + 异步响应唤醒。
+#[cfg(feature = "input-editor")]
+mod completion_sidecar;
 /// footer 输入区视图组装（M4.1 批C，feature = "input-editor"）——设计稿 §7.1。
 #[cfg(feature = "input-editor")]
 mod composer;
@@ -551,10 +554,19 @@ struct AppState {
     /// feature = "input-editor" 门控。
     #[cfg(feature = "input-editor")]
     ghost_cache: (u64, Option<String>),
-    /// 补全弹窗候选列表（M4.4 批1）：Tab 键触发后存入，render 时构造 CompletionView。
+    /// 补全弹窗候选列表（M4.4 批1 + 批2）：Tab 键触发后存入，render 时构造 CompletionView。
     /// feature = "input-editor" 门控。
     #[cfg(feature = "input-editor")]
     completion_candidates: Vec<completion::Completion>,
+    /// 命令补全 sidecar 进程管理器（M4.4 批2）。
+    /// feature = "input-editor" 门控。
+    #[cfg(feature = "input-editor")]
+    completion_sidecar: completion_sidecar::CompletionSidecar,
+    /// 当前在途的 sidecar 请求 id（M4.4 批2）：用于丢弃过期响应。
+    /// 0 = 无在途请求（保留无效值，request 从 1 开始分配）。
+    /// feature = "input-editor" 门控。
+    #[cfg(feature = "input-editor")]
+    completion_req_id: u64,
 
     // ── footer 鼠标状态机（第十一轮，feature = "input-editor"）──────────
     /// footer 区域的鼠标是否正在拖选中（左键按住未松开）。
@@ -2260,6 +2272,10 @@ impl App {
             #[cfg(feature = "input-editor")]
             completion_candidates: Vec::new(),
             #[cfg(feature = "input-editor")]
+            completion_sidecar: completion_sidecar::CompletionSidecar::new(self.proxy.clone()),
+            #[cfg(feature = "input-editor")]
+            completion_req_id: 0,
+            #[cfg(feature = "input-editor")]
             footer_dragging: false,
             #[cfg(feature = "input-editor")]
             footer_drag_anchor: lumen_editor::Position::default(),
@@ -2656,6 +2672,75 @@ impl ApplicationHandler<PtyWake> for App {
             && state.proxy.send_event(PtyWake).is_err()
         {
             error!("补发 PtyWake 失败：事件循环已关闭");
+        }
+
+        // M4.4 批2：drain sidecar 命令补全响应，合并进候选列表。
+        #[cfg(feature = "input-editor")]
+        {
+            let responses = state.completion_sidecar.poll();
+            let mut sidecar_merged = false;
+            for resp in responses {
+                // 丢弃过期响应（id 不匹配当前在途请求）。
+                if resp.id != state.completion_req_id || state.completion_req_id == 0 {
+                    continue;
+                }
+                if resp.items.is_empty() {
+                    continue;
+                }
+                // 取当前行文本（用于 char→byte 换算）。
+                let line_text = {
+                    let ti = state.active_tab;
+                    let pi = state.tabs[ti].focused;
+                    let view = state.tabs[ti].panes[pi].editor.view();
+                    let cur = view.cursor();
+                    view.line(cur.line).to_owned()
+                };
+                // 把 sidecar 候选转成 Completion，按 display 去重后追加。
+                // 先收集已有 display 字符串（owned），释放借用后再 push。
+                let existing_displays: std::collections::HashSet<String> = state
+                    .completion_candidates
+                    .iter()
+                    .map(|c| c.display.clone())
+                    .collect();
+                // char→byte 区间只算一次（resp 内所有候选共享同一 ri/rl）。
+                let replace_range = Some(completion_sidecar::char_range_to_bytes(
+                    &line_text, resp.ri, resp.rl,
+                ));
+                let mut new_items: Vec<completion::Completion> = Vec::new();
+                for item in &resp.items {
+                    if item.text.is_empty() {
+                        continue;
+                    }
+                    // ProviderContainer = 目录。
+                    let is_dir = item.kind == "ProviderContainer";
+                    // display 与 replacement 统一使用 item.text。
+                    let display = if is_dir && !item.text.ends_with('/') {
+                        format!("{}/", item.text)
+                    } else {
+                        item.text.clone()
+                    };
+                    if existing_displays.contains(&display) {
+                        continue; // 去重：与文件路径候选同名的跳过。
+                    }
+                    new_items.push(completion::Completion {
+                        display,
+                        replacement: item.text.clone(),
+                        is_dir,
+                        replace_range,
+                    });
+                }
+                state.completion_candidates.extend(new_items);
+                sidecar_merged = true;
+            }
+            if sidecar_merged && !state.completion_candidates.is_empty() {
+                // 若弹窗尚未打开（文件路径候选为空、等 sidecar），现在打开。
+                if !state.shell_state.completion.open {
+                    state.shell_state.completion.open = true;
+                    state.shell_state.completion.selected = 0;
+                    state.terminal_focused = false;
+                }
+                state.window.request_redraw();
+            }
         }
     }
 
@@ -3072,7 +3157,7 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::ComposeTab) => {
-                        // Compose 态 Tab：M4.4 批1 文件路径补全。
+                        // Compose 态 Tab：M4.4 批1 文件路径补全 + 批2 命令补全。
                         #[cfg(feature = "input-editor")]
                         {
                             let ti = state.active_tab;
@@ -3091,13 +3176,26 @@ impl ApplicationHandler<PtyWake> for App {
                                 .unwrap_or_else(|| std::path::PathBuf::from("."));
                             let (_, token) = completion::current_token(&line_text, cursor_byte);
                             let candidates = completion::complete_path(token, &cwd);
-                            if candidates.is_empty() {
-                                // 无候选时保留旧占位提示（静默或 toast）。
-                                let s = i18n::strings();
+
+                            // 批2：计算光标的 char 偏移，发送 sidecar 命令补全请求。
+                            // char 偏移 = line_text[..cursor_byte] 的 Unicode char 数。
+                            let cursor_char = line_text[..cursor_byte.min(line_text.len())]
+                                .chars()
+                                .count();
+                            let cwd_str = cwd.to_string_lossy();
+                            let req_id =
                                 state
-                                    .shell_state
-                                    .toast
-                                    .push(shell::toast::ToastKind::Info, s.toast_compose_tab_hint);
+                                    .completion_sidecar
+                                    .request(&line_text, cursor_char, &cwd_str);
+                            state.completion_req_id = req_id;
+
+                            if candidates.is_empty() {
+                                // 无文件路径候选，但命令补全可能异步到达：
+                                // 先清候选列表、打开弹窗（空状态）等待 sidecar 响应；
+                                // 若 sidecar 也无候选才降级提示。
+                                // 此处先只清旧候选，弹窗在 sidecar 响应到达后开。
+                                state.completion_candidates.clear();
+                                // 无文件路径候选时先不开弹窗（等 sidecar），但不推 toast。
                             } else {
                                 state.completion_candidates = candidates;
                                 let comp = &mut state.shell_state.completion;
@@ -4206,33 +4304,42 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— 补全弹窗（M4.4 批1）输出处理 ——
                 // completion_accept：用选定候选的 replacement 替换当前 token。
+                // 批2：若候选含 replace_range（命令补全），按其字节区间替换；
+                //       否则（文件路径补全）沿用批1 的 current_token 区间逻辑。
                 #[cfg(feature = "input-editor")]
                 if let Some(idx) = shell_out.completion_accept {
                     if let Some(cand) = state.completion_candidates.get(idx) {
                         let replacement = cand.replacement.clone();
+                        let replace_range = cand.replace_range;
                         let ti = state.active_tab;
                         let pi = state.tabs[ti].focused;
-                        // 重新计算 token 区间（接受时再算一次，保证与编辑器当前状态一致）。
-                        let (token_start, cursor_byte) = {
+                        let cur_line_idx = state.tabs[ti].panes[pi].editor.view().cursor().line;
+
+                        let (sel_start_byte, sel_end_byte) = if let Some((rs, re)) = replace_range {
+                            // 命令补全：使用 sidecar 给出的字节区间（已在合并时换算好）。
+                            (rs, re)
+                        } else {
+                            // 文件路径补全：重新计算 current_token 区间（与编辑器当前状态一致）。
                             let view = state.tabs[ti].panes[pi].editor.view();
                             let cur = view.cursor();
                             let line = view.line(cur.line).to_owned();
                             let (start, _) = completion::current_token(&line, cur.byte);
                             (start, cur.byte)
                         };
-                        let token_start_pos = lumen_editor::Position {
-                            line: state.tabs[ti].panes[pi].editor.view().cursor().line,
-                            byte: token_start,
+
+                        let sel_start_pos = lumen_editor::Position {
+                            line: cur_line_idx,
+                            byte: sel_start_byte,
                         };
-                        let cursor_pos = lumen_editor::Position {
-                            line: state.tabs[ti].panes[pi].editor.view().cursor().line,
-                            byte: cursor_byte,
+                        let sel_end_pos = lumen_editor::Position {
+                            line: cur_line_idx,
+                            byte: sel_end_byte,
                         };
-                        // 选中 token 区间，然后 InsertText 替换。
+                        // 选中替换区间，然后 InsertText 覆盖写入候选文本。
                         state.tabs[ti].panes[pi].editor.apply(
                             &lumen_editor::EditAction::SetSelection(lumen_editor::Selection {
-                                anchor: token_start_pos,
-                                cursor: cursor_pos,
+                                anchor: sel_start_pos,
+                                cursor: sel_end_pos,
                             }),
                         );
                         state.tabs[ti].panes[pi]
@@ -4240,6 +4347,7 @@ impl ApplicationHandler<PtyWake> for App {
                             .apply(&lumen_editor::EditAction::InsertText(replacement));
                         state.shell_state.completion.open = false;
                         state.completion_candidates.clear();
+                        state.completion_req_id = 0; // 取消 sidecar 在途请求（若还有）。
                         state.terminal_focused = true;
                         state.window.request_redraw();
                     }
@@ -4248,6 +4356,10 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.completion_closed {
                     state.shell_state.completion.open = false;
                     state.completion_candidates.clear();
+                    #[cfg(feature = "input-editor")]
+                    {
+                        state.completion_req_id = 0; // 丢弃后续 sidecar 响应。
+                    }
                     state.terminal_focused = true;
                     state.window.request_redraw();
                 }
