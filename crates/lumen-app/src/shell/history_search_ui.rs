@@ -108,6 +108,11 @@ pub fn show(
         }
     });
 
+    // 鼠标本帧是否移动——hover 仅在移动时生效，避免鼠标静止在面板上时
+    // 每帧把 selected 拉回 hover 行、键盘 ↑↓ 失效（海风哥 2026-06-13 反馈：
+    // 面板常开在鼠标正下方，一开就动不了键盘）。
+    let pointer_moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+
     // selected 每帧按 rows.len() 钳制（rows 可能减少）。
     if !rows.is_empty() {
         state.selected = state.selected.min(rows.len() - 1);
@@ -226,7 +231,9 @@ pub fn show(
                             );
 
                             let is_selected = idx == state.selected;
-                            let is_hovered = resp.hovered();
+                            // hover 仅在鼠标移动时算数——静止时让位键盘选择，
+                            // 既不抢 selected（242）也不画 hover 背景（232 双高亮）。
+                            let is_hovered = resp.hovered() && pointer_moved;
 
                             // 高亮背景（selected 或 hover）。
                             if is_selected || is_hovered {
