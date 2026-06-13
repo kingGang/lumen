@@ -2,8 +2,9 @@
 //!
 //! # 设计原则
 //! - **静态表**：表项 = 键位 + 修饰 + 模式列 + 守卫条件 + Action，先命中先赢。
-//! - **安全规则置表头**：Ctrl+C Running/AltScreen 无条件 Interrupt 最高优先级
-//!   （设计稿风险 3 硬规则：任何守卫组合下均不得拦截）。
+//! - **安全规则置表头**：Ctrl+C Running/AltScreen 无条件 Interrupt（运行中
+//!   中断优先，不被选区拦截）；Fallback 有选区先复制、否则 Interrupt；
+//!   Compose（待命）有选区复制（层 9）。
 //! - **行为 1:1 平移**：把 main.rs 现有八层 if-else 的全部终端快捷键语义
 //!   完整平移进表，零行为变化（批B 是纯重构）。
 //! - **Compose 态暂与 Running 相同**：本批两态均直通 PTY，批D 开闸时仅改
@@ -163,7 +164,7 @@ pub fn lookup(
 /// 3. 外壳级快捷键（Ctrl+T/W/B/,/Tab，alt screen 时让位终端）
 /// 4. 终端聚焦闸（非聚焦直接返回 None）
 /// 5. Ctrl+Shift+E（经典直通切换，全模式可用）
-/// 6. 安全规则：Ctrl+C Running/AltScreen/Fallback 无条件 Interrupt（最高优先级）
+/// 6. 安全规则：Ctrl+C Running/AltScreen 无条件 Interrupt；Fallback 有选区先复制、否则 Interrupt（最高优先级）
 /// 7. Shift+PgUp/PgDn 翻屏，Shift+Insert 粘贴（Compose 态 Shift+Insert 进编辑器）
 /// 8. Ctrl+↑/↓ 块跳转（非 alt screen）
 /// 9. **Compose 态开闸**（M4.1 批D1）：设计稿 §4 完整键位语义表
@@ -258,12 +259,38 @@ pub fn lookup_input(
         return None;
     }
 
-    // ── 层 5（安全规则最高优先）：Ctrl+C Running/AltScreen 无条件 Interrupt ──
-    // 设计稿风险 3 硬规则：Running / AltScreen / Fallback 态下 Ctrl+C 一律
-    // 直通 ETX，任何守卫组合不得吞。
+    // ── 层 5（安全规则最高优先）：Ctrl+C 中断 / 复制分场景 ──────────────────
+    // Running（命令运行中）/ AltScreen（全屏 TUI）：无条件 Interrupt——运行中
+    // 中断优先，决不被选区拦截（跑飞进程必须可杀、TUI 必须收 SIGINT）。
+    // Fallback（集成未生效、无 OSC 133、分不清待命/运行）：折中——有终端选区/
+    // 选中块先复制（CopySelection/CopyBlock 复制后即清选区，下次 Ctrl+C 即
+    // 中断），无任何选择才中断。Compose（提示符待命）走层 9：有选区复制。
+    // 理想体验「待命复制 + 运行无条件中断」需 shell 集成生效（进 Compose/Running）。
     if ctrl && is_char(input, 'c') && !shift {
         match mode {
-            InputMode::Running | InputMode::AltScreen | InputMode::Fallback => {
+            // 运行中 / 全屏 TUI：无条件 Interrupt——命令运行中 Ctrl+C 必须可靠
+            // 中断（杀跑飞进程 / 让 TUI 收 SIGINT），决不被选区拦截。选区复制
+            // 在提示符待命（Compose 态层 9）进行，或用右键。
+            InputMode::Running | InputMode::AltScreen => {
+                return Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::Interrupt,
+                )));
+            }
+            // Fallback（集成未生效，无 OSC 133、分不清待命/运行）：折中——有
+            // 终端选区/选中块先复制（复制后清选区，下次 Ctrl+C 即中断），无任
+            // 何选择才中断。理想的「待命复制 + 运行无条件中断」需 shell 集成
+            // 生效进入 Compose/Running 态。
+            InputMode::Fallback => {
+                if guard.has_selection {
+                    return Some(LookupResult::TerminalAction(Action::Term(
+                        TermAction::CopySelection,
+                    )));
+                }
+                if guard.has_selected_block {
+                    return Some(LookupResult::TerminalAction(Action::Term(
+                        TermAction::CopyBlock,
+                    )));
+                }
                 return Some(LookupResult::TerminalAction(Action::Term(
                     TermAction::Interrupt,
                 )));
@@ -326,7 +353,7 @@ pub fn lookup_input(
 
     // ── 层 9：Compose 态开闸（M4.1 批D1）——设计稿 §4 ──────────────────
     // Running/AltScreen/Fallback 态跳过此层，走后续兜底直通。
-    // E9 铁律：Running/AltScreen/Fallback 的 Ctrl+C 已在层 5 无条件 Interrupt，
+    // E9 铁律：Running/AltScreen/Fallback 的 Ctrl+C 已在层 5 处理并返回，
     // 此层逻辑对非 Compose 态完全不可达（模式检查保证）。
     if mode == InputMode::Compose {
         // 9-a: Enter → Composer(Submit)
@@ -474,7 +501,7 @@ pub fn lookup_input(
         //   缓冲非空 → CancelLine（清空存放弃稿）
         //   缓冲为空 → Interrupt（下穿 ETX，逃生舱）
         //
-        // E9 铁律：Running/AltScreen/Fallback 态在层 5 已无条件 Interrupt，
+        // E9 铁律：Running/AltScreen/Fallback 态的 Ctrl+C 已在层 5 处理并返回，
         // 此层仅在 Compose 态可达，安全规则不受影响。
         if ctrl && !shift && is_char(input, 'c') {
             // 第一级（新增）：编辑器选区非空 → 复制编辑器选区文本
@@ -763,7 +790,9 @@ mod tests {
 
     #[test]
     fn safety_ctrl_c_running_with_selection_is_interrupt() {
-        // Running 态安全规则：无条件 Interrupt，不做复制（设计稿 §4）
+        // Running 态（命令运行中）安全规则：即使有选区也无条件 Interrupt——
+        // 运行中中断优先，不被选区拦截（跑飞进程必须可杀）。选区复制在提示符
+        // 待命（Compose 态）进行。
         let guard = GuardState {
             terminal_focused: true,
             has_selection: true,
@@ -783,7 +812,87 @@ mod tests {
                     TermAction::Interrupt
                 )))
             ),
-            "Running 态 Ctrl+C 即使有选区也应为 Interrupt（安全规则）"
+            "Running 态 Ctrl+C 即使有选区也应 Interrupt（运行中中断优先）"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_fallback_with_selection_is_copy_selection() {
+        // Fallback 态（集成未生效）有选区同样先复制。
+        let guard = GuardState {
+            terminal_focused: true,
+            has_selection: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Fallback,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopySelection
+                )))
+            ),
+            "Fallback 态 Ctrl+C 有选区应复制选区"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_fallback_with_selected_block_is_copy_block() {
+        // Fallback 态无终端选区但有选中块 → 复制块输出。
+        let guard = GuardState {
+            terminal_focused: true,
+            has_selected_block: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Fallback,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopyBlock
+                )))
+            ),
+            "Fallback 态 Ctrl+C 有选中块应复制块输出"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_alt_screen_with_selection_still_interrupt() {
+        // AltScreen 态刻意排除：即使有选区也无条件 Interrupt，让 TUI 立即收
+        // Ctrl+C（右键仍可复制）。锁定这一刻意取舍。
+        let guard = GuardState {
+            terminal_focused: true,
+            is_alt_screen: true,
+            has_selection: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::AltScreen,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::Interrupt
+                )))
+            ),
+            "AltScreen 态 Ctrl+C 即使有选区也应 Interrupt（刻意排除）"
         );
     }
 
@@ -1928,7 +2037,7 @@ mod tests {
 
     #[test]
     fn e9_running_ctrl_c_无选区_interrupt() {
-        // E9 铁律：Running 态 Ctrl+C 无条件 Interrupt（层 5 安全规则）
+        // E9 铁律：Running 态 Ctrl+C 无选区时 Interrupt（层 5 安全规则）
         let result = lookup_char(
             "c",
             ModifiersState::CONTROL,
