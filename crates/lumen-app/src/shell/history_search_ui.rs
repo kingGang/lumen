@@ -17,8 +17,6 @@ const LIST_MAX_HEIGHT: f32 = 360.0;
 const ROW_HEIGHT: f32 = 32.0;
 /// 退出码徽标列宽。
 const BADGE_COL: f32 = 24.0;
-/// cwd 尾目录名列最大宽度（超出截断）。
-const CWD_MAX_WIDTH: f32 = 140.0;
 /// 面板圆角半径。
 const PANEL_RADIUS: f32 = 10.0;
 /// 面板内边距（水平/垂直）。
@@ -36,14 +34,14 @@ pub struct HistorySearchUiState {
     pub selected: usize,
     /// 为 true 时下一帧对搜索框 request_focus 并清零此标志。
     pub focus_query: bool,
+    /// 本帧 selected 是否由键盘 ↑↓ 改变（用于驱动 scroll_to_me，验收⑤）。
+    pub selection_changed_by_key: bool,
 }
 
 /// 历史搜索面板中一行的展示数据（由 main.rs 从 fuzzy_search + entries 构造）。
 pub struct HistoryRow {
     /// 命令文本（用于展示与填入）。
     pub text: String,
-    /// 工作目录（可选；展示尾目录名）。
-    pub cwd: Option<String>,
     /// 退出码（None 不展示徽标）。
     pub exit_code: Option<i32>,
     /// 命中字符的字节区间列表 `[start, end)`，已合并连续段，用于高亮。
@@ -83,16 +81,19 @@ pub fn show(
     // ── 键盘事件（在 Modal 之前读取，避免 Modal 消化部分按键）──────────
     // 注意：egui 的 Modal 会在 should_close 中处理 Esc，但我们先在此处
     // 捕获方向键与 Enter，避免它们被其他控件（TextEdit）消化。
+    state.selection_changed_by_key = false;
     ctx.input(|i| {
         // ↑：向上移动选中行（钳制到 0）。
         if i.key_pressed(egui::Key::ArrowUp) && state.selected > 0 {
             state.selected -= 1;
+            state.selection_changed_by_key = true;
         }
         // ↓：向下移动选中行（钳制到 rows.len().saturating_sub(1)）。
         if i.key_pressed(egui::Key::ArrowDown) {
             let max = rows.len().saturating_sub(1);
             if state.selected < max {
                 state.selected += 1;
+                state.selection_changed_by_key = true;
             }
         }
         // Enter：接受当前选中行。
@@ -242,7 +243,12 @@ pub fn show(
                                 state.selected = idx;
                             }
 
-                            // 内容绘制（badge + 命令文本 + cwd）。
+                            // 键盘 ↑↓ 改变 selected 后，滚动使选中行可见（验收⑤）。
+                            if is_selected && state.selection_changed_by_key {
+                                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+                            }
+
+                            // 内容绘制（badge + 命令文本，去掉 cwd 列，验收③）。
                             let p = ui.painter();
 
                             // 退出码徽标（exit_code=Some(0) → 绿 ✓；Some(非0) → 红 ✗；None → 无）。
@@ -270,28 +276,17 @@ pub fn show(
                                 None => {}
                             }
 
-                            // cwd 尾目录名（右对齐，fg_dim，截断）。
-                            let cwd_name: Option<String> = row.cwd.as_deref().and_then(|c| {
-                                std::path::Path::new(c)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .map(|n| n.to_owned())
-                            });
-                            let cwd_width = if cwd_name.is_some() {
-                                CWD_MAX_WIDTH
-                            } else {
-                                0.0
-                            };
-
-                            // 命令文本区域（badge 列之后，cwd 列之前）。
+                            // 命令文本区域：badge 列之后，占满全宽（无 cwd 列，验收③）。
                             let text_left = row_rect.min.x + BADGE_COL;
-                            let text_right = row_rect.max.x - cwd_width - 8.0;
+                            let text_right = row_rect.max.x - 8.0;
                             let text_rect = egui::Rect::from_min_max(
                                 egui::pos2(text_left, row_rect.min.y),
                                 egui::pos2(text_right, row_rect.max.y),
                             );
 
-                            // 命令文本：用 LayoutJob 实现 match_spans 高亮。
+                            // 命令文本：LayoutJob 实现 match_spans 高亮。
+                            // first_row_min_height 设 0（不撑高 galley），
+                            // 使 galley.size().y = 文字自然高度，居中计算才正确（验收⑥）。
                             let mut job = egui::text::LayoutJob {
                                 wrap: egui::text::TextWrapping {
                                     max_width: text_rect.width(),
@@ -299,7 +294,7 @@ pub fn show(
                                     break_anywhere: true,
                                     ..Default::default()
                                 },
-                                first_row_min_height: ROW_HEIGHT,
+                                first_row_min_height: 0.0,
                                 ..Default::default()
                             };
 
@@ -358,29 +353,12 @@ pub fn show(
                             }
 
                             let galley = p.layout_job(job);
+                            // 居中：galley 自然高度居于行高中央（验收⑥）。
                             let text_pos = egui::pos2(
                                 text_rect.min.x,
                                 text_rect.center().y - galley.size().y / 2.0,
                             );
                             p.galley(text_pos, galley, pal.fg);
-
-                            // cwd 尾目录名（右对齐）。
-                            if let Some(name) = cwd_name {
-                                let cwd_rect = egui::Rect::from_min_max(
-                                    egui::pos2(row_rect.max.x - cwd_width, row_rect.min.y),
-                                    egui::pos2(row_rect.max.x - 4.0, row_rect.max.y),
-                                );
-                                let cwd_galley = p.layout_no_wrap(
-                                    name,
-                                    egui::FontId::proportional(11.0),
-                                    pal.fg_dim,
-                                );
-                                let cwd_pos = egui::pos2(
-                                    cwd_rect.max.x - cwd_galley.size().x.min(cwd_width - 4.0),
-                                    cwd_rect.center().y - cwd_galley.size().y / 2.0,
-                                );
-                                p.galley(cwd_pos, cwd_galley, pal.fg_dim);
-                            }
 
                             // 分配行高让 ScrollArea 正确计算总高度。
                             ui.advance_cursor_after_rect(row_rect);

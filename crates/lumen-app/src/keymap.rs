@@ -310,6 +310,20 @@ pub fn lookup_input(
         }
     }
 
+    // ── 层 8：Ctrl+R 历史搜索（Compose + 经典直通 Fallback）─────────────
+    // Compose 态与经典直通（Fallback）态打开 Lumen 历史面板（M4.3 验收①：
+    // 海风哥要经典模式也能开）。**Running / AltScreen 不拦截、必须直通**——
+    // 全屏程序（vim/codex 的 Ctrl+R redo）与运行中程序（python REPL 的反向
+    // 搜索）要独占键盘，被面板抢就坏了（设计稿 §4：这两态 Ctrl+R 本就直通）。
+    // 位于聚焦闸（层 4）之后保证终端聚焦；位于 Compose 开闸（层 9）之前。
+    if ctrl
+        && !shift
+        && is_char(input, 'r')
+        && matches!(mode, InputMode::Compose | InputMode::Fallback)
+    {
+        return Some(LookupResult::ComposeHistorySearch);
+    }
+
     // ── 层 9：Compose 态开闸（M4.1 批D1）——设计稿 §4 ──────────────────
     // Running/AltScreen/Fallback 态跳过此层，走后续兜底直通。
     // E9 铁律：Running/AltScreen/Fallback 的 Ctrl+C 已在层 5 无条件 Interrupt，
@@ -441,10 +455,7 @@ pub fn lookup_input(
             return Some(LookupResult::ComposeTab);
         }
 
-        // 9-j: Ctrl+R → 无操作（D2 历史面板占位）
-        if ctrl && !shift && is_char(input, 'r') {
-            return Some(LookupResult::ComposeHistorySearch);
-        }
+        // 9-j: Ctrl+R → 已提前至层 8 全模式处理（不在此重复）
 
         // 9-k: Esc → 关浮层 → 清选区 → 空操作
         if !ctrl && !shift && !alt && is_named(input, WinitNamedKey::Escape) {
@@ -1647,7 +1658,57 @@ mod tests {
         );
         assert!(
             matches!(result, Some(LookupResult::ComposeHistorySearch)),
-            "Compose 态 Ctrl+R → ComposeHistorySearch 占位"
+            "Compose 态 Ctrl+R → ComposeHistorySearch"
+        );
+    }
+
+    #[test]
+    fn running_ctrl_r_直通_不开面板() {
+        // 验收①修正：Running 态 Ctrl+R 必须直通（python REPL 反向搜索等独占
+        // 键盘），不开 Lumen 历史面板——只 Compose / Fallback 开。
+        let result = lookup_char(
+            "r",
+            ModifiersState::CONTROL,
+            InputMode::Running,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            !matches!(result, Some(LookupResult::ComposeHistorySearch)),
+            "Running 态 Ctrl+R 不应开面板（直通给运行中程序）"
+        );
+    }
+
+    #[test]
+    fn altscreen_ctrl_r_直通_不开面板() {
+        // 验收①修正：AltScreen（vim/codex 全屏）态 Ctrl+R 必须直通（vim 的
+        // Ctrl+R 是 redo），绝不能被历史面板抢。
+        let result = lookup_char(
+            "r",
+            ModifiersState::CONTROL,
+            InputMode::AltScreen,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            !matches!(result, Some(LookupResult::ComposeHistorySearch)),
+            "AltScreen 态 Ctrl+R 不应开面板（直通给全屏程序）"
+        );
+    }
+
+    #[test]
+    fn fallback_ctrl_r_是_compose_history_search_结果() {
+        // 验收①：Fallback（经典直通）态 Ctrl+R 也应打开历史面板。
+        let result = lookup_char(
+            "r",
+            ModifiersState::CONTROL,
+            InputMode::Fallback,
+            true,
+            &default_guard(),
+        );
+        assert!(
+            matches!(result, Some(LookupResult::ComposeHistorySearch)),
+            "Fallback 态 Ctrl+R 也应返回 ComposeHistorySearch（全模式历史搜索）"
         );
     }
 

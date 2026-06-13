@@ -349,6 +349,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: 1,
+                count: 1,
             });
 
             // 编辑器输入 "git s"，光标在行末（byte=5）。
@@ -432,6 +433,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: 1,
+                count: 1,
             });
             let mut editor = Editor::default();
             editor.apply(&EditAction::InsertText("git".to_string()));

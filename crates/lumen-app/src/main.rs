@@ -3731,6 +3731,8 @@ impl ApplicationHandler<PtyWake> for App {
                     });
                 // 历史搜索面板行数据（M4.3）：仅面板打开时计算（最多取 50 条）。
                 // 面板关闭时传空 Vec，不做 fuzzy_search 开销。
+                // 历史搜索面板行数据（M4.3）：仅面板打开时计算（取前 20 条，由 fuzzy_search 内部截断）。
+                // 面板关闭时传空 Vec，不做 fuzzy_search 开销。
                 let history_rows_owned: Vec<shell::history_search_ui::HistoryRow> =
                     if state.shell_state.history_search.open {
                         let query = &state.shell_state.history_search.query;
@@ -3738,12 +3740,10 @@ impl ApplicationHandler<PtyWake> for App {
                             .history
                             .fuzzy_search(query)
                             .into_iter()
-                            .take(50)
                             .map(|hit| {
                                 let entry = &state.history.entries()[hit.entry_idx];
                                 shell::history_search_ui::HistoryRow {
                                     text: entry.text.clone(),
-                                    cwd: entry.cwd.clone(),
                                     exit_code: entry.exit_code,
                                     match_spans: hit.match_spans,
                                 }
@@ -4150,21 +4150,41 @@ impl ApplicationHandler<PtyWake> for App {
                 }
 
                 // —— 历史搜索面板（M4.3）输出处理 ——
-                // history_accept：把选定命令写入焦点窗格编辑器并关闭面板。
-                #[cfg(feature = "input-editor")]
+                // history_accept：按当前输入模式分流。
+                // - Compose 态：填入编辑器（SetText + 光标移末）。
+                // - 非 Compose 态（Running / Fallback / AltScreen）：直接写入 PTY，
+                //   不带回车，让用户确认后自己回车（验收①）。
                 if let Some(text) = shell_out.history_accept {
                     let ti = state.active_tab;
                     let pi = state.tabs[ti].focused;
-                    state.tabs[ti].panes[pi]
-                        .editor
-                        .apply(&lumen_editor::EditAction::SetText(text));
-                    // 光标移到行末（视觉跟手，与历史导航同款）。
-                    state.tabs[ti].panes[pi]
-                        .editor
-                        .apply(&lumen_editor::EditAction::Move {
-                            motion: lumen_editor::Motion::DocEnd,
-                            extend: false,
-                        });
+                    let cur_mode =
+                        mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
+                    #[cfg(feature = "input-editor")]
+                    if cur_mode == mode::InputMode::Compose {
+                        state.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::SetText(text));
+                        // 光标移到行末（视觉跟手，与历史导航同款）。
+                        state.tabs[ti].panes[pi]
+                            .editor
+                            .apply(&lumen_editor::EditAction::Move {
+                                motion: lumen_editor::Motion::DocEnd,
+                                extend: false,
+                            });
+                    } else {
+                        // 非 Compose 态：把命令文本写入 PTY（不含 \r，让用户自己确认）。
+                        if let Err(e) = state.tabs[ti].panes[pi].write_user_input(text.as_bytes()) {
+                            log::error!("历史搜索填入 PTY 失败: {e:#}");
+                        }
+                    }
+                    #[cfg(not(feature = "input-editor"))]
+                    {
+                        // 无 input-editor feature 时（理论上不会到此分支，防御性兜底）
+                        let _ = cur_mode;
+                        if let Err(e) = state.tabs[ti].panes[pi].write_user_input(text.as_bytes()) {
+                            log::error!("历史搜索填入 PTY 失败: {e:#}");
+                        }
+                    }
                     state.shell_state.history_search.open = false;
                     state.terminal_focused = true;
                     state.window.request_redraw();

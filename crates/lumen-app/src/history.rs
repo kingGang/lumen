@@ -43,6 +43,9 @@ pub struct HistoryEntry {
     pub duration_ms: Option<u64>,
     /// 提交时刻（Unix 毫秒）。
     pub ts: u64,
+    /// 该命令在历史中出现次数（`deduplicate` 去重时统计；`#[serde(default)]` 兼容旧 jsonl 文件）。
+    #[serde(default)]
+    pub count: u32,
 }
 
 impl HistoryEntry {
@@ -54,6 +57,7 @@ impl HistoryEntry {
             exit_code: None,
             duration_ms: None,
             ts,
+            count: 0, // load → deduplicate 时重算
         }
     }
 }
@@ -204,6 +208,7 @@ impl HistoryStore {
                 exit_code: None,
                 duration_ms: None,
                 ts: mtime_ms,
+                count: 0, // deduplicate 时重算
             })
             .collect();
 
@@ -461,9 +466,12 @@ impl HistoryStore {
 
     /// 模糊搜索历史命令（M4.3 Ctrl+R 历史搜索面板）。
     ///
-    /// 子序列匹配（大小写不敏感）+ 评分（连续/词首边界 bonus + 短文本加权），
-    /// 按分降序返回（同分按近因 = entries 下标大→小，即新→旧）。空 query 返回
-    /// 全部、按近因排序。跳过多行条目（面板单行展示）。
+    /// 子序列匹配（大小写不敏感）+ 评分（连续/词首边界 bonus + 短文本加权）。
+    /// - **空 query**：按使用频率（`count` 降序）排列，同 count 按近因（entry_idx 大→小）；
+    ///   取前 20 条（验收④）。
+    /// - **非空 query**：按匹配分降序，同分按近因；取前 20 条。
+    /// - **输出去重保险**：同 text 只保留排序最靠前的一条（验收②）。
+    /// - 跳过多行条目（面板单行展示）。
     ///
     /// 返回的 [`HistorySearchHit::entry_idx`] 是 [`Self::entries`] 的下标。
     pub fn fuzzy_search(&self, query: &str) -> Vec<HistorySearchHit> {
@@ -473,13 +481,13 @@ impl HistoryStore {
             .filter(|c| !c.is_whitespace())
             .flat_map(char::to_lowercase)
             .collect();
-        if q.is_empty() {
-            // 空 query：全部非多行条目，按近因（新 → 旧）。
-            return self
+
+        let mut hits: Vec<HistorySearchHit> = if q.is_empty() {
+            // 空 query：全部非多行条目，按频率（count 降序）+ 近因排列。
+            let mut v: Vec<HistorySearchHit> = self
                 .entries
                 .iter()
                 .enumerate()
-                .rev()
                 .filter(|(_, e)| !e.text.contains('\n'))
                 .map(|(entry_idx, _)| HistorySearchHit {
                     entry_idx,
@@ -487,22 +495,50 @@ impl HistoryStore {
                     match_spans: Vec::new(),
                 })
                 .collect();
-        }
-        let mut hits: Vec<HistorySearchHit> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| !e.text.contains('\n'))
-            .filter_map(|(entry_idx, e)| {
-                fuzzy_match_score(&e.text, &q).map(|(score, match_spans)| HistorySearchHit {
-                    entry_idx,
-                    score,
-                    match_spans,
+            v.sort_by(|a, b| {
+                let ca = self.entries[a.entry_idx].count;
+                let cb = self.entries[b.entry_idx].count;
+                cb.cmp(&ca).then(b.entry_idx.cmp(&a.entry_idx))
+            });
+            v
+        } else {
+            // 非空 query：子序列匹配 + 评分。
+            let mut v: Vec<HistorySearchHit> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.text.contains('\n'))
+                .filter_map(|(entry_idx, e)| {
+                    fuzzy_match_score(&e.text, &q).map(|(score, match_spans)| HistorySearchHit {
+                        entry_idx,
+                        score,
+                        match_spans,
+                    })
                 })
-            })
-            .collect();
-        // 分降序；同分按近因（entry_idx 大 = 新）。
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then(b.entry_idx.cmp(&a.entry_idx)));
+                .collect();
+            // 分降序；同分按近因（entry_idx 大 = 新），再按 count 做三级排序。
+            v.sort_by(|a, b| {
+                b.score
+                    .cmp(&a.score)
+                    .then(b.entry_idx.cmp(&a.entry_idx))
+                    .then(
+                        self.entries[b.entry_idx]
+                            .count
+                            .cmp(&self.entries[a.entry_idx].count),
+                    )
+            });
+            v
+        };
+
+        // 输出层去重保险（验收②）：同 text 只保留排序最靠前的一条。
+        {
+            use std::collections::HashSet;
+            let mut seen: HashSet<&str> = HashSet::new();
+            hits.retain(|h| seen.insert(self.entries[h.entry_idx].text.as_str()));
+        }
+
+        // 截断：最多返回 20 条（验收④）。
+        hits.truncate(20);
         hits
     }
 }
@@ -565,17 +601,15 @@ fn fuzzy_match_score(text: &str, query_lower: &[char]) -> Option<(i64, Vec<(usiz
 }
 
 /// 去重并保留最近 `max` 条：同 text 的条目合并（保留 exit_code 非 None 的，
-/// 否则取 ts 最新的）。输出按原始时间升序（老 → 新）。
+/// 否则取 ts 最新的）；同时统计各 text 的出现次数写入 `count`（验收④）。
+/// 输出按原始时间升序（老 → 新）。
 fn deduplicate(mut raw: Vec<HistoryEntry>, max: usize) -> Vec<HistoryEntry> {
-    // 去重：保留每个 text 最新（ts 最大）的条目，且 exit_code 非 None 时优先。
-    // 用一个 IndexMap-like 策略：逆序遍历（新 → 旧），seen 集合跟踪已见 text。
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut deduped: Vec<HistoryEntry> = Vec::with_capacity(raw.len().min(max));
-    // 先将有 exit_code 的条目按 text 归档（保留最新有效 exit_code）。
+    // 第一遍：统计每个 text 的出现次数、最新有效 exit_code。
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut exit_codes: std::collections::HashMap<String, (i32, u64)> =
         std::collections::HashMap::new();
     for e in &raw {
+        *counts.entry(e.text.clone()).or_insert(0) += 1;
         if let Some(ec) = e.exit_code {
             let prev_ts = exit_codes.get(&e.text).map(|(_, t)| *t).unwrap_or(0);
             if e.ts >= prev_ts {
@@ -583,9 +617,15 @@ fn deduplicate(mut raw: Vec<HistoryEntry>, max: usize) -> Vec<HistoryEntry> {
             }
         }
     }
-    // 逆序去重（取最新出现）。
+
+    // 第二遍：逆序去重（取最新出现的条目），同时写入 count 和 exit_code。
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<HistoryEntry> = Vec::with_capacity(raw.len().min(max));
     for e in raw.iter_mut().rev() {
         if seen.insert(e.text.clone()) {
+            // 写入出现次数（至少 1）。
+            e.count = counts.get(&e.text).copied().unwrap_or(1).max(1);
             // 补充 exit_code（若本条目没有，但其他批次有）。
             if e.exit_code.is_none() {
                 if let Some(&(ec, _)) = exit_codes.get(&e.text) {
@@ -679,7 +719,7 @@ mod tests {
 
     // ── 模糊搜索（M4.3）────────────────────────────────────────────────
 
-    /// 用给定文本构造内存 store（ts 按下标递增 = 越后越新）。
+    /// 用给定文本构造内存 store（ts 按下标递增 = 越后越新；count=1）。
     fn store_with(texts: &[&str]) -> HistoryStore {
         let mut s = make_store(std::env::temp_dir().join("lumen_fuzzy_test"));
         for (i, text) in texts.iter().enumerate() {
@@ -689,6 +729,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: (i + 1) as u64,
+                count: 1,
             });
         }
         s
@@ -713,13 +754,16 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_大小写不敏感_空query按近因() {
+    fn fuzzy_大小写不敏感_空query按频率() {
         let s = store_with(&["LS -la", "PWD"]);
         assert_eq!(s.fuzzy_search("ls").len(), 1, "大小写不敏感");
-        // 空 query 返回全部、按近因（新 → 旧）。
+        // 空 query：store_with 给每条 count=1，同 count 按近因（新→旧）。
         let all = s.fuzzy_search("");
         assert_eq!(all.len(), 2);
-        assert_eq!(s.entries[all[0].entry_idx].text, "PWD", "最新条目排首");
+        assert_eq!(
+            s.entries[all[0].entry_idx].text, "PWD",
+            "同 count 时最新条目排首"
+        );
     }
 
     #[test]
@@ -740,6 +784,90 @@ mod tests {
         assert_eq!(s.entries[hits[0].entry_idx].text, "foobar");
     }
 
+    #[test]
+    fn fuzzy_空query按频率降序排列() {
+        // count 高的应排在前面（验收④）。
+        let mut s = make_store(std::env::temp_dir().join("lumen_fuzzy_freq_test"));
+        s.entries.push(HistoryEntry {
+            text: "ls".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1,
+            count: 5,
+        });
+        s.entries.push(HistoryEntry {
+            text: "pwd".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 2,
+            count: 10,
+        });
+        s.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 3,
+            count: 3,
+        });
+        let hits = s.fuzzy_search("");
+        assert_eq!(s.entries[hits[0].entry_idx].text, "pwd", "count=10 应排首");
+        assert_eq!(s.entries[hits[1].entry_idx].text, "ls", "count=5 应排第二");
+        assert_eq!(
+            s.entries[hits[2].entry_idx].text, "git status",
+            "count=3 应排第三"
+        );
+    }
+
+    #[test]
+    fn fuzzy_结果最多20条() {
+        // 超过 20 条时应截断（验收④）。
+        let texts: Vec<String> = (0..30).map(|i| format!("command-{i}")).collect();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let s = store_with(&text_refs);
+        let hits = s.fuzzy_search("");
+        assert_eq!(hits.len(), 20, "空 query 结果应截断至 20 条");
+        let hits2 = s.fuzzy_search("command");
+        assert_eq!(hits2.len(), 20, "非空 query 结果也应截断至 20 条");
+    }
+
+    #[test]
+    fn fuzzy_输出层去重() {
+        // 即使 entries 中有重复文本（防御性），输出也应去重（验收②）。
+        let mut s = make_store(std::env::temp_dir().join("lumen_fuzzy_dedup_test"));
+        // 直接插入两条相同 text（绕过 deduplicate，模拟极端情况）。
+        for i in 0..3u64 {
+            s.entries.push(HistoryEntry {
+                text: "git status".into(),
+                cwd: None,
+                exit_code: None,
+                duration_ms: None,
+                ts: i,
+                count: 1,
+            });
+        }
+        s.entries.push(HistoryEntry {
+            text: "ls".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 10,
+            count: 1,
+        });
+        let hits = s.fuzzy_search("git");
+        let texts: Vec<&str> = hits
+            .iter()
+            .map(|h| s.entries[h.entry_idx].text.as_str())
+            .collect();
+        assert_eq!(
+            texts.iter().filter(|&&t| t == "git status").count(),
+            1,
+            "输出层去重应只保留一条 git status"
+        );
+    }
+
     // ── 去重函数 ─────────────────────────────────────────────────────
 
     #[test]
@@ -751,6 +879,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: 100,
+                count: 0,
             },
             HistoryEntry {
                 text: "pwd".into(),
@@ -758,6 +887,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: 200,
+                count: 0,
             },
             HistoryEntry {
                 text: "ls".into(),
@@ -765,6 +895,7 @@ mod tests {
                 exit_code: Some(0),
                 duration_ms: None,
                 ts: 300,
+                count: 0,
             },
         ];
         let result = deduplicate(raw, 100);
@@ -774,6 +905,9 @@ mod tests {
         assert_eq!(result[1].text, "ls");
         assert_eq!(result[1].ts, 300, "应保留最新 ts 的 ls");
         assert_eq!(result[1].exit_code, Some(0), "exit_code 应被保留");
+        // count 统计：ls 出现 2 次，pwd 出现 1 次
+        assert_eq!(result[1].count, 2, "ls 出现 2 次，count 应为 2");
+        assert_eq!(result[0].count, 1, "pwd 出现 1 次，count 应为 1");
     }
 
     #[test]
@@ -785,6 +919,7 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 ts: i as u64,
+                count: 0,
             })
             .collect();
         let result = deduplicate(raw, 5);
@@ -813,6 +948,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         store.entries.push(HistoryEntry {
             text: "ls".into(),
@@ -820,6 +956,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 2,
+            count: 1,
         });
 
         // ↑ 首按：保存草稿，跳最新。
@@ -854,6 +991,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
 
         let _ = store.navigate_up("");
@@ -872,6 +1010,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         store.abandoned = Some("放弃的命令".to_owned());
 
@@ -897,6 +1036,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1000,
+            count: 1,
         });
         let idx = 0;
         store.backfill(idx, "ls", 1000, 0, 150);
@@ -919,6 +1059,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         assert!(
             store.find_ghost_prefix("").is_none(),
@@ -935,6 +1076,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         assert!(
             store.find_ghost_prefix("git\nstatus").is_none(),
@@ -951,6 +1093,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         store.entries.push(HistoryEntry {
             text: "git diff".into(),
@@ -958,6 +1101,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 2,
+            count: 1,
         });
         // 最新条目是 "git diff"，前缀 "git " → 联想为 "diff"
         let ghost = store.find_ghost_prefix("git ");
@@ -977,6 +1121,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         // 前缀 = 条目本身，应跳过（避免 ghost 为空串）
         assert!(
@@ -995,6 +1140,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 2,
+            count: 1,
         });
         // 次新条目：单行（应命中）
         store.entries.push(HistoryEntry {
@@ -1003,6 +1149,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         let ghost = store.find_ghost_prefix("git s");
         assert_eq!(
@@ -1021,6 +1168,7 @@ mod tests {
             exit_code: None,
             duration_ms: None,
             ts: 1,
+            count: 1,
         });
         assert!(
             store.find_ghost_prefix("git").is_none(),
