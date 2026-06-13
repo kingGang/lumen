@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/jimhyliu/lumen"
+repository = "https://github.com/jimhy/lumen"
 
 [workspace.dependencies]
 lumen-pty = { path = "crates/lumen-pty" }
@@ -56,6 +56,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    # 侧栏会话图标（F7②，proc_icon.rs）：CreateToolhelp32Snapshot /
+    # Process32FirstW / Process32NextW / PROCESSENTRY32W —— 从 shell PID
+    # 查前台运行程序，再读其 exe 图标（SHGetFileInfoW，Win32_UI_Shell）。
+    "Win32_System_Diagnostics_ToolHelp",
     # M3.8 Snap Layouts 子类化（snap_layouts.rs）：SetWindowSubclass /
     # DefSubclassProc / SetWindowSubclassCallback；WM_NCHITTEST 命中
     # 最大化按钮区域时返回 HTMAXBUTTON，触发 Win11 Snap 弹出。
@@ -79,6 +83,10 @@ winresource = "0.1"
 # 文件对话框（P13）：Windows 原生 IFileOpenDialog，零外部 DLL 依赖。
 # default-features = false 关闭 async 后端等无用特性（同步对话框只需基础特性）。
 rfd = { version = "0.15", default-features = false }
+# HTTP 客户端（F3 热更）：同步、轻量，后台线程内阻塞请求 GitHub/Gitee
+# Release API 并下载安装包。自带 rustls TLS（不依赖系统 OpenSSL）。HTTP+TLS
+# 自实现成本高且无法离线 E2E 测试，选成熟库以最大化首次正确率。
+ureq = "2"
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。

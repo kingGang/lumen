@@ -21,7 +21,11 @@ mod history;
 mod i18n;
 mod input;
 mod keymap;
+/// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
+mod links;
 mod mode;
+/// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
+mod proc_icon;
 mod profile;
 mod session;
 mod sessions_store;
@@ -31,6 +35,8 @@ mod single_instance;
 // M3.8 批2 Snap Layouts 子类化（仅 Windows）。
 #[cfg(target_os = "windows")]
 mod snap_layouts;
+/// F3 热更（自动更新）：查 GitHub latest Release + 下载 Inno Setup 安装包。
+mod update;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,6 +438,32 @@ fn estimate_restored_pane_px(
         .collect()
 }
 
+/// F3：更新提示弹窗的按钮动作（egui 帧内捕获，帧后施加）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateAction {
+    /// 立即下载并安装。
+    Install,
+    /// 稍后（本次运行不再弹）。
+    Later,
+    /// 跳过此版本（持久化 skip_version）。
+    Skip,
+}
+
+/// F10：鼠标悬停命中的可点击链接（区段 + 打开目标）。
+#[derive(Debug, Clone)]
+struct HoverLink {
+    /// 命中所在窗格的会话 id（渲染时只给该窗格传 hover 区段）。
+    pane_id: SessionId,
+    /// 链接所在绝对行号（与 grid 显示坐标系一致）。
+    line: u64,
+    /// 链接在该行内的起始列（含）。
+    start_col: usize,
+    /// 链接在该行内的结束列（不含）。
+    end_col: usize,
+    /// 解析后的打开目标。
+    target: links::LinkTarget,
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -488,6 +520,24 @@ struct AppState {
     last_key_at: Option<Instant>,
     /// 鼠标最近一次的窗口内像素位置。
     mouse_pos: (f64, f64),
+    /// F10：鼠标当前悬停的可点击链接（None = 未悬停在链接上）。供
+    /// 渲染层画 hover 下划线、egui 帧设手型光标、点击时打开。
+    hovered_link: Option<HoverLink>,
+    /// F10：上次做过链接探测的单元格 (窗格 id, 绝对行, 列)——鼠标仍在
+    /// 同一格时跳过重复探测（避免每像素移动都做行扫描/文件系统校验）。
+    hover_probe_cell: Option<(SessionId, u64, usize)>,
+
+    // —— F3 热更（自动更新）——
+    /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
+    update_tx: crossbeam_channel::Sender<update::UpdateMsg>,
+    /// 接收端（user_event 里 drain）。
+    update_rx: crossbeam_channel::Receiver<update::UpdateMsg>,
+    /// 已发现的可更新版本（Some 时展示更新提示弹窗）。
+    update_available: Option<update::UpdateInfo>,
+    /// 安装包下载进行中（避免重复点「立即更新」）。
+    update_downloading: bool,
+    /// 本次运行「稍后」已点过：暂不再弹窗（重启或新版本会再弹）。
+    update_dismissed: bool,
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
@@ -499,6 +549,14 @@ struct AppState {
     /// 待注销的 egui 纹理 id：窗格关闭动作可能发生在 run_ui 之后
     /// （本帧 shape 仍引用该纹理），推迟到帧呈现后统一 free。
     pending_tex_free: Vec<egui::TextureId>,
+    /// F7② 会话图标——每 tab 当前前台运行程序的 exe 路径（节流轮询写入，
+    /// 见 [`Self::probe_session_icons`]）；值 None = 查不到。
+    session_icon_exe: HashMap<TabId, Option<std::path::PathBuf>>,
+    /// F7② 会话图标纹理缓存（键 = exe 路径）：值 None = 抽取失败（缓存
+    /// 失败避免每帧重试，回退自绘字形）。TextureHandle 在此存活即保活纹理。
+    session_icon_tex: HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    /// F7② 前台进程轮询的上次时刻（节流；进程快照较重，不必每帧查）。
+    last_icon_probe: Option<Instant>,
     /// 激活 tab 各窗格的矩形（会话 id, 物理像素 x/y/w/h），来自最近
     /// 一帧 egui 布局（鼠标命中/IME 候选框定位用）。tab 结构变更后
     /// 的陈旧条目按 id 解析不到窗格、自然失效。
@@ -1406,6 +1464,252 @@ impl AppState {
         })
     }
 
+    /// 某窗格底部 footer 物理像素高度：仅聚焦窗格显示 footer，其余为 0。
+    /// 与渲染/resize 用同一 `footer_height_px` 算法，保证命中坐标一致。
+    #[cfg(feature = "input-editor")]
+    fn pane_footer_px(&self, pane_idx: usize, pane_h: f32) -> f32 {
+        if self.tabs[self.active_tab].focused != pane_idx {
+            return 0.0;
+        }
+        let pane = &self.tabs[self.active_tab].panes[pane_idx];
+        let mode = mode::effective_mode(&pane.term, self.force_fallback);
+        let cv = composer::compose_view_for_mode(
+            mode,
+            pane.editor.view(),
+            pane.preedit.clone(),
+            pane.exit_badge.clone(),
+            None,
+        );
+        let (_, cell_h) = self.renderer.cell_size();
+        let fp = self.renderer.padding() * 0.4;
+        let max_h = pane_h / 3.0;
+        lumen_renderer::composer_view::footer_height_px(Some(&cv), cell_h, fp, max_h)
+    }
+    #[cfg(not(feature = "input-editor"))]
+    fn pane_footer_px(&self, _pane_idx: usize, _pane_h: f32) -> f32 {
+        0.0
+    }
+
+    /// 鼠标当前所在的「窗格 + 单元格」：返回 (窗格下标, 窗格 id, 绝对行,
+    /// 列)。鼠标不在任何窗格上（egui 面板/分隔条/首帧布局前）返回 None。
+    /// 坐标换算与 [`Self::sel_point_at_mouse`] 同源（扣 footer、按窗格矩形
+    /// 夹紧），但作用于**鼠标下的窗格**而非焦点窗格（F10 可悬停非焦点窗格）。
+    fn cell_under_mouse(&self) -> Option<(usize, SessionId, u64, usize)> {
+        let pane_idx = self.pane_under_mouse()?;
+        let pane_id = self.tabs[self.active_tab].panes[pane_idx].id;
+        let (x, y, w, h) = self
+            .pane_rects_px
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, r)| *r)?;
+        let footer_px = self.pane_footer_px(pane_idx, h);
+        let (row, col) = self.renderer.cell_at_with_footer(
+            self.mouse_pos.0 - x as f64,
+            self.mouse_pos.1 - y as f64,
+            w.max(1.0) as u32,
+            h.max(1.0) as u32,
+            footer_px,
+        );
+        let abs = self.tabs[self.active_tab].panes[pane_idx]
+            .term
+            .grid()
+            .view_top_abs_line()
+            + row as u64;
+        Some((pane_idx, pane_id, abs, col))
+    }
+
+    /// 求鼠标当前位置命中的可点击链接（F10）：先查 OSC 8 显式超链接，
+    /// 再按行文本扫描裸 URL / 文件路径（文件需在 cwd 下存在才算链接）。
+    /// 焦点窗格的 footer（编辑器输入区）不参与终端链接识别。
+    fn link_at_mouse(&self) -> Option<HoverLink> {
+        #[cfg(feature = "input-editor")]
+        if self.mouse_on_footer() {
+            return None;
+        }
+        let (pane_idx, pane_id, abs, col) = self.cell_under_mouse()?;
+        let pane = &self.tabs[self.active_tab].panes[pane_idx];
+        // 备用屏幕（vim/less 等）下不识别链接：坐标语义与块/历史不一致。
+        if pane.term.is_alt_screen() {
+            return None;
+        }
+        // 1) OSC 8 显式超链接（区段与 URI 由终端侧直接给出）。
+        if let Some((sc, ec, uri)) = pane.term.hyperlink_span_at(abs, col) {
+            return Some(HoverLink {
+                pane_id,
+                line: abs,
+                start_col: sc,
+                end_col: ec,
+                target: links::LinkTarget::Url(uri),
+            });
+        }
+        // 2) 隐式 URL / 文件路径：扫描行文本（跳过宽字符占位格，建立
+        //    显示列 ↔ 字符下标映射）。
+        let row = pane.term.grid().line_by_abs(abs)?;
+        let cells = row.cells();
+        let mut cols: Vec<usize> = Vec::new();
+        let mut text: Vec<char> = Vec::new();
+        for (c, cell) in cells.iter().enumerate() {
+            if cell.flags.contains(lumen_term::CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            cols.push(c);
+            text.push(cell.ch);
+        }
+        // 命中字符下标：col 命中某显示列则取之；落在宽字符右半占位格时
+        // 回退到其主格（最近的 ≤ col 的显示列）。
+        let char_idx = cols
+            .iter()
+            .position(|&dc| dc == col)
+            .or_else(|| cols.iter().rposition(|&dc| dc <= col))?;
+        let (cs, ce, raw) = links::detect_link(&text, char_idx)?;
+        let target = links::resolve(&raw, pane.term.cwd())?;
+        // 字符下标区段 → 显示列区段（高亮用）。
+        let start_col = *cols.get(cs)?;
+        let end_col = cols.get(ce).copied().unwrap_or_else(|| {
+            let last = ce.saturating_sub(1).min(cols.len().saturating_sub(1));
+            let last_col = cols.get(last).copied().unwrap_or(start_col);
+            let wide = cells
+                .get(last_col)
+                .is_some_and(|c| c.flags.contains(lumen_term::CellFlags::WIDE));
+            last_col + if wide { 2 } else { 1 }
+        });
+        Some(HoverLink {
+            pane_id,
+            line: abs,
+            start_col,
+            end_col,
+            target,
+        })
+    }
+
+    /// 鼠标移动后更新链接 hover 态（F10）：单元格未变则跳过；变化时
+    /// 重算 hover 链接并按需请求重绘（hover 下划线/手型光标）。
+    fn update_link_hover(&mut self) {
+        let probe = self
+            .cell_under_mouse()
+            .map(|(_, id, line, col)| (id, line, col));
+        if probe == self.hover_probe_cell {
+            return;
+        }
+        self.hover_probe_cell = probe;
+        let new_link = self.link_at_mouse();
+        let changed = match (&new_link, &self.hovered_link) {
+            (Some(a), Some(b)) => {
+                a.pane_id != b.pane_id
+                    || a.line != b.line
+                    || a.start_col != b.start_col
+                    || a.end_col != b.end_col
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        self.hovered_link = new_link;
+        if changed {
+            self.window.request_redraw();
+        }
+    }
+
+    /// F3：后台线程检查更新。`manual=true` 时无更新/失败也回 toast 反馈；
+    /// 自动检查无更新则静默（不唤醒主循环）。自动检查会更新节流时间戳。
+    fn spawn_update_check(&mut self, manual: bool) {
+        if !manual {
+            self.settings.update.last_check_ms = Some(update::now_ms());
+            if let Some(err) = self.settings.save() {
+                log::warn!("F3：写盘检查时间戳失败: {err}");
+            }
+        }
+        let tx = self.update_tx.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let msg = match update::check_for_update() {
+                update::CheckResult::Newer(info) => update::UpdateMsg::Available(info),
+                update::CheckResult::UpToDate if manual => update::UpdateMsg::UpToDate,
+                update::CheckResult::Failed if manual => update::UpdateMsg::CheckFailed,
+                // 自动检查无更新/失败：静默，不打扰、不唤醒主循环。
+                _ => return,
+            };
+            let _ = tx.send(msg);
+            let _ = proxy.send_event(PtyWake);
+        });
+    }
+
+    /// F3：后台下载安装包，完成/失败经 channel 回主循环。
+    fn spawn_update_download(&mut self, info: &update::UpdateInfo) {
+        let tx = self.update_tx.clone();
+        let proxy = self.proxy.clone();
+        let url = info.download_url.clone();
+        let dest = update::installer_dest(&info.tag);
+        self.update_downloading = true;
+        std::thread::spawn(move || {
+            let msg = match update::download_installer(&url, &dest, |_d, _t| {}) {
+                Ok(()) => update::UpdateMsg::DownloadDone(dest),
+                Err(e) => update::UpdateMsg::DownloadFailed(e),
+            };
+            let _ = tx.send(msg);
+            let _ = proxy.send_event(PtyWake);
+        });
+    }
+
+    /// F3：drain 更新消息（user_event 内调用）。返回 true = 请求优雅退出
+    /// （安装器已拉起，落盘后让它替换 exe）。
+    fn drain_update_msgs(&mut self) -> bool {
+        let mut want_exit = false;
+        while let Ok(msg) = self.update_rx.try_recv() {
+            match msg {
+                update::UpdateMsg::Available(info) => {
+                    // 用户已「跳过」该版本则不打扰。
+                    if self.settings.update.skip_version.as_deref() == Some(info.tag.as_str()) {
+                        continue;
+                    }
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        i18n::fmt1(i18n::strings().update_toast_available_fmt, info.version),
+                    );
+                    self.update_dismissed = false;
+                    self.update_available = Some(info);
+                    self.window.request_redraw();
+                }
+                update::UpdateMsg::UpToDate => self.shell_state.toast.push(
+                    shell::toast::ToastKind::Info,
+                    i18n::strings().update_toast_up_to_date.to_owned(),
+                ),
+                update::UpdateMsg::CheckFailed => self.shell_state.toast.push(
+                    shell::toast::ToastKind::Warn,
+                    i18n::strings().update_toast_check_failed.to_owned(),
+                ),
+                update::UpdateMsg::DownloadDone(path) => {
+                    match update::launch_installer(&path) {
+                        Ok(()) => {
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Info,
+                                i18n::strings().update_toast_installing.to_owned(),
+                            );
+                            // 安装器已起：优雅退出，落盘后让它替换 exe。
+                            want_exit = true;
+                        }
+                        Err(e) => {
+                            log::error!("F3：{e}");
+                            self.update_downloading = false;
+                            self.shell_state.toast.push(
+                                shell::toast::ToastKind::Error,
+                                i18n::fmt1(i18n::strings().update_toast_download_failed_fmt, &e),
+                            );
+                        }
+                    }
+                }
+                update::UpdateMsg::DownloadFailed(e) => {
+                    log::error!("F3：下载失败 {e}");
+                    self.update_downloading = false;
+                    self.shell_state.toast.push(
+                        shell::toast::ToastKind::Error,
+                        i18n::fmt1(i18n::strings().update_toast_download_failed_fmt, &e),
+                    );
+                }
+            }
+        }
+        want_exit
+    }
+
     /// 切换激活 tab：清掉目标 tab **全部窗格**的冻结计时与渲染计划
     /// （属于「上次激活期间」的旧时间轴，带过来会借用过期的调度），
     /// 清未读点，同步窗口标题并立即重绘。无覆盖层/重命名时终端拿
@@ -1866,6 +2170,78 @@ impl AppState {
         self.window.set_title(&format!("Lumen — {title}"));
     }
 
+    /// F7② 节流轮询各 tab 焦点窗格的前台运行程序 exe（进程快照较重，
+    /// `ICON_PROBE_INTERVAL` 限频）。结果写入 `session_icon_exe`，纹理在
+    /// [`Self::ensure_session_icon_textures`] 按需懒加载。侧栏隐藏时跳过。
+    fn probe_session_icons(&mut self, now: Instant) {
+        if !self.settings.layout.sidebar_visible {
+            return;
+        }
+        if self
+            .last_icon_probe
+            .is_some_and(|t| now.duration_since(t) < ICON_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.last_icon_probe = Some(now);
+        // 先收集（不可变借 tabs），再写缓存（可变借自身），避免借用冲突。
+        let probed: Vec<(TabId, Option<std::path::PathBuf>)> = self
+            .tabs
+            .iter()
+            .map(|t| {
+                let exe = t
+                    .focused_pane()
+                    .pty
+                    .shell_pid()
+                    .and_then(proc_icon::foreground_exe);
+                (t.id, exe)
+            })
+            .collect();
+        for (id, exe) in probed {
+            self.session_icon_exe.insert(id, exe);
+        }
+        // 清理已关闭 tab 的条目（exe 缓存按路径保活，无需随 tab 清）。
+        let live: std::collections::HashSet<TabId> = self.tabs.iter().map(|t| t.id).collect();
+        self.session_icon_exe.retain(|k, _| live.contains(k));
+    }
+
+    /// F7② 把 `session_icon_exe` 里出现、但纹理缓存尚无的 exe 图标懒加载
+    /// 为 egui 纹理（抽取失败缓存 None，避免每帧重试）。
+    fn ensure_session_icon_textures(&mut self) {
+        let needed: Vec<std::path::PathBuf> = self
+            .session_icon_exe
+            .values()
+            .flatten()
+            .filter(|p| !self.session_icon_tex.contains_key(*p))
+            .cloned()
+            .collect();
+        for path in needed {
+            let tex = proc_icon::load_icon_rgba(&path).map(|ic| {
+                let img = egui::ColorImage::from_rgba_unmultiplied(
+                    [ic.width as usize, ic.height as usize],
+                    &ic.rgba,
+                );
+                self.egui_ctx.load_texture(
+                    format!("sess-icon:{}", path.display()),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.session_icon_tex.insert(path, tex);
+        }
+    }
+
+    /// F7② 取某 tab 当前应显示的会话图标纹理（前台程序 exe 图标）；
+    /// 查不到 / 抽取失败时 None（上层回退自绘终端字形）。
+    fn session_icon_for(&self, tab_id: TabId) -> Option<egui::TextureId> {
+        self.session_icon_exe
+            .get(&tab_id)
+            .and_then(|o| o.as_ref())
+            .and_then(|p| self.session_icon_tex.get(p))
+            .and_then(|o| o.as_ref())
+            .map(egui::TextureHandle::id)
+    }
+
     /// 构造当前 tab 列表的持久化快照（F4/F5 嵌套结构：每 tab 的
     /// 自定义名 + 各窗格 cwd + 焦点下标）。窗格 cwd 取 OSC 9;9 上报
     /// 值，尚未上报（恢复后首个提示符还没到）时回退该窗格启动时的
@@ -1945,6 +2321,10 @@ impl App {
                 .with_maximized(true)
                 .with_decorations(false)
                 .with_undecorated_shadow(true)
+                // 隐藏创建：初始化全程不可见，避免 DWM 显示空白表面的白闪。
+                // init 末尾铺一帧主题底色后再 set_visible(true)（同步、无条件，
+                // 见 init 收尾），窗口一露面即深色 + 已最大化、无尺寸跳变。
+                .with_visible(false)
                 .with_window_icon(window_icon)
                 .with_taskbar_icon(taskbar_icon)
         };
@@ -1953,6 +2333,8 @@ impl App {
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
             .with_maximized(true)
+            // 隐藏创建，init 末尾铺底色帧后再显示（消白闪，见 init 收尾）。
+            .with_visible(false)
             .with_window_icon(window_icon);
         // 启动默认最大化（P17）：inner_size 保留为「取消最大化」后的还原尺寸。
         let window = Arc::new(event_loop.create_window(attrs).context("创建窗口失败")?);
@@ -2224,6 +2606,9 @@ impl App {
         // 在 app_settings 被 move 进 AppState 之前读出 classic_mode（第十八轮）。
         let init_force_fallback = app_settings.classic_mode;
 
+        // F3：后台更新线程 → 主循环的消息通道。
+        let (update_tx, update_rx) = crossbeam_channel::unbounded();
+
         let mut state = AppState {
             perf,
             perf_t0: Instant::now(),
@@ -2247,11 +2632,21 @@ impl App {
             clipboard,
             last_key_at: None,
             mouse_pos: (0.0, 0.0),
+            hovered_link: None,
+            hover_probe_cell: None,
+            update_tx,
+            update_rx,
+            update_available: None,
+            update_downloading: false,
+            update_dismissed: false,
             egui_ctx,
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
             pending_tex_free: Vec::new(),
+            session_icon_exe: HashMap::new(),
+            session_icon_tex: HashMap::new(),
+            last_icon_probe: None,
             pane_rects_px: Vec::new(),
             pane_close_rects_px: Vec::new(),
             divider_rects_px: Vec::new(),
@@ -2338,9 +2733,53 @@ impl App {
             }
         }
 
+        // F3：启动自动检查更新（节流——距上次检查不足 AUTO_CHECK_INTERVAL_MS
+        // 则跳过；无更新静默；有更新经 channel 回主循环弹提示）。
+        if state.settings.update.auto_check
+            && update::should_auto_check(
+                state.settings.update.last_check_ms,
+                update::now_ms(),
+                AUTO_CHECK_INTERVAL_MS,
+            )
+        {
+            state.spawn_update_check(false);
+        }
+
+        // —— 启动消白块：揭幕窗口 ——
+        // 窗口以 with_visible(false) 隐藏创建，至此渲染器/字体/主题/egui 全
+        // 部就绪、全程不可见（无白闪）。顺序固定、缺一不可：
+        //   ① present_clear：同步把一帧主题底色塞进交换链（acquire 失败则
+        //      静默跳过，退化为原白闪、不影响后续）。**用 catch_unwind 包裹**：
+        //      wgpu 29 默认错误处理器对未捕获错误（OOM/校验类，受控单次取帧
+        //      下几近不可能）会 panic，若不吞会经 init→resumed 上抛令进程退出、
+        //      窗口一次都不显示——违背「显示绝不依赖渲染成功」的承诺。吞掉后
+        //      照常显示，最坏退化为白闪。（对抗审查 finding#1。）
+        //   ② set_visible(true)：**无条件**显示——winit 在事件循环线程同步
+        //      执行 ShowWindow(SW_SHOW+SW_MAXIMIZE)（execute_in_thread 直跑），
+        //      窗口必定露面且直接最大化（无尺寸跳变）。决不把「显示」依赖在
+        //      任何隐藏窗口收不到的事件上（上一版误用 RedrawRequested 致窗口
+        //      卡隐藏态的根错，此处堵死）；
+        //   ③ request_redraw：随后正常渲染真实 UI（窗口已可见，事件可靠）。
+        let present_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.renderer.present_clear();
+        }))
+        .is_err();
+        if present_panicked {
+            log::warn!("启动铺底色帧 present_clear 触发 wgpu panic，已吞并照常显示窗口");
+        }
+        state.window.set_visible(true);
+        state.window.request_redraw();
+
         Ok(state)
     }
 }
+
+/// F3 启动自动检查的最小间隔（6 小时）：避免频繁开关应用每次都打网络。
+const AUTO_CHECK_INTERVAL_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// F7② 会话前台进程轮询间隔：进程快照较重，限频到 ~0.8s（命令起止的
+/// 图标切换感知足够灵敏，开销可忽略）。
+const ICON_PROBE_INTERVAL: Duration = Duration::from_millis(800);
 
 impl ApplicationHandler<PtyWake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -2372,6 +2811,16 @@ impl ApplicationHandler<PtyWake> for App {
         }
         if state.tabs.is_empty() {
             return; // 退出流程中（exit 后仍可能有滞后事件）
+        }
+        // F3：drain 更新消息（发现新版/检查结果/下载完成）。下载完成会拉起
+        // 安装器并请求优雅退出——走与 CloseRequested 同路径（落盘 + flush
+        // 历史 + exit），让安装器替换 exe。
+        if state.drain_update_msgs() {
+            state.persist_sessions();
+            #[cfg(feature = "input-editor")]
+            state.history.flush_on_exit();
+            event_loop.exit();
+            return;
         }
         // 先清挂起标志再 drain：drain 期间新到的数据会触发下一个 wake，不丢。
         state.wake_pending.store(false, Ordering::Release);
@@ -2459,21 +2908,28 @@ impl ApplicationHandler<PtyWake> for App {
                         #[cfg(feature = "input-editor")]
                         {
                             // 先收集所有需要处理的数据（不持有不可变借用）。
-                            let (closed_now, new_block_data): (usize, Vec<(u64, Option<i32>)>) = {
+                            #[allow(clippy::type_complexity)]
+                            let (closed_now, new_block_data): (
+                                usize,
+                                Vec<(u64, Option<i32>, Option<String>)>,
+                            ) = {
                                 let pane = &state.tabs[ti].panes[pi];
                                 let blocks = pane.term.blocks();
                                 let closed_blocks: Vec<_> =
                                     blocks.iter().filter(|b| b.is_closed()).collect();
                                 let closed_now = closed_blocks.len();
                                 let last = pane.last_seen_closed_blocks;
-                                let new_data: Vec<(u64, Option<i32>)> = if closed_now > last {
-                                    closed_blocks[last..]
-                                        .iter()
-                                        .map(|b| (b.id, b.exit_code))
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                };
+                                // M4.2：连同 shell 权威命令文本（cmd_text）一起收集，
+                                // 块闭合时用于对账历史记录。
+                                let new_data: Vec<(u64, Option<i32>, Option<String>)> =
+                                    if closed_now > last {
+                                        closed_blocks[last..]
+                                            .iter()
+                                            .map(|b| (b.id, b.exit_code, b.cmd_text.clone()))
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
                                 (closed_now, new_data)
                             };
 
@@ -2487,7 +2943,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 // 取 pending_submit 中的文本和 history_idx（clone 脱离借用）。
                                 let pending = state.tabs[ti].panes[pi].pending_submit.clone();
 
-                                for (block_id, exit_code) in &new_block_data {
+                                for (block_id, exit_code, cmd_text) in &new_block_data {
                                     // 设置退出码角标（仅 Compose 态会显示，Running 态下也存，
                                     // 下一次进入 Compose 态时 badge 仍在，按任意键清除）。
                                     if let Some(code) = exit_code {
@@ -2515,8 +2971,34 @@ impl ApplicationHandler<PtyWake> for App {
                                         );
                                     }
                                     log::debug!(
-                                        "[BlockClosed] block_id={block_id} exit_code={exit_code:?} duration_ms={duration_ms}"
+                                        "[BlockClosed] block_id={block_id} exit_code={exit_code:?} duration_ms={duration_ms} cmd_text={cmd_text:?}"
                                     );
+                                }
+                                // M4.2 对账：**所有块 backfill 完成后**再统一对账一次
+                                // ——backfill 以 submitted 文本为匹配键，循环内提前
+                                // reconcile 会把 entries[idx].text 改成 authoritative，
+                                // 毒化同批后续块的 backfill 匹配（审查 finding，致最后
+                                // 一条命令 exit_code 丢失）。取最后一个带权威命令文本
+                                // 的块，与编辑器提交文本不一致时以 shell 为准校正。
+                                if let Some((ref submitted_text, _, history_idx)) = pending {
+                                    if let Some(authoritative) = new_block_data
+                                        .iter()
+                                        .rev()
+                                        .find_map(|(_, _, ct)| ct.as_deref())
+                                    {
+                                        let ts = state
+                                            .history
+                                            .entries()
+                                            .get(history_idx)
+                                            .map(|e| e.ts)
+                                            .unwrap_or(0);
+                                        state.history.reconcile_text(
+                                            history_idx,
+                                            submitted_text,
+                                            ts,
+                                            authoritative,
+                                        );
+                                    }
                                 }
                                 // 回填完成后清 pending_submit（仅清一次，即使多块闭合）。
                                 if pending.is_some() {
@@ -3334,6 +3816,30 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                     }
                 }
+
+                // F10：非拖选时探测鼠标下的可点击链接（更新 hover 下划线
+                // 与手型光标态）。拖选/footer 拖选期间不抢。
+                #[allow(unused_mut)]
+                let mut busy = state.focused_pane().selecting;
+                #[cfg(feature = "input-editor")]
+                {
+                    busy = busy || state.footer_dragging;
+                }
+                if !busy {
+                    state.update_link_hover();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // F10：指针移出窗口，清除链接 hover 态（否则离屏纹理里残留
+                // 一条 hover 下划线，直到该窗格下次重渲才消失）。probe 也清成
+                // None，原格重入时不会因 probe 相等而跳过重新探测。
+                if state.hovered_link.is_some() {
+                    state.hovered_link = None;
+                    state.hover_probe_cell = None;
+                    state.window.request_redraw();
+                } else {
+                    state.hover_probe_cell = None;
+                }
             }
             WindowEvent::MouseInput {
                 state: btn_state,
@@ -3451,6 +3957,19 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.focused_pane_mut().selecting = false;
                     if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
+                        // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
+                        // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
+                        // 普通单击保持「选中/清除命令块」，不误触开链接
+                        // （海风哥反馈：只 click 就开体验不好）。
+                        if state.modifiers.control_key() {
+                            if let Some(link) = state.link_at_mouse() {
+                                log::info!("F10：Ctrl+Click 打开链接 {:?}", link.target);
+                                links::open(&link.target);
+                                state.focused_pane_mut().selection = None;
+                                state.window.request_redraw();
+                                return;
+                            }
+                        }
                         // 单击（未拖动）：选中/清除所在命令块。
                         // 备用屏幕下块行号坐标系不可用，不做块选中。
                         let p = state.sel_point_at_mouse();
@@ -3748,22 +4267,27 @@ impl ApplicationHandler<PtyWake> for App {
                 // 此处不再 shrink screen_rect。query_maximized_overflow / maximized_overflow
                 // 纯函数已有单测保留（算法正确，只是本场景不需要应用它）。
 
+                // F7② 会话图标：节流轮询各 tab 前台运行程序 → 懒加载其 exe
+                // 图标纹理（侧栏隐藏时 probe 内部直接跳过，零开销）。
+                state.probe_session_icons(Instant::now());
+                state.ensure_session_icon_textures();
                 let entries: Vec<shell::TabItem> = state
                     .tabs
                     .iter()
                     .enumerate()
                     .map(|(i, t)| {
-                        // 标题取值（自定义名 > 焦点窗格 cwd > OSC 标题 >
-                        // 会话 N）见 Tab::display_title，恒非空；默认名
-                        // 为 cwd 时挂全路径悬停提示（截断时可看全，F4）。
-                        let title = t.display_title();
+                        // 两行条目（F7②样式）：名称行=自定义名/cwd 尾目录名/
+                        // 会话 N（Tab::display_name），路径行=完整 cwd
+                        // （Tab::cwd_path，未知为 None 时只画名称行）；图标=前台
+                        // 运行程序 exe 图标（查不到为 None，回退自绘字形）。
                         shell::TabItem {
                             id: t.id,
-                            hover_path: t.title_is_cwd().then(|| title.clone()),
-                            title,
+                            name: t.display_name(),
+                            path: t.cwd_path(),
                             active: i == state.active_tab,
                             unseen: t.has_unseen(),
                             pane_count: t.panes.len(),
+                            icon: state.session_icon_for(t.id),
                         }
                     })
                     .collect();
@@ -3923,6 +4447,37 @@ impl ApplicationHandler<PtyWake> for App {
                 let footer_ctx_menu_req = state.footer_context_menu_at.take();
                 #[cfg(feature = "input-editor")]
                 let mut footer_ctx_action: Option<action::Action> = None;
+                // F10：悬停可点击链接时**始终**把光标设为手型（Warp 体验，
+                // 海风哥拍板）+ 弹「打开文件/链接（Ctrl+单击）」提示浮层。
+                // egui 拥有光标，须在帧内 set（终端区是图像、不自带光标，
+                // 帧尾 last-set 生效；hover 结束自然回落默认）。
+                let link_hover_active = state.hovered_link.is_some();
+                // hover 链接的提示浮层：文案按目标类型（URL/文件）+ 鼠标
+                // 逻辑坐标（物理像素 / ppp）。
+                let link_tooltip: Option<(egui::Pos2, &'static str)> =
+                    state.hovered_link.as_ref().map(|h| {
+                        let s = crate::i18n::strings();
+                        let text = match h.target {
+                            links::LinkTarget::Url(_) => s.link_open_url_hint,
+                            links::LinkTarget::File { .. } => s.link_open_file_hint,
+                        };
+                        let ppp = state.egui_ctx.pixels_per_point();
+                        let pos = egui::pos2(
+                            state.mouse_pos.0 as f32 / ppp,
+                            state.mouse_pos.1 as f32 / ppp,
+                        );
+                        (pos, text)
+                    });
+                // F3：发现新版且未「稍后」、未在下载时，本帧弹更新提示框。
+                let update_modal: Option<update::UpdateInfo> = if state.update_available.is_some()
+                    && !state.update_dismissed
+                    && !state.update_downloading
+                {
+                    state.update_available.clone()
+                } else {
+                    None
+                };
+                let mut update_action: Option<UpdateAction> = None;
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
                     shell_out = Some(shell::show(
                         ui,
@@ -3931,6 +4486,58 @@ impl ApplicationHandler<PtyWake> for App {
                         app_settings,
                         is_maximized,
                     ));
+                    if link_hover_active {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    // F10：hover 链接提示浮层（VSCode 风「打开文件 [Ctrl+Click]」
+                    // 的中文版），锚在鼠标右下方，不拦截点击。
+                    if let Some((pos, text)) = link_tooltip {
+                        egui::Area::new(egui::Id::new("lumen_link_tooltip"))
+                            .fixed_pos(pos + egui::vec2(14.0, 18.0))
+                            .order(egui::Order::Tooltip)
+                            .interactable(false)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.label(text);
+                                });
+                            });
+                    }
+                    // F3 更新提示框（居中模态窗，按钮动作帧后施加）。
+                    if let Some(info) = &update_modal {
+                        let s = crate::i18n::strings();
+                        egui::Window::new(s.update_modal_title)
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                            .show(ui.ctx(), |ui| {
+                                ui.label(crate::i18n::fmt1(
+                                    s.update_modal_version_fmt,
+                                    info.version,
+                                ));
+                                ui.add_space(6.0);
+                                if !info.notes.trim().is_empty() {
+                                    ui.label(s.update_modal_notes_label);
+                                    egui::ScrollArea::vertical().max_height(220.0).show(
+                                        ui,
+                                        |ui| {
+                                            ui.label(&info.notes);
+                                        },
+                                    );
+                                    ui.add_space(8.0);
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button(s.update_btn_install).clicked() {
+                                        update_action = Some(UpdateAction::Install);
+                                    }
+                                    if ui.button(s.update_btn_later).clicked() {
+                                        update_action = Some(UpdateAction::Later);
+                                    }
+                                    if ui.button(s.update_btn_skip).clicked() {
+                                        update_action = Some(UpdateAction::Skip);
+                                    }
+                                });
+                            });
+                    }
 
                     // ── footer 右键菜单（第十一轮，input-editor feature）──
                     #[cfg(feature = "input-editor")]
@@ -3987,6 +4594,31 @@ impl ApplicationHandler<PtyWake> for App {
                         let _ = area_resp;
                     }
                 });
+                // F3：更新提示框按钮动作（帧后施加）。
+                match update_action {
+                    Some(UpdateAction::Install) => {
+                        if let Some(info) = state.update_available.clone() {
+                            state.shell_state.toast.push(
+                                shell::toast::ToastKind::Info,
+                                i18n::strings().update_toast_downloading.to_owned(),
+                            );
+                            state.spawn_update_download(&info);
+                        }
+                    }
+                    Some(UpdateAction::Skip) => {
+                        if let Some(tag) =
+                            state.update_available.as_ref().map(|i| i.tag.clone())
+                        {
+                            state.settings.update.skip_version = Some(tag);
+                            if let Some(err) = state.settings.save() {
+                                log::warn!("F3：写盘跳过版本失败: {err}");
+                            }
+                        }
+                        state.update_available = None;
+                    }
+                    Some(UpdateAction::Later) => state.update_dismissed = true,
+                    None => {}
+                }
                 let Some(shell_out) = shell_out else {
                     return; // run_ui 必然执行闭包，防御分支
                 };
@@ -4442,8 +5074,17 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_background_image_changed
                     || shell_out.settings_background_params_changed
                     || shell_out.settings_language_changed
+                    || shell_out.settings_update_changed
                     || sidebar_changed
                     || filetree_changed;
+                // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
+                if shell_out.update_check_now {
+                    state.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        i18n::strings().update_toast_checking.to_owned(),
+                    );
+                    state.spawn_update_check(true);
+                }
                 if need_save {
                     // 变更即写盘（写临时文件后改名，防半写损坏）。失败
                     // 弹 toast：用户以为改完即存，静默丢失重启才发现。
@@ -4975,6 +5616,12 @@ impl ApplicationHandler<PtyWake> for App {
                         // render_with_composer 传入 footer 视图；flag 剔除时用 render。
                         // 只有聚焦窗格显示 footer；非聚焦窗格传 None = 无 footer。
                         // 批D 起按各窗格独立模式组装（多窗格各自有 footer）。
+                        // F10：本窗格命中的链接 hover 区段（abs 行, 起列, 止列）。
+                        let link_hover = state
+                            .hovered_link
+                            .as_ref()
+                            .filter(|h| h.pane_id == s.id)
+                            .map(|h| (h.line, h.start_col, h.end_col));
                         #[cfg(feature = "input-editor")]
                         let render_result = {
                             let composer_view = if state.tabs[state.active_tab].focused == i {
@@ -4988,6 +5635,7 @@ impl ApplicationHandler<PtyWake> for App {
                                 s.selection.as_ref(),
                                 s.cursor_displayed,
                                 s.selected_block,
+                                link_hover,
                                 composer_view,
                             )
                         };
@@ -4998,6 +5646,7 @@ impl ApplicationHandler<PtyWake> for App {
                             s.selection.as_ref(),
                             s.cursor_displayed,
                             s.selected_block,
+                            link_hover,
                         );
                         if let Err(e) = render_result {
                             error!("渲染失败: {e:#}");

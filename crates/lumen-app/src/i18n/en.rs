@@ -178,4 +178,26 @@ pub static STRINGS: Strings = Strings {
     topbar_filetree_hide_tip: "Hide file tree (Ctrl+B)",
     topbar_reset_layout_tip: "Reset pane sizes",
     topbar_reset_layout_disabled_tip: "Only one pane, nothing to reset",
+
+    // F3 auto-update
+    update_toast_available_fmt: "New version {} available",
+    update_modal_title: "Update available",
+    update_modal_version_fmt: "Version {}",
+    update_modal_notes_label: "What's new",
+    update_btn_install: "Update now",
+    update_btn_later: "Later",
+    update_btn_skip: "Skip this version",
+    update_settings_section: "Updates",
+    update_settings_auto_check: "Check for updates on startup",
+    update_btn_check_now: "Check for updates",
+    update_toast_checking: "Checking for updates…",
+    update_toast_up_to_date: "You're on the latest version",
+    update_toast_check_failed: "Update check failed",
+    update_toast_downloading: "Downloading update…",
+    update_toast_download_failed_fmt: "Download failed: {}",
+    update_toast_installing: "Launching installer…",
+
+    // F10 link hover hint
+    link_open_file_hint: "Open file (Ctrl+Click)",
+    link_open_url_hint: "Open link (Ctrl+Click)",
 };

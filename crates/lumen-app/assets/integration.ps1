@@ -41,11 +41,22 @@ function prompt {
 }
 
 # 包装 ReadLine：用户按下回车、命令即将执行时发 C（输出开始）。
+# M4.2：在 C 的私有参数位上挂 base64(UTF-8(命令行)) 作为「权威命令文本」，
+# 供终端与编辑器本地记录对账、并作直通/Fallback 态命令文本来源（系统
+# ConPTY 吞 OSC 633，故降级走 OSC 133 私参，设计稿 §3.3）。base64 为纯
+# ASCII，跨机/西文系统/Windows PowerShell 5.1 均无编码风险；try/catch
+# 兜底——编码异常绝不能吞掉命令本身的执行。
 if ($function:PSConsoleHostReadLine) {
     $Global:__LumenReadLine = $function:PSConsoleHostReadLine
     function PSConsoleHostReadLine {
         $line = & $Global:__LumenReadLine
-        [Console]::Write("$([char]27)]133;C$([char]7)")
+        $b64 = ''
+        try {
+            if ($line -is [string] -and $line.Length -gt 0) {
+                $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($line))
+            }
+        } catch {}
+        [Console]::Write("$([char]27)]133;C;$b64$([char]7)")
         $line
     }
 }

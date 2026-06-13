@@ -38,6 +38,8 @@ winit.workspace = true
 # 背景图片功能（P13）。
 image.workspace = true
 rfd.workspace = true
+# 热更检查/下载（F3）：HTTP 客户端。
+ureq.workspace = true
 
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]

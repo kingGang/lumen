@@ -287,6 +287,44 @@ impl HistoryStore {
         warn!("历史库 backfill 未找到条目（text={text:?} ts={ts}）");
     }
 
+    /// M4.2 命令文本对账：块闭合时用 shell 上报的**权威命令文本**
+    /// （OSC 133;C base64 私参）校正历史记录。
+    ///
+    /// 编辑器本地记录的提交文本（`submitted`）与 shell 实际执行的文本
+    /// （`authoritative`）一致时（绝大多数情况）直接返回；不一致时
+    /// （PSReadLine 历史展开 `!!`、用户在直通态手敲等）以 shell 为准
+    /// 更新内存条目（退出时 [`Self::flush_on_exit`] 原子重写落盘）。
+    /// 条目按 `idx` 优先、失效则 `submitted`+`ts` 逆序匹配（同 backfill）。
+    pub fn reconcile_text(&mut self, idx: usize, submitted: &str, ts: u64, authoritative: &str) {
+        if submitted == authoritative || authoritative.is_empty() {
+            return;
+        }
+        // idx 命中且 text+ts 吻合：直接校正。
+        if self
+            .entries
+            .get(idx)
+            .is_some_and(|e| e.text == submitted && e.ts == ts)
+        {
+            info!(
+                "历史对账：命令文本以 shell 为准更新 {submitted:?} → {authoritative:?}"
+            );
+            self.entries[idx].text = authoritative.to_owned();
+            return;
+        }
+        // idx 失效：按 text+ts 逆序找最近匹配。
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.text == submitted && e.ts == ts)
+        {
+            info!(
+                "历史对账：命令文本以 shell 为准更新 {submitted:?} → {authoritative:?}"
+            );
+            e.text = authoritative.to_owned();
+        }
+    }
+
     /// 退出时原子重写（tmp → rename）。去重 + 保留最近 MAX_ENTRIES 条。
     ///
     /// 写失败 log warn 不打扰用户。
@@ -1046,6 +1084,84 @@ mod tests {
             Some(150),
             "duration_ms 应被回填"
         );
+    }
+
+    #[test]
+    fn reconcile_一致时不改() {
+        let mut store = make_store(PathBuf::from("test_reconcile_same.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "git status".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 1000,
+            count: 1,
+        });
+        store.reconcile_text(0, "git status", 1000, "git status");
+        assert_eq!(store.entries[0].text, "git status", "一致时文本不变");
+    }
+
+    #[test]
+    fn reconcile_不一致以shell为准() {
+        let mut store = make_store(PathBuf::from("test_reconcile_diff.jsonl"));
+        // 编辑器记录的是历史展开前的 "!!"，shell 实际执行的是展开后的命令。
+        store.entries.push(HistoryEntry {
+            text: "!!".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 2000,
+            count: 1,
+        });
+        store.reconcile_text(0, "!!", 2000, "cargo build");
+        assert_eq!(
+            store.entries[0].text, "cargo build",
+            "不一致时以 shell 权威文本为准"
+        );
+    }
+
+    #[test]
+    fn 多块闭合_先全backfill再对账_退出码不丢() {
+        // 回归（审查 finding）：同批多块闭合时 reconcile 必须在所有
+        // backfill **之后**统一做一次——backfill 以 submitted 为匹配键，
+        // 若循环内提前 reconcile 把 text 改成 authoritative，会毒化同批
+        // 后续块的 backfill 匹配，致最后一条命令退出码丢失。本测试钉住
+        // 「先两次 backfill（均以 submitted 命中），再一次 reconcile」的
+        // 正确组合：退出码取自最后一块、文本被对账。
+        let mut store = make_store(PathBuf::from("test_multi_block_reconcile.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "submitted".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 5000,
+            count: 1,
+        });
+        store.backfill(0, "submitted", 5000, 1, 100); // 块1 exit=1
+        store.backfill(0, "submitted", 5000, 0, 200); // 块2 exit=0（最后一块覆盖）
+        store.reconcile_text(0, "submitted", 5000, "authoritative");
+        assert_eq!(
+            store.entries[0].exit_code,
+            Some(0),
+            "退出码应取自最后一块（backfill 匹配键未被提前 reconcile 毒化）"
+        );
+        assert_eq!(store.entries[0].duration_ms, Some(200));
+        assert_eq!(store.entries[0].text, "authoritative", "文本已以 shell 为准对账");
+    }
+
+    #[test]
+    fn reconcile_权威文本为空不改() {
+        let mut store = make_store(PathBuf::from("test_reconcile_empty.jsonl"));
+        store.entries.push(HistoryEntry {
+            text: "ls".into(),
+            cwd: None,
+            exit_code: None,
+            duration_ms: None,
+            ts: 3000,
+            count: 1,
+        });
+        store.reconcile_text(0, "ls", 3000, "");
+        assert_eq!(store.entries[0].text, "ls", "权威文本为空时不覆盖");
     }
 
     // ── find_ghost_prefix ghost text 前缀匹配 ───────────────────────

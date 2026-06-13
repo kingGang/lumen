@@ -248,6 +248,17 @@ mod tests {
         assert_eq!(fmt2("static text", "X", "Y"), "static text");
     }
 
+    #[test]
+    fn update_modal_version_fmt_占位符正确_三语() {
+        // 发布只走 GitHub（不发 Gitee）后，弹窗版本行只剩版本号（单参 fmt1）。
+        // 钉住三语模板都含一个 {} 且 fmt1 能把版本号插入、无残留占位符。
+        for s in [&zh_cn::STRINGS, &zh_tw::STRINGS, &en::STRINGS] {
+            let out = fmt1(s.update_modal_version_fmt, "0.2.0");
+            assert!(out.contains("0.2.0"), "版本号应被替换: {out}");
+            assert!(!out.contains("{}"), "占位符应被替换: {out}");
+        }
+    }
+
     // —— strings() 三语覆盖校验（抽查部分字段，编译期全量已保证）——
 
     #[test]

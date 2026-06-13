@@ -468,6 +468,48 @@ impl Renderer {
         }
     }
 
+    /// 立即向 surface 呈现一帧「纯主题底色」（无任何内容）。
+    ///
+    /// 启动消白块用：窗口隐藏创建、初始化期间不可见，所有资源就绪后由
+    /// app 层调本方法把一帧底色塞进交换链，再 `set_visible(true)`——窗口
+    /// 一露面即主题深色而非 DWM 的空白表面白底（见 main.rs init 末尾）。
+    /// acquire 失败（Lost/Outdated 等）时静默跳过：调用方仍会无条件显示
+    /// 窗口，最坏退化为原先的白闪、绝不卡隐藏态。
+    pub fn present_clear(&mut self) {
+        let Some(frame) = self.acquire_frame() else {
+            return;
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lumen present_clear"),
+            });
+        // 仅 Clear 装载、立即 Store——一个空 pass 即把底色写满 surface。
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("lumen clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.theme.background.to_wgpu()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+    }
+
     /// 渲染一帧终端内容到指定窗格（`id` = 会话 id）的离屏纹理
     /// （不触碰 surface，呈现由 app 层的 egui pass 完成）。
     ///
@@ -488,8 +530,9 @@ impl Renderer {
         selection: Option<&Selection>,
         cursor: (usize, usize, bool),
         selected_block: Option<u64>,
+        link_hover: Option<(u64, usize, usize)>,
     ) -> Result<()> {
-        self.render_impl(id, term, selection, cursor, selected_block, None)
+        self.render_impl(id, term, selection, cursor, selected_block, link_hover, None)
     }
 
     /// 带 footer 输入区视图的渲染帧（feature = "input-editor"）——设计稿 §7.1。
@@ -498,6 +541,8 @@ impl Renderer {
     /// - `None` 或 Hidden 态：不绘制 footer，grid 使用全高。
     /// - Composer / StatusBar 态：底部绘制 footer 卡片，grid 扣除 footer 高度。
     #[cfg(feature = "input-editor")]
+    // 渲染入口天然多参（一帧的全部输入）；拆 struct 收益不抵噪音。
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_composer(
         &mut self,
         id: u64,
@@ -505,12 +550,14 @@ impl Renderer {
         selection: Option<&Selection>,
         cursor: (usize, usize, bool),
         selected_block: Option<u64>,
+        link_hover: Option<(u64, usize, usize)>,
         composer: Option<&composer_view::ComposerView>,
     ) -> Result<()> {
-        self.render_impl(id, term, selection, cursor, selected_block, composer)
+        self.render_impl(id, term, selection, cursor, selected_block, link_hover, composer)
     }
 
     /// 渲染实现（统一入口，两个公开 render 方法均调用此处）。
+    #[allow(clippy::too_many_arguments)]
     fn render_impl(
         &mut self,
         id: u64,
@@ -518,6 +565,7 @@ impl Renderer {
         selection: Option<&Selection>,
         cursor: (usize, usize, bool),
         selected_block: Option<u64>,
+        link_hover: Option<(u64, usize, usize)>,
         #[cfg(feature = "input-editor")] composer: Option<&composer_view::ComposerView>,
         #[cfg(not(feature = "input-editor"))] _composer: Option<()>,
     ) -> Result<()> {
@@ -642,6 +690,32 @@ impl Renderer {
                         pos: [x, y + ch * 0.5],
                         size: [w, 1.5],
                         color: fg.to_linear_f32(1.0),
+                    });
+                }
+            }
+        }
+        // F10：鼠标悬停的可点击链接——整段画**一条连续**下划线 rect。
+        // 不逐 cell 画：单元格宽常为非整数像素（如 8.79px），逐段会在亚
+        // 像素边界产生接缝/长度错位（海风哥反馈「下划线长度位置有些地方
+        // 不对」的根因）。一条 rect 从 hs 列左缘精确画到 he 列左缘。
+        if let Some((hl_abs, hs, he)) = link_hover {
+            let end = he.min(cols);
+            if hl_abs >= view_top_abs && end > hs {
+                let vr = (hl_abs - view_top_abs) as usize;
+                if vr < rows {
+                    let x = pad + hs as f32 * cw;
+                    let w = (end - hs) as f32 * cw;
+                    let y = pad + vr as f32 * ch;
+                    // 颜色取链接首格前景色，贴合文字色（如红色错误里的 URL）。
+                    let color = grid
+                        .line_by_abs(hl_abs)
+                        .and_then(|r| r.cells().get(hs))
+                        .map(|cell| self.theme.cell_colors(cell).0)
+                        .unwrap_or(self.theme.foreground);
+                    instances.push(rect::RectInstance {
+                        pos: [x, y + ch - 2.0],
+                        size: [w, 1.5],
+                        color: color.to_linear_f32(1.0),
                     });
                 }
             }
@@ -840,12 +914,22 @@ impl Renderer {
                     attrs
                 };
 
-                // 段构建：单字符段（宽字符/非 ASCII）或 ASCII run。
+                // 段构建：单字符段（宽字符 / 非 ASCII / 粗体 / 斜体）或 ASCII run。
+                //
+                // 粗体/斜体也走单字符段（各自钉 col*cw）：粗体/斜体字形的
+                // 字宽（advance）常 != 等宽 cell_w（系统缺 Cascadia Mono Bold
+                // 时尤甚，cosmic-text 回退到别的字体），批量成段会让段内文字
+                // 逐字漂移、与按网格列定位的下划线/光标/选区错位（海风哥反馈：
+                // 粗体红错误行里的链接下划线偏位）。普通文字 advance==cell_w
+                // 不漂、仍批量成段（不伤性能）。
                 let start_col = c;
                 let mut line = String::new();
                 let mut spans: Vec<(usize, usize, Attrs)> = Vec::new();
 
-                if cell.flags.contains(CellFlags::WIDE) || !cell.ch.is_ascii() {
+                if cell.flags.contains(CellFlags::WIDE)
+                    || !cell.ch.is_ascii()
+                    || cell.flags.intersects(CellFlags::BOLD | CellFlags::ITALIC)
+                {
                     line.push(cell.ch);
                     spans.push((0, line.len(), cell_attrs(cell)));
                     c += if cell.flags.contains(CellFlags::WIDE) {
@@ -858,10 +942,14 @@ impl Renderer {
                     let mut run_attrs: Option<Attrs> = None;
                     while c < row_len {
                         let cell = &cells[c];
-                        if cell
-                            .flags
-                            .intersects(CellFlags::WIDE | CellFlags::WIDE_SPACER)
-                            || !cell.ch.is_ascii()
+                        // 宽字符/非 ASCII/粗体/斜体都打断 ASCII run（前两者本就
+                        // 单独成段；粗体/斜体改走单字符段以钉网格列、防漂移）。
+                        if cell.flags.intersects(
+                            CellFlags::WIDE
+                                | CellFlags::WIDE_SPACER
+                                | CellFlags::BOLD
+                                | CellFlags::ITALIC,
+                        ) || !cell.ch.is_ascii()
                         {
                             break;
                         }

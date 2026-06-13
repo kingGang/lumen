@@ -23,6 +23,12 @@ pub struct Block {
     pub end_col: usize,
     /// 命令退出码（OSC 133;D;<code>）。
     pub exit_code: Option<i32>,
+    /// shell 上报的**权威命令文本**（M4.2）：integration.ps1 在 ReadLine
+    /// 包装里把用户实际执行的命令行经 base64 挂在 `OSC 133;C` 私有参数位
+    /// 上送达（系统 ConPTY 吞 OSC 633，降级走 133 私参，见设计稿 §3.3）。
+    /// 用于与编辑器本地记录的提交文本对账（不一致时以 shell 为准）、以及
+    /// 直通/Fallback 态命令文本的来源。无 shell 集成的会话为 None。
+    pub cmd_text: Option<String>,
 }
 
 impl Block {

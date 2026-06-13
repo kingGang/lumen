@@ -176,6 +176,28 @@ impl Default for LayoutSettings {
     }
 }
 
+/// 热更（F3）设置。旧文件无此节时 `#[serde(default)]` 补默认值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// 启动时自动检查更新（默认 true）。
+    pub auto_check: bool,
+    /// 用户「跳过」的版本 tag：该 tag 不再提示；出现更新的版本仍会提示。
+    pub skip_version: Option<String>,
+    /// 上次检查的 Unix 毫秒时间戳（节流：间隔不足时跳过后台自动检查）。
+    pub last_check_ms: Option<u64>,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            skip_version: None,
+            last_check_ms: None,
+        }
+    }
+}
+
 /// 应用设置根结构。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -198,6 +220,9 @@ pub struct Settings {
     /// 与状态栏切换按钮同路径）——切换时同步写盘，重启后恢复。
     #[serde(default)]
     pub classic_mode: bool,
+    /// 热更设置（F3）：`#[serde(default)]` 旧文件无此节时补默认值。
+    #[serde(default)]
+    pub update: UpdateSettings,
 }
 
 impl Default for Settings {
@@ -208,6 +233,7 @@ impl Default for Settings {
             layout: LayoutSettings::default(),
             language: crate::i18n::Language::default(),
             classic_mode: false,
+            update: UpdateSettings::default(),
         }
     }
 }
@@ -401,6 +427,30 @@ impl Settings {
         );
         // classic_mode：旧文件（第十八轮前）无此字段时静默补 false（默认正常模式）。
         s.classic_mode = lenient_field(root, "classic_mode", "classic_mode", false, path);
+        // update（F3）：旧文件缺整节时静默补默认值；逐字段宽松解析。
+        if let Some(up) = root.get("update") {
+            if up.is_object() {
+                let d = UpdateSettings::default();
+                s.update.auto_check =
+                    lenient_field(up, "auto_check", "update.auto_check", d.auto_check, path);
+                s.update.skip_version = lenient_field(
+                    up,
+                    "skip_version",
+                    "update.skip_version",
+                    d.skip_version,
+                    path,
+                );
+                s.update.last_check_ms = lenient_field(
+                    up,
+                    "last_check_ms",
+                    "update.last_check_ms",
+                    d.last_check_ms,
+                    path,
+                );
+            } else {
+                log::warn!("设置节 update 不是对象，整节降级默认值: {}", path.display());
+            }
+        }
         s
     }
 
@@ -623,6 +673,11 @@ mod tests {
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,
+            update: UpdateSettings {
+                auto_check: false,
+                skip_version: Some("v9.9.9".to_owned()),
+                last_check_ms: Some(123_456),
+            },
         };
         let p = temp_path("roundtrip");
         s.save_to(&p).expect("写盘失败");

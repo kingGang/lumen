@@ -1,0 +1,98 @@
+# Lumen 发版流水（F3 热更分发用，需求池 F3）。
+#
+# 触发：push 形如 `v0.2.0` 的 tag。
+# 产物：dist\Lumen-Setup-<version>.exe（Inno Setup 安装包），作为资产传到
+#       同名 GitHub Release——客户端 update.rs 查 `jimhy/lumen` 的 latest
+#       Release、下载本 .exe 完成自替换更新。
+#
+# 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。本工作流是
+# scripts\release.ps1 的 CI 等价物：同一条 改版本号 → release 构建 →
+# Inno 打包 → 发 Release 链路，差别仅在「谁来跑」。
+#
+# 一次性发版流程：
+#   1) 本地把 Cargo.toml 版本号 bump 到目标版本、提交。
+#   2) git tag v<版本> && git push origin v<版本>
+#   3) 本工作流自动构建打包并创建 GitHub Release。
+# （CI 会按 tag 再校正一次 Cargo.toml 版本号，纵使忘了 bump 也能保证
+#  exe 内嵌的 CARGO_PKG_VERSION 与 tag 一致，否则客户端版本比较会失灵。）
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 创建 Release 需要写权限。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust（stable）
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo 缓存
+        uses: Swatinem/rust-cache@v2
+
+      # tag 去掉 `v` 前缀作为版本号；并把 Cargo.toml 的 [workspace.package]
+      # version 校正到该值（与 scripts\release.ps1 同款正则，只改行首
+      # version，依赖内联 version 不误伤），保证 CARGO_PKG_VERSION == tag。
+      - name: 推导版本号并校正 Cargo.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "tag '${{ github.ref_name }}' 不是 v<major>.<minor>.<patch> 形态"
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $cargo = 'Cargo.toml'
+          $content = Get-Content -Raw -LiteralPath $cargo
+          $updated = [regex]::Replace($content, '(?m)^version = "[^"]*"', "version = `"$version`"")
+          Set-Content -LiteralPath $cargo -Value $updated -NoNewline
+          Write-Host "版本号 → $version"
+
+      - name: Release 构建
+        run: cargo build --release
+
+      - name: 安装 Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # 与 scripts\release.ps1 一致：iscc /DMyAppVersion=<v> installer\lumen.iss
+      # → 产物 dist\Lumen-Setup-<v>.exe。
+      - name: Inno Setup 打包
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "未找到 ISCC.exe：$iscc" }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "installer\lumen.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 打包失败（exit $LASTEXITCODE）" }
+
+      # 安装包 SHA256，附进 Release 说明供人工校验（客户端当前未强制校验）。
+      - name: 计算 SHA256
+        id: sha
+        shell: pwsh
+        run: |
+          $installer = "dist\Lumen-Setup-${{ steps.ver.outputs.version }}.exe"
+          if (-not (Test-Path $installer)) { throw "未找到安装包：$installer" }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer).Hash.ToLower()
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "SHA256：$hash"
+
+      # 创建/更新同名 Release 并附上安装包。body 走 GitHub 自动生成的更新
+      # 日志（基于提交/PR），开头附 SHA256——客户端 update.rs 会把 body
+      # 原样展示在「发现新版本」弹窗里。
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Lumen ${{ github.ref_name }}
+          generate_release_notes: true
+          body: |
+            SHA256: `${{ steps.sha.outputs.sha256 }}`
+          files: dist/Lumen-Setup-${{ steps.ver.outputs.version }}.exe

@@ -176,4 +176,26 @@ pub static STRINGS: Strings = Strings {
     topbar_filetree_hide_tip: "隐藏文件树 (Ctrl+B)",
     topbar_reset_layout_tip: "恢复窗格默认大小",
     topbar_reset_layout_disabled_tip: "单窗格无需复位",
+
+    // F3 热更
+    update_toast_available_fmt: "发现新版本 {}",
+    update_modal_title: "发现新版本",
+    update_modal_version_fmt: "新版本 {}",
+    update_modal_notes_label: "更新内容",
+    update_btn_install: "立即更新",
+    update_btn_later: "稍后",
+    update_btn_skip: "跳过此版本",
+    update_settings_section: "更新",
+    update_settings_auto_check: "启动时自动检查更新",
+    update_btn_check_now: "检查更新",
+    update_toast_checking: "正在检查更新…",
+    update_toast_up_to_date: "已是最新版本",
+    update_toast_check_failed: "检查更新失败",
+    update_toast_downloading: "正在下载更新…",
+    update_toast_download_failed_fmt: "下载失败：{}",
+    update_toast_installing: "正在启动安装程序…",
+
+    // F10 链接 hover 提示
+    link_open_file_hint: "打开文件（Ctrl+单击）",
+    link_open_url_hint: "打开链接（Ctrl+单击）",
 };

@@ -385,4 +385,44 @@ pub struct Strings {
     pub validate_name_bad_chars: &'static str,
     /// 名称不能以点或空格结尾
     pub validate_name_trailing: &'static str,
+
+    // ── F3 热更（自动更新）─────────────────────────────────────────
+    /// 发现新版本 toast（fmt1：版本号）
+    pub update_toast_available_fmt: &'static str,
+    /// 更新提示弹窗标题
+    pub update_modal_title: &'static str,
+    /// 弹窗版本行（fmt1：版本号）
+    pub update_modal_version_fmt: &'static str,
+    /// 弹窗「更新内容」小标题
+    pub update_modal_notes_label: &'static str,
+    /// 立即更新按钮
+    pub update_btn_install: &'static str,
+    /// 稍后按钮
+    pub update_btn_later: &'static str,
+    /// 跳过此版本按钮
+    pub update_btn_skip: &'static str,
+    /// 设置页「更新」分区标题
+    pub update_settings_section: &'static str,
+    /// 设置页：启动时自动检查更新
+    pub update_settings_auto_check: &'static str,
+    /// 设置页：检查更新按钮
+    pub update_btn_check_now: &'static str,
+    /// 正在检查更新 toast
+    pub update_toast_checking: &'static str,
+    /// 已是最新版本 toast
+    pub update_toast_up_to_date: &'static str,
+    /// 检查更新失败 toast
+    pub update_toast_check_failed: &'static str,
+    /// 正在下载更新 toast
+    pub update_toast_downloading: &'static str,
+    /// 下载失败 toast（fmt1：错误信息）
+    pub update_toast_download_failed_fmt: &'static str,
+    /// 正在启动安装程序 toast
+    pub update_toast_installing: &'static str,
+
+    // ── F10 链接 hover 提示浮层 ────────────────────────────────────
+    /// 悬停文件路径链接：提示「打开文件（Ctrl+单击）」
+    pub link_open_file_hint: &'static str,
+    /// 悬停 URL 链接：提示「打开链接（Ctrl+单击）」
+    pub link_open_url_hint: &'static str,
 }

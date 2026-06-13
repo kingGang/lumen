@@ -1,4 +1,6 @@
 /target
+# F3 热更发版产物（Inno Setup 安装包输出目录）。
+/dist
 **/*.rs.bk
 *.pdb
 /.engram/

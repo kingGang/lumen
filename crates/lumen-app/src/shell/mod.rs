@@ -32,17 +32,20 @@ pub(crate) const PANE_TITLE_HEIGHT: f32 = 24.0;
 /// 条目 = tab，每 tab 含 1~6 个终端窗格）。
 pub struct TabItem {
     pub id: u64,
-    /// 展示标题（自定义名 > 焦点窗格 cwd 完整路径 > OSC 标题 >
-    /// 「会话 N」，取值见 Tab::display_title，恒非空）。
-    pub title: String,
-    /// 悬停提示：默认名为 cwd 时为完整路径（条目宽度有限会截断，
-    /// 悬停看全路径，F4）；其余情况 None 不挂提示。
-    pub hover_path: Option<String>,
+    /// 名称行（自定义名 > 焦点窗格 cwd 尾目录名 > OSC 标题 > 「会话 N」，
+    /// 取值见 Tab::display_name，恒非空）。重命名以它为初值。
+    pub name: String,
+    /// 路径行（焦点窗格 cwd 完整文件夹路径，OSC 9;9 上报）；cwd 未知
+    /// （新会话首个提示符前）为 None，仅画名称行。
+    pub path: Option<String>,
     pub active: bool,
     /// 后台期间 tab 内任意窗格有未读输出（条目右侧小圆点）。
     pub unseen: bool,
     /// tab 内窗格数（>1 时条目右侧标「N 格」，F5 批2 视觉打磨）。
     pub pane_count: usize,
+    /// 会话图标纹理（F7②：前台运行程序 exe 图标）；None 时回退自绘
+    /// 终端字形（取不到图标/非 Windows）。
+    pub icon: Option<egui::TextureId>,
 }
 
 /// 跨帧保留的外壳 UI 状态。
@@ -269,6 +272,10 @@ pub struct ShellOutput {
     pub completion_accept: Option<usize>,
     /// 补全弹窗（M4.4 批1）：本帧请求关闭（Esc）。
     pub completion_closed: bool,
+    /// 设置页「更新」分区点击了「检查更新」按钮（F3）：main 起一次手动检查。
+    pub update_check_now: bool,
+    /// 设置页改了更新设置（auto_check 开关，F3）：main 进 need_save 落盘。
+    pub settings_update_changed: bool,
 }
 
 /// 绘制整个外壳：顶栏 + 左侧会话栏 + 中间文件树 + 中央终端纹理 +
@@ -337,6 +344,8 @@ pub fn show(
         history_query_changed: false,
         completion_accept: None,
         completion_closed: false,
+        update_check_now: false,
+        settings_update_changed: false,
     };
     // 生效主题的外壳色板（P12）：Lumen 双主题取手调静态板、其余主题
     // 派生（每帧少量色彩数学，开销可忽略）。
@@ -363,7 +372,7 @@ pub fn show(
         .tabs
         .iter()
         .find(|e| e.active)
-        .map_or("Lumen", |e| e.title.as_str());
+        .map_or("Lumen", |e| e.name.as_str());
     let tb = topbar::show(
         root,
         active_title,
@@ -1114,6 +1123,8 @@ pub fn show(
         out.settings_background_params_changed = s_out.background_params_changed;
         out.settings_background_image_changed = s_out.background_image_changed;
         out.settings_language_changed = s_out.language_changed;
+        out.update_check_now = s_out.update_check_now;
+        out.settings_update_changed = s_out.update_changed;
         if s_out.log_out {
             out.logged_out = true;
         }
@@ -1310,22 +1321,78 @@ fn sidebar_ui(
                     continue;
                 }
 
-                // 激活条目用 selection 档（控件梯度最高档）：与悬停的
-                // bg_highlight 拉开一档，激活态一眼可辨（M3.7b 高对比）。
-                let fill = if entry.active {
+                // 两行条目（F7②样式）：左终端图标 + 名称行 + 路径行。
+                // 激活=selection 底（控件梯度最高档，一眼可辨），悬停=
+                // bg_highlight；圆角 6。
+                const ROW_H: f32 = 46.0;
+                const ICON_COL: f32 = 30.0;
+                let (rect, mut resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ROW_H),
+                    egui::Sense::click(),
+                );
+                let bg = if entry.active {
                     pal.selection
+                } else if resp.hovered() {
+                    pal.bg_highlight
                 } else {
                     egui::Color32::TRANSPARENT
                 };
-                let btn = egui::Button::new(
-                    egui::RichText::new(format!("● {}", entry.title)).color(pal.fg),
-                )
-                .fill(fill)
-                .wrap_mode(egui::TextWrapMode::Truncate)
-                .min_size(egui::vec2(ui.available_width(), 30.0));
-                let mut resp = ui.add(btn);
-                if let Some(path) = &entry.hover_path {
-                    // 默认名 = cwd：条目截断时悬停可看完整路径。
+                if bg != egui::Color32::TRANSPARENT {
+                    ui.painter().rect_filled(rect, 6.0, bg);
+                }
+                // 左侧图标（垂直居中于行）：有真实程序图标则画纹理，
+                // 否则回退自绘终端字形。
+                let icon_center = egui::pos2(rect.left() + ICON_COL / 2.0, rect.center().y);
+                if let Some(tex) = entry.icon {
+                    let img_rect = egui::Rect::from_center_size(icon_center, egui::vec2(20.0, 20.0));
+                    ui.painter().image(
+                        tex,
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    draw_session_icon(ui, icon_center, entry.active, pal);
+                }
+                // 右侧为未读点/窗格数预留宽度，避免文字压到它们。
+                let right_reserve = if entry.pane_count > 1 {
+                    if entry.unseen {
+                        40.0
+                    } else {
+                        34.0
+                    }
+                } else if entry.unseen {
+                    16.0
+                } else {
+                    8.0
+                };
+                let text_left = rect.left() + ICON_COL;
+                let text_w = (rect.right() - right_reserve - text_left).max(10.0);
+                // 名称 + 路径两行（路径未知时仅名称行），整体垂直居中于行内。
+                let block_h = if entry.path.is_some() { 30.0 } else { 16.0 };
+                let text_rect = egui::Rect::from_min_size(
+                    egui::pos2(text_left, rect.center().y - block_h / 2.0),
+                    egui::vec2(text_w, block_h),
+                );
+                let mut text_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                text_ui.spacing_mut().item_spacing.y = 2.0;
+                // 名称行：激活时用前景亮色，否则常规前景；超宽截断省略。
+                text_ui.add(
+                    egui::Label::new(egui::RichText::new(&entry.name).size(13.0).color(pal.fg))
+                        .selectable(false)
+                        .truncate(),
+                );
+                // 路径行：暗色小字；超宽截断（完整路径走悬停提示）。
+                if let Some(path) = &entry.path {
+                    text_ui.add(
+                        egui::Label::new(egui::RichText::new(path).size(11.0).color(pal.fg_dim))
+                            .selectable(false)
+                            .truncate(),
+                    );
                     resp = resp.on_hover_text(path.clone());
                 }
                 if resp.clicked() {
@@ -1334,7 +1401,7 @@ fn sidebar_ui(
                 resp.context_menu(|ui| {
                     let s = crate::i18n::strings();
                     if ui.button(s.menu_rename).clicked() {
-                        st.renaming = Some((entry.id, entry.title.clone()));
+                        st.renaming = Some((entry.id, entry.name.clone()));
                         st.rename_focus = true;
                         ui.close();
                     }
@@ -1343,17 +1410,17 @@ fn sidebar_ui(
                         ui.close();
                     }
                 });
-                // 未读小圆点（后台有新输出，切换到该 tab 时清除）。
+                // 未读小圆点（后台有新输出，切换到该 tab 时清除）——贴名称行右端。
                 if entry.unseen {
-                    let center = egui::pos2(resp.rect.right() - 10.0, resp.rect.center().y);
+                    let center = egui::pos2(rect.right() - 10.0, rect.top() + 13.0);
                     ui.painter().circle_filled(center, 3.0, pal.accent);
                 }
-                // 窗格数指示（F5 批2）：多窗格 tab 在条目右侧标「N 格」
+                // 窗格数指示（F5 批2）：多窗格 tab 在条目右上标「N 格」
                 // （有未读点时左移让位）。
                 if entry.pane_count > 1 {
-                    let x = resp.rect.right() - if entry.unseen { 18.0 } else { 8.0 };
+                    let x = rect.right() - if entry.unseen { 20.0 } else { 8.0 };
                     ui.painter().text(
-                        egui::pos2(x, resp.rect.center().y),
+                        egui::pos2(x, rect.top() + 13.0),
                         egui::Align2::RIGHT_CENTER,
                         crate::i18n::fmt1(s.pane_count_fmt, entry.pane_count),
                         egui::FontId::proportional(10.0),
@@ -1366,6 +1433,37 @@ fn sidebar_ui(
     // R8：底部「⚙ 设置」和「＋ 新建会话」按钮已删除。
     // 设置入口=头像菜单 Settings + Ctrl+,（两者均健在）。
     // 新建会话入口=侧栏标题栏右端小「＋」按钮（Ctrl+T）。
+}
+
+/// 侧栏会话条目左侧的终端图标（codicon terminal 风格）。
+///
+/// 圆角外框内画 `>` 提示符 + 下划线光标；`active` 时用前景亮色，否则暗色。
+fn draw_session_icon(ui: &egui::Ui, center: egui::Pos2, active: bool, pal: &theme::Palette) {
+    let painter = ui.painter();
+    let fg = if active { pal.fg } else { pal.fg_dim };
+    let stroke = egui::Stroke::new(1.3, fg);
+    // 外框 18×15，圆角 3，0.5 像素对齐（防模糊）。
+    let bw = 18.0_f32;
+    let bh = 15.0_f32;
+    let ox = (center.x - bw / 2.0 + 0.5).floor() - 0.5;
+    let oy = (center.y - bh / 2.0 + 0.5).floor() - 0.5;
+    let frame = egui::Rect::from_min_size(egui::pos2(ox, oy), egui::vec2(bw, bh));
+    painter.rect_stroke(frame, 3.0, stroke, egui::StrokeKind::Middle);
+    // 内部 `>` 提示符（两段线构成尖角，左上起笔）。
+    let px = ox + 4.5;
+    let py = oy + 4.0;
+    let chev = 3.0_f32;
+    painter.line_segment([egui::pos2(px, py), egui::pos2(px + chev, py + chev)], stroke);
+    painter.line_segment(
+        [egui::pos2(px + chev, py + chev), egui::pos2(px, py + 2.0 * chev)],
+        stroke,
+    );
+    // 下划线光标（提示符右侧短横，贴底）。
+    let uy = oy + bh - 4.0;
+    painter.line_segment(
+        [egui::pos2(px + chev + 2.0, uy), egui::pos2(ox + bw - 4.0, uy)],
+        stroke,
+    );
 }
 
 #[cfg(test)]

@@ -152,6 +152,10 @@ pub struct SettingsOutput {
     pub background_image_changed: bool,
     /// 语言变更（F6）：main 进 need_save 落盘。
     pub language_changed: bool,
+    /// About 页点击「检查更新」（F3）：main 起一次手动检查。
+    pub update_check_now: bool,
+    /// About 页改了更新设置（auto_check 开关）：main 进 need_save 落盘。
+    pub update_changed: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -251,7 +255,7 @@ pub fn show(
                     Category::Account => account(ui, profile, pal, &mut out),
                     Category::Appearance => appearance(ui, st, settings, pal, &mut out, os_dark),
                     Category::Shortcuts => shortcuts(ui, pal),
-                    Category::About => about(ui, pal),
+                    Category::About => about(ui, settings, pal, &mut out),
                 });
         });
     // Esc（顶层 modal 且无弹层打开时）或 backdrop 点击 → 关闭。
@@ -950,8 +954,8 @@ fn shortcuts(ui: &mut egui::Ui, pal: &Palette) {
         });
 }
 
-/// About：产品名 / 版本 / 技术栈。
-fn about(ui: &mut egui::Ui, pal: &Palette) {
+/// About：产品名 / 版本 / 技术栈 / 更新（F3）。
+fn about(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut SettingsOutput) {
     let s = i18n::strings();
     heading(ui, pal, s.about_heading);
     ui.label(
@@ -970,4 +974,18 @@ fn about(ui: &mut egui::Ui, pal: &Palette) {
             .size(11.0)
             .color(pal.fg_dim),
     );
+
+    // —— F3 热更 ——
+    ui.add_space(20.0);
+    heading(ui, pal, s.update_settings_section);
+    ui.horizontal(|ui| {
+        if toggle_switch(ui, &mut settings.update.auto_check, pal).changed() {
+            out.update_changed = true;
+        }
+        ui.label(egui::RichText::new(s.update_settings_auto_check).color(pal.fg));
+    });
+    ui.add_space(8.0);
+    if ui.button(s.update_btn_check_now).clicked() {
+        out.update_check_now = true;
+    }
 }

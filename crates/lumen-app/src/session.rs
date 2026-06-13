@@ -96,9 +96,35 @@ impl Tab {
         })
     }
 
-    /// 默认标题当前是否来自焦点窗格的 cwd（侧栏据此挂全路径悬停提示）。
-    pub fn title_is_cwd(&self) -> bool {
-        self.custom_title.is_none() && self.focused_pane().term.cwd().is_some()
+    /// 侧栏条目「名称行」：自定义名 > 焦点窗格 cwd **尾目录名**（非完整
+    /// 路径，完整路径走 [`Self::cwd_path`] 的第二行）> OSC 标题 >
+    /// 「会话 N」。与 [`Self::display_title`] 的区别仅在默认取 cwd 时用尾
+    /// 目录名而非完整路径（两行布局：名称=尾名、路径=全路径）。
+    pub fn display_name(&self) -> String {
+        if let Some(t) = &self.custom_title {
+            return t.clone();
+        }
+        let p = self.focused_pane();
+        if let Some(cwd) = p.term.cwd() {
+            return cwd.file_name().map_or_else(
+                || cwd.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+        }
+        let osc = p.term.title();
+        if !osc.is_empty() {
+            return osc.to_owned();
+        }
+        crate::i18n::fmt1(crate::i18n::strings().session_default_name_fmt, self.id + 1)
+    }
+
+    /// 侧栏条目「路径行」：焦点窗格 cwd 完整路径（OSC 9;9 上报）；cwd
+    /// 未知（新会话首个提示符前）为 None。
+    pub fn cwd_path(&self) -> Option<String> {
+        self.focused_pane()
+            .term
+            .cwd()
+            .map(|c| c.display().to_string())
     }
 
     /// tab 内任意窗格有未读输出（侧栏未读点；切到本 tab 时全清）。

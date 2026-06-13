@@ -32,6 +32,9 @@ pub struct PtySession {
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// 进程存活标志：wait 线程在子进程退出时置 false（[`Self::is_alive`] 据此）。
     alive: Arc<AtomicBool>,
+    /// shell 子进程 PID（spawn 时捕获，恒定）。用于查会话内前台运行的
+    /// 程序（侧栏会话图标读取其 exe 图标，F7②）。spawn 后端取不到时 None。
+    shell_pid: Option<u32>,
     /// 写入走独立线程：ConPTY 输入管道在 conhost 繁忙时会反压，
     /// 主线程（UI 事件循环）绝不能阻塞在管道写上。
     write_tx: Sender<Vec<u8>>,
@@ -82,6 +85,8 @@ impl PtySession {
         drop(pair.slave);
         // killer 留作 Drop 杀进程；child 本体稍后 move 进 wait 线程等退出。
         let killer = child.clone_killer();
+        // shell PID 在 child move 走前捕获（侧栏会话图标用，F7②）。
+        let shell_pid = child.process_id();
         // 进程存活标志：wait 线程在子进程退出时翻转。
         let alive = Arc::new(AtomicBool::new(true));
 
@@ -154,6 +159,7 @@ impl PtySession {
                 master: pair.master,
                 killer,
                 alive,
+                shell_pid,
                 write_tx,
             },
             rx,
@@ -183,6 +189,12 @@ impl PtySession {
     /// shell 进程是否仍在运行（wait 线程在子进程退出时翻转此标志）。
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// shell 子进程 PID（spawn 时捕获，恒定）；后端取不到时 None。
+    /// 侧栏会话图标据此查前台运行程序的 exe 图标（F7②）。
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
     }
 }
 

@@ -1,5 +1,7 @@
 //! 终端单元格：字符 + 颜色 + 样式。
 
+use std::num::NonZeroU32;
+
 use bitflags::bitflags;
 
 /// 单元格颜色。具体 RGB 解析（调色板/主题）由渲染层负责。
@@ -38,6 +40,12 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub flags: CellFlags,
+    /// OSC 8 显式超链接的内部 id（F10）：`Some(id)` 时本格属于一个由
+    /// `ESC]8;;URI` 开启的超链接区段，id 映射到终端持有的 URI 表
+    /// （见 [`crate::Terminal::hyperlink_at`]）。隐式链接（裸 URL /
+    /// 文件路径）不写此字段，由上层在 hover 时按行文本扫描识别。
+    /// 用 `NonZeroU32` 借空指针优化：`Option` 不额外占字节（id 从 1 起）。
+    pub hyperlink_id: Option<NonZeroU32>,
 }
 
 impl Default for Cell {
@@ -47,6 +55,7 @@ impl Default for Cell {
             fg: Color::Default,
             bg: Color::Default,
             flags: CellFlags::empty(),
+            hyperlink_id: None,
         }
     }
 }

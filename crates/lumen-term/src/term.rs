@@ -1,5 +1,7 @@
 //! 终端状态机：把 vte 解析事件应用到 Grid 上。
 
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use log::trace;
@@ -221,6 +223,36 @@ impl Terminal {
         self.inner.last_esu_seq > self.inner.last_cursor_show_seq
     }
 
+    /// 查询某绝对行某列单元格上的 OSC 8 显式超链接 URI（F10）。
+    ///
+    /// 坐标系与 [`crate::Grid::line_by_abs`] 一致（当前显示网格的绝对
+    /// 行号）。无该格、格上无超链接、或 id 已被容量保护清掉时返回 None。
+    pub fn hyperlink_at(&self, abs: u64, col: usize) -> Option<&str> {
+        let id = self.inner.grid.line_by_abs(abs)?.cells().get(col)?.hyperlink_id?;
+        self.inner.hyperlinks.get(&id).map(String::as_str)
+    }
+
+    /// 求某格所在 OSC 8 超链接在本行内的连续区段（F10 hover 高亮用）。
+    ///
+    /// 返回 `(start_col, end_col_exclusive, uri)`：start/end 为本行内
+    /// 拥有相同超链接 id 的最左/最右列（左闭右开）。无超链接返回 None。
+    /// 同一逻辑链接跨行时只取本行段（折行链接的跨行合并不在此处理）。
+    pub fn hyperlink_span_at(&self, abs: u64, col: usize) -> Option<(usize, usize, String)> {
+        let row = self.inner.grid.line_by_abs(abs)?;
+        let cells = row.cells();
+        let id = cells.get(col)?.hyperlink_id?;
+        let uri = self.inner.hyperlinks.get(&id)?.clone();
+        let mut start = col;
+        while start > 0 && cells.get(start - 1).and_then(|c| c.hyperlink_id) == Some(id) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while cells.get(end).and_then(|c| c.hyperlink_id) == Some(id) {
+            end += 1;
+        }
+        Some((start, end, uri))
+    }
+
     /// 提取选区覆盖的文本：行尾去空白、行间以 `\n` 连接、跳过宽字符占位格。
     pub fn selection_text(&self, sel: &crate::Selection) -> String {
         let (s, e) = sel.normalized();
@@ -290,6 +322,13 @@ struct TermInner {
     event_seq: u64,
     last_cursor_show_seq: u64,
     last_esu_seq: u64,
+    /// OSC 8 显式超链接表（F10）：内部 id → URI。`pen.hyperlink_id`
+    /// 指向当前开启的链接段，写入字符时随 pen 落到 cell 上。
+    hyperlinks: HashMap<NonZeroU32, String>,
+    /// URI → 内部 id 的反查表，让同一 URI 复用一个 id（去重、控容量）。
+    hyperlink_ids: HashMap<String, NonZeroU32>,
+    /// 下一个超链接 id（从 1 起，配合 `NonZeroU32` 空指针优化）。
+    next_hyperlink_id: u32,
 }
 
 impl TermInner {
@@ -314,7 +353,59 @@ impl TermInner {
             event_seq: 0,
             last_cursor_show_seq: 0,
             last_esu_seq: 0,
+            hyperlinks: HashMap::new(),
+            hyperlink_ids: HashMap::new(),
+            next_hyperlink_id: 1,
         }
+    }
+
+    /// 处理 OSC 8 超链接标记（F10）。
+    ///
+    /// 形如 `ESC]8;<params>;<URI>ST`：URI 非空 = 开启一段超链接（后续
+    /// 写入的字符都归属它），URI 为空（`ESC]8;;ST`）= 关闭当前链接。
+    /// `<params>`（如 `id=foo`）当前忽略——只用内部自增 id 维持归属。
+    ///
+    /// 容量保护：不同 URI 数超上限时清空映射表（但 `next_hyperlink_id`
+    /// **保持单调不复位**——新 id 永远大于屏上/历史里任何旧 cell 的 id，
+    /// 旧 id 在清空后的表里查无 → `hyperlink_at` 返回 None，真正的优雅
+    /// 悬空降级，不会把旧 cell 别名到新 URI）。防长会话里恶意/异常程序
+    /// 狂发唯一 URI 撑爆内存。
+    fn handle_hyperlink(&mut self, params: &[&[u8]]) {
+        // URI 可能含分号（被 vte 按 ; 切开），params[2..] 重新拼回。
+        // 仅 `OSC 8;<params>` 两段（无 URI 段）时视为关闭。
+        let uri: Vec<u8> = if params.len() > 2 {
+            params[2..].join(&b';')
+        } else {
+            Vec::new()
+        };
+        if uri.is_empty() {
+            self.pen.hyperlink_id = None;
+            return;
+        }
+        let Ok(uri) = std::str::from_utf8(&uri) else {
+            trace!("OSC 8 URI 非 UTF-8，忽略");
+            return;
+        };
+        // 容量保护：约 4096 个不同 URI 封顶。清表但 next_hyperlink_id
+        // 不复位（保持单调），旧 cell 的 id 清表后查无 → 真正悬空降级，
+        // 不会被新 URI 别名（审查 finding：复位会让屏上旧链接开错网址）。
+        const HYPERLINK_LIMIT: usize = 4096;
+        if !self.hyperlink_ids.contains_key(uri) && self.hyperlinks.len() >= HYPERLINK_LIMIT {
+            self.hyperlinks.clear();
+            self.hyperlink_ids.clear();
+        }
+        let id = if let Some(id) = self.hyperlink_ids.get(uri) {
+            *id
+        } else {
+            // next_hyperlink_id 从 1 起、只 saturating_add，恒 ≥ 1，构造必成功。
+            let id = NonZeroU32::new(self.next_hyperlink_id)
+                .expect("next_hyperlink_id 不变量：恒 ≥ 1");
+            self.next_hyperlink_id = self.next_hyperlink_id.saturating_add(1);
+            self.hyperlinks.insert(id, uri.to_owned());
+            self.hyperlink_ids.insert(uri.to_owned(), id);
+            id
+        };
+        self.pen.hyperlink_id = Some(id);
     }
 
     /// 光标下移一行；到滚动区底部则滚动。
@@ -542,6 +633,20 @@ impl TermInner {
             Some(b'C') => {
                 if let Some(b) = self.blocks.last_mut() {
                     b.output_line = Some(line);
+                    // M4.2：私有参数位携带的 base64 权威命令文本
+                    // （integration.ps1 在 ReadLine 包装里发 133;C;<base64>，
+                    // 系统 ConPTY 吞 OSC 633 → 降级走 133 私参，设计稿 §3.3）。
+                    // 无此参数/非 UTF-8/解码失败都静默跳过（其它 shell 集成
+                    // 只发裸 133;C，自然无 cmd_text，优雅降级）。
+                    if let Some(text) = params
+                        .get(2)
+                        .filter(|p| !p.is_empty())
+                        .and_then(|p| std::str::from_utf8(p).ok())
+                        .and_then(base64_decode)
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                    {
+                        b.cmd_text = Some(text);
+                    }
                 }
             }
             Some(b'D') => {
@@ -903,6 +1008,7 @@ impl Perform for TermInner {
                     self.title = title.to_owned();
                 }
             }
+            b"8" => self.handle_hyperlink(params),
             b"9" => self.handle_osc9(params),
             b"133" => self.handle_block_marker(params),
             _ => trace!("未实现的 OSC: {:?}", std::str::from_utf8(code)),
@@ -912,6 +1018,42 @@ impl Perform for TermInner {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
+}
+
+/// 标准 base64 解码（RFC 4648，字母表 `A-Za-z0-9+/`，带可选 `=` padding）。
+///
+/// 仅 M4.2 解析 `OSC 133;C` 私参里的权威命令文本用——只需解码方向，
+/// 零依赖自实现（与 `lumen-app` 侧 `base64_encode` 对应）。非法字符返回
+/// `None`，尾部 padding 与剩余不足 8 位的比特按 RFC 丢弃。
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b'=' {
+        end -= 1;
+    }
+    let mut out = Vec::with_capacity(end / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &c in &bytes[..end] {
+        let v = val(c)? as u32;
+        acc = (acc << 6) | v;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1311,6 +1453,120 @@ mod tests {
         // 空路径忽略，不覆盖已有值。
         t.advance(b"\x1b]9;9;C:\\ok\x07\x1b]9;9;\x07");
         assert_eq!(t.cwd(), Some(Path::new("C:\\ok")));
+    }
+
+    // ── F10 OSC 8 超链接 ──────────────────────────────────────────────
+
+    #[test]
+    fn osc8_超链接开启与归属() {
+        let mut t = term();
+        // ESC]8;;https://a.com ST  link  ESC]8;; ST  plain
+        t.advance(b"\x1b]8;;https://a.com\x1b\\link\x1b]8;;\x1b\\xy");
+        // "link" 四格都归属超链接
+        assert_eq!(t.hyperlink_at(0, 0), Some("https://a.com"));
+        assert_eq!(t.hyperlink_at(0, 3), Some("https://a.com"));
+        // 关闭后写的 "xy" 无超链接
+        assert_eq!(t.hyperlink_at(0, 4), None);
+        assert_eq!(t.hyperlink_at(0, 5), None);
+    }
+
+    #[test]
+    fn osc8_区段查询返回连续范围() {
+        let mut t = term();
+        t.advance(b"ab\x1b]8;;https://x\x1b\\LINK\x1b]8;;\x1b\\cd");
+        // "LINK" 在列 2..6
+        let span = t.hyperlink_span_at(0, 4).expect("应命中超链接");
+        assert_eq!(span.0, 2);
+        assert_eq!(span.1, 6);
+        assert_eq!(span.2, "https://x");
+        // 非超链接格返回 None
+        assert!(t.hyperlink_span_at(0, 0).is_none());
+        assert!(t.hyperlink_span_at(0, 6).is_none());
+    }
+
+    #[test]
+    fn osc8_相同uri复用id_不同uri各占一格() {
+        let mut t = term();
+        t.advance(b"\x1b]8;;https://same\x1b\\A\x1b]8;;\x1b\\");
+        t.advance(b"\x1b]8;;https://same\x1b\\B\x1b]8;;\x1b\\");
+        t.advance(b"\x1b]8;;https://other\x1b\\C\x1b]8;;\x1b\\");
+        let id_a = t.grid().row(0)[0].hyperlink_id;
+        let id_b = t.grid().row(0)[1].hyperlink_id;
+        let id_c = t.grid().row(0)[2].hyperlink_id;
+        assert!(id_a.is_some());
+        assert_eq!(id_a, id_b, "相同 URI 应复用同一 id");
+        assert_ne!(id_a, id_c, "不同 URI 应分配不同 id");
+        assert_eq!(t.hyperlink_at(0, 2), Some("https://other"));
+    }
+
+    #[test]
+    fn osc8_bel终止与含分号uri() {
+        let mut t = term();
+        // BEL 终止 + URI 内含分号（参数被 vte 切开，需拼回）。
+        t.advance(b"\x1b]8;;https://a.com/x;y;z\x07Z\x1b]8;;\x07");
+        assert_eq!(t.hyperlink_at(0, 0), Some("https://a.com/x;y;z"));
+    }
+
+    // ── M4.2 OSC 133;C 权威命令文本（base64 私参）──────────────────────
+
+    #[test]
+    fn base64_decode_标准向量() {
+        assert_eq!(base64_decode(""), Some(vec![]));
+        assert_eq!(base64_decode("Zg=="), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8="), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode("Zm9vYmFy"), Some(b"foobar".to_vec()));
+        // 非法字符 → None。
+        assert_eq!(base64_decode("@@@@"), None);
+    }
+
+    #[test]
+    fn osc133_c_权威命令文本_base64() {
+        let mut t = term();
+        // base64("git status") = "Z2l0IHN0YXR1cw=="
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;Z2l0IHN0YXR1cw==\x07");
+        let b = t.blocks().last().expect("应有块");
+        assert_eq!(b.cmd_text.as_deref(), Some("git status"));
+    }
+
+    #[test]
+    fn osc133_c_中文命令文本_base64() {
+        let mut t = term();
+        // base64(UTF-8("echo 海风")) —— 验证 UTF-8 往返。
+        use std::io::Write as _;
+        let cmd = "echo 海风";
+        // 自算 base64（与解码对称，避免硬编码）。
+        let bytes = cmd.as_bytes();
+        let b64 = {
+            const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut o = Vec::new();
+            for chunk in bytes.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+                o.push(A[(n >> 18 & 63) as usize]);
+                o.push(A[(n >> 12 & 63) as usize]);
+                o.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] } else { b'=' });
+                o.push(if chunk.len() > 2 { A[(n & 63) as usize] } else { b'=' });
+            }
+            o
+        };
+        let mut seq = Vec::new();
+        write!(seq, "\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C;").unwrap();
+        seq.extend_from_slice(&b64);
+        seq.push(0x07);
+        t.advance(&seq);
+        assert_eq!(t.blocks().last().unwrap().cmd_text.as_deref(), Some("echo 海风"));
+    }
+
+    #[test]
+    fn osc133_c_无私参时cmd_text为none() {
+        let mut t = term();
+        t.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]133;C\x07");
+        assert_eq!(t.blocks().last().unwrap().cmd_text, None);
     }
 
     #[test]

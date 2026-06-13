@@ -1,0 +1,48 @@
+# Lumen 持续集成：守住「编译过 + 测试绿 + clippy 0 warning」与跨平台编译
+# 不回归。发版打包另见 release.yml。
+#
+# - Windows 是权威平台（发布目标）：cargo test 全绿 + clippy -D warnings。
+# - Linux 仅作「跨平台编译哨兵」：non-blocking（continue-on-error）的
+#   cargo check，专防 windows-sys/winresource 等 target-gate 漏写、把
+#   非 Windows 代码路径编挂的回归。失败不拦合并，只在 CI 面板亮黄。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一分支新推送取消尚在跑的旧 run，省 CI 额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 权威：Windows 上测试 + clippy。
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy（0 warning）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 测试
+        run: cargo test --workspace
+
+  # 哨兵：Linux 仅编译检查，非阻塞。只为及早发现跨平台 cfg 回归。
+  compile-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check（跨平台编译哨兵）
+        run: cargo check --workspace --all-targets
