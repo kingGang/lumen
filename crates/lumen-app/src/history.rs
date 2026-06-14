@@ -1,7 +1,9 @@
 //! 命令历史库（M4.1 批D2，feature = "input-editor"）——设计稿 §8。
 //!
 //! # 存储格式
-//! `%LOCALAPPDATA%/Lumen/history.jsonl`：每行一条 JSON 记录，追加写。
+//! 应用数据目录下的 `history.jsonl`（目录按构建类型隔离，见
+//! [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）：每行一条
+//! JSON 记录，追加写。
 //! 条目格式：`{ text, cwd?, exit_code?, duration_ms?, ts }`。
 //!
 //! # 回填策略（内存回填 + 退出时原子重写）
@@ -94,16 +96,14 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// 历史库文件路径（`%LOCALAPPDATA%/Lumen/history.jsonl`）。
+/// 历史库文件路径：应用数据目录下的 `history.jsonl`（目录按构建类型
+/// 隔离，见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。
 ///
 /// # Errors
-/// 若 LOCALAPPDATA 环境变量未设置则返回 None（此时历史功能静默降级）。
+/// 数据目录不可用（`LOCALAPPDATA` 未设置且无 `LUMEN_DATA_DIR` 覆盖）时
+/// 返回 None（此时历史功能静默降级）。
 pub fn history_path() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    let mut p = PathBuf::from(base);
-    p.push("Lumen");
-    p.push("history.jsonl");
-    Some(p)
+    crate::paths::data_file("history.jsonl")
 }
 
 impl HistoryStore {

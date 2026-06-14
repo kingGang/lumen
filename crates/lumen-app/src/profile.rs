@@ -2,7 +2,8 @@
 //!
 //! 真账号后端 M5 才做（docs/M3应用外壳设计.md §7），本期为纯本地
 //! mock：登录只做格式校验（[`mock_login`]：邮箱含 `@` 且密码非空），
-//! 成功后把身份信息写 `%LOCALAPPDATA%/Lumen/profile.json`。
+//! 成功后把身份信息写应用数据目录下的 `profile.json`（目录按构建类型
+//! 隔离，见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。
 //! **文件中绝不存密码**——[`Profile`] 没有密码字段，密码仅在校验
 //! 瞬间过手、不进任何持久化路径。
 //!
@@ -40,10 +41,11 @@ impl Profile {
             .unwrap_or_else(|| "?".to_owned())
     }
 
-    /// 档案文件路径：`%LOCALAPPDATA%/Lumen/profile.json`。
-    /// 环境变量缺失（极端定制环境）返回 None，登录态仅在内存生效。
+    /// 档案文件路径：应用数据目录下的 `profile.json`（目录按构建类型
+    /// 隔离，见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。
+    /// 数据目录不可用（极端定制环境）返回 None，登录态仅在内存生效。
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Lumen").join("profile.json"))
+        crate::paths::data_file("profile.json")
     }
 
     /// 启动加载：缺失 = 未登录；损坏 = 未登录 + 日志警告，不 panic。

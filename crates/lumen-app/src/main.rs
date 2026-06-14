@@ -24,6 +24,8 @@ mod keymap;
 /// F10 终端可点击链接：URL/文件路径识别 + 系统默认程序打开。
 mod links;
 mod mode;
+/// 应用数据目录解析（单一真源）：按构建类型隔离 debug/release 的持久化数据。
+mod paths;
 /// F7②：侧栏会话图标 = 会话内前台运行程序的 exe 图标（查不到回退字形）。
 mod proc_icon;
 mod profile;

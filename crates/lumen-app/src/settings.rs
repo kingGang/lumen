@@ -1,6 +1,7 @@
 //! 设置数据层（M3.4）：serde 结构 + JSON 持久化。
 //!
-//! 持久化位置：`%LOCALAPPDATA%/Lumen/settings.json`。启动加载——缺失
+//! 持久化位置：应用数据目录下的 `settings.json`（目录按构建类型隔离，
+//! 见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。启动加载——缺失
 //! 或损坏时降级默认值并记日志警告，绝不 panic（损坏文件保留原样，
 //! 直到下一次设置变更才被覆盖）。写盘走「先写同目录临时文件再改名
 //! 覆盖」：Windows 的 `fs::rename` 带 MOVEFILE_REPLACE_EXISTING 语义，
@@ -239,10 +240,11 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// 设置文件路径：`%LOCALAPPDATA%/Lumen/settings.json`。
-    /// 环境变量缺失（极端定制环境）返回 None，设置仅在内存生效。
+    /// 设置文件路径：应用数据目录下的 `settings.json`（目录按构建类型
+    /// 隔离，见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。
+    /// 数据目录不可用（极端定制环境）返回 None，设置仅在内存生效。
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Lumen").join("settings.json"))
+        crate::paths::data_file("settings.json")
     }
 
     /// 启动加载：缺失/损坏降级默认值（记日志），不 panic。

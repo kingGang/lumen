@@ -1,4 +1,6 @@
-//! 会话列表持久化（F4 / F5 分屏升级）：`%LOCALAPPDATA%/Lumen/sessions.json`。
+//! 会话列表持久化（F4 / F5 分屏升级）：应用数据目录下的 `sessions.json`
+//! （目录按构建类型隔离，见 [`crate::paths`]——release `Lumen/`、
+//! debug `Lumen-dev/`）。
 //!
 //! M3.7 起为 v2 嵌套结构 `{version: 2, active_tab, tabs: [{custom_title,
 //! focused, panes: [{cwd}]}]}`：每个 tab 保存自定义名、窗格列表（各窗格
@@ -121,10 +123,11 @@ impl SessionsFile {
         }
     }
 
-    /// 持久化路径：`%LOCALAPPDATA%/Lumen/sessions.json`。
-    /// 环境变量缺失（极端定制环境）返回 None，本次运行不持久化。
+    /// 持久化路径：应用数据目录下的 `sessions.json`（目录按构建类型
+    /// 隔离，见 [`crate::paths`]——release `Lumen/`、debug `Lumen-dev/`）。
+    /// 数据目录不可用（极端定制环境）返回 None，本次运行不持久化。
     pub fn path() -> Option<PathBuf> {
-        std::env::var_os("LOCALAPPDATA").map(|d| Path::new(&d).join("Lumen").join("sessions.json"))
+        crate::paths::data_file("sessions.json")
     }
 
     /// 启动加载：缺失/损坏/空条目返回 None（回退单默认会话），损坏
