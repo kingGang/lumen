@@ -959,8 +959,15 @@ impl Perform for TermInner {
             }
             _ => trace!("未实现的 CSI: {action} {params:?}"),
         }
-        // 任何 CSI 都打断延迟换行状态。
-        self.grid.cursor.pending_wrap = false;
+        // 仅「实际移动光标」的 CSI 打断延迟换行（pending_wrap / VT 的
+        // wrapnext 标志）：SGR(m) / 擦除(J/K) / 模式设置(?h/?l) / 设备查询
+        // 等**不移动光标**的 CSI 不清——否则像 claude 这种「填满整行 → 发
+        // SGR 重置颜色 → 靠 autowrap 折到下一行画 ❯ 提示符」的序列会被破坏：
+        // ❯ 不折行、覆盖行尾、后续字符整体左移错位（海风哥 2026-06-14 实证，
+        // wt/warp 正常因其 wrapnext 仅随光标移动而清，与 xterm/VT 标准一致）。
+        if self.grid.cursor.row != cur.row || self.grid.cursor.col != cur.col {
+            self.grid.cursor.pending_wrap = false;
+        }
         self.grid.mark_dirty();
     }
 
@@ -1090,6 +1097,36 @@ mod tests {
         t.advance(b"x");
         assert_eq!(t.grid().cursor.row, 1);
         assert!(screen_text(&t)[1].starts_with('x'));
+    }
+
+    #[test]
+    fn sgr不打断行尾延迟换行() {
+        // 回归（海风哥 2026-06-14 实证）：填满整行后发 SGR（ESC[m，不移动
+        // 光标）不应清除 pending_wrap——否则 claude「填满边框行 → ESC[m 重置
+        // 颜色 → 靠 autowrap 折到下一行画 ❯」会错位：❯ 覆盖行尾、后续字符整体
+        // 左移。曾因 csi_dispatch 末尾「任何 CSI 都清 pending_wrap」而误清。
+        let mut t = term();
+        t.advance(b"0123456789"); // 恰好写满一行（10 列）
+        assert_eq!(t.grid().cursor.row, 0, "尚未换行");
+        t.advance(b"\x1b[m"); // SGR 重置：不移动光标
+        t.advance(b"x");
+        assert_eq!(t.grid().cursor.row, 1, "SGR 不应清 pending_wrap，写字符应折行");
+        assert!(screen_text(&t)[1].starts_with('x'), "x 应在下一行行首");
+    }
+
+    #[test]
+    fn 移动光标的csi仍打断延迟换行() {
+        // 对偶：实际移动光标的 CSI（CUP）应清 pending_wrap，定位后写字符落在
+        // 定位处、不触发折行（确保上面的修复未矫枉过正）。
+        let mut t = term();
+        t.advance(b"0123456789"); // 写满
+        t.advance(b"\x1b[1;5H"); // CUP 到 row1 col5（移动光标）
+        t.advance(b"y");
+        assert_eq!(t.grid().cursor.row, 0, "CUP 已清 pending_wrap，不应折行");
+        assert!(
+            screen_text(&t)[0].chars().nth(4) == Some('y'),
+            "y 应落在 CUP 定位的 col4"
+        );
     }
 
     #[test]
