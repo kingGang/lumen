@@ -466,6 +466,21 @@ struct HoverLink {
     target: links::LinkTarget,
 }
 
+/// 终端区滚动条的逐窗格几何（仅 scrollback 非空、内容区够高的可见
+/// 窗格各一条）。run_ui 闭包内据此绘制轨道/滑块并处理拖动，闭包后把
+/// 目标 `display_offset` 落到对应 grid。几何取自上一帧 `pane_rects_px`
+/// （物理像素→逻辑点，滞后一帧无感），与「回到底部」按钮同源。
+struct ScrollbarGeom {
+    /// 窗格会话 id（点击/拖动后据此定位 grid）。
+    sid: SessionId,
+    /// 轨道矩形（逻辑点）：窗格右缘内侧、内容区高度（焦点窗格扣 footer）。
+    track: egui::Rect,
+    /// 滑块矩形（逻辑点）：高度 = 可视占比，位置 = 滚动进度。
+    thumb: egui::Rect,
+    /// scrollback 行数（拖动反算 `display_offset` 用：进度 ↔ 偏移）。
+    scrollback: usize,
+}
+
 struct AppState {
     /// 性能埋点输出（LUMEN_PERF=<路径> 启用）。
     perf: Option<std::fs::File>,
@@ -528,6 +543,11 @@ struct AppState {
     /// F10：上次做过链接探测的单元格 (窗格 id, 绝对行, 列)——鼠标仍在
     /// 同一格时跳过重复探测（避免每像素移动都做行扫描/文件系统校验）。
     hover_probe_cell: Option<(SessionId, u64, usize)>,
+    /// 终端滚动条拖动态：`(会话 id, 抓取锚点)`。锚点 = 按下时指针 Y 与
+    /// 滑块顶部的差值（逻辑点）——拖动中据它让滑块跟手、不跳。None =
+    /// 未拖动。egui 跨帧记住被拖控件，配合 `interact_pointer_pos` 用绝对
+    /// 指针位置反算偏移（不靠 delta 累加，无漂移）。
+    scrollbar_drag: Option<(SessionId, f32)>,
 
     // —— F3 热更（自动更新）——
     /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
@@ -1485,6 +1505,94 @@ impl AppState {
             ));
         }
         out
+    }
+
+    /// 终端区滚动条的逐窗格几何（每个有 scrollback 历史、内容区够高的
+    /// 可见窗格各一条）。返回轨道/滑块逻辑矩形与 scrollback 行数，run_ui
+    /// 闭包内据此绘制 + 处理拖动，闭包后把目标 `display_offset` 落到 grid。
+    ///
+    /// 滑块模型：内容总行数 `total = scrollback + rows`，滑块高 = 可视占比
+    /// `rows/total`（带最小高，行极多时仍可抓），位置按滚动进度——
+    /// `display_offset` 以行计，0 = 底部（滑块贴底）、`scrollback` = 最旧
+    /// （滑块贴顶）。几何取自上一帧 `pane_rects_px`（物理像素→逻辑点，
+    /// 滞后一帧无感）；焦点窗格扣 footer，轨道不压输入区。`&self` 借整个
+    /// state，须在 `run_ui` 可变借用 `state.shell_state` 之前调用。
+    fn scrollbar_overlays(&self) -> Vec<ScrollbarGeom> {
+        // 轨道逻辑宽、距窗格右缘留白、滑块最小高（逻辑点）。
+        const WIDTH: f32 = 10.0;
+        const MARGIN: f32 = 2.0;
+        const MIN_THUMB: f32 = 28.0;
+        let ppp = self.egui_ctx.pixels_per_point();
+        if ppp <= 0.0 {
+            return Vec::new();
+        }
+        let focus_sid = self.focused_pane().id;
+        #[cfg(feature = "input-editor")]
+        let footer_h_px = self.focused_footer_rect_px().map_or(0.0, |(_, _, _, h)| h);
+        #[cfg(not(feature = "input-editor"))]
+        let footer_h_px = 0.0_f32;
+
+        let panes = &self.tabs[self.active_tab].panes;
+        let mut out = Vec::new();
+        for (sid, (x, y, w, h)) in &self.pane_rects_px {
+            let Some(pane) = panes.iter().find(|p| p.id == *sid) else {
+                continue;
+            };
+            let g = pane.term.grid();
+            let sb = g.scrollback_len();
+            // 无历史可滚则不画。
+            if sb == 0 {
+                continue;
+            }
+            let rows = g.rows().max(1);
+            let total = sb + rows;
+            let footer = if *sid == focus_sid { footer_h_px } else { 0.0 };
+            // 轨道（逻辑点）：贴窗格右缘内侧，纵向占内容区（扣 footer）。
+            let tx = (x + w) / ppp - MARGIN - WIDTH;
+            let ty = y / ppp;
+            let th = ((h - footer) / ppp).max(0.0);
+            // 内容区太矮、塞不下最小滑块就不画（极小窗格防御）。
+            if th <= MIN_THUMB {
+                continue;
+            }
+            let track = egui::Rect::from_min_size(egui::pos2(tx, ty), egui::vec2(WIDTH, th));
+            // 滑块高 = 可视占比 ×轨道高，夹到 [MIN_THUMB, th]。
+            let thumb_h = (th * rows as f32 / total as f32).clamp(MIN_THUMB, th);
+            // 进度：offset=0→贴底、offset=sb→贴顶。可移动范围 = th - thumb_h。
+            let movable = (th - thumb_h).max(0.0);
+            let offset = g.display_offset().min(sb);
+            let thumb_top = ty + (1.0 - offset as f32 / sb as f32) * movable;
+            let thumb = egui::Rect::from_min_size(
+                egui::pos2(tx, thumb_top),
+                egui::vec2(WIDTH, thumb_h),
+            );
+            out.push(ScrollbarGeom {
+                sid: *sid,
+                track,
+                thumb,
+                scrollback: sb,
+            });
+        }
+        out
+    }
+
+    /// 鼠标当前是否落在某窗格的滚动条轨道上（复用 `scrollbar_overlays`
+    /// 几何，逻辑点判定）。滚动条是 `Order::Foreground` 层，会让
+    /// `pane_under_mouse` 因命中非 Background 层而返回 None——MouseWheel
+    /// 据此补一判：否则每个有历史窗格的右缘整列会变成「滚轮死区」（指针
+    /// 悬在轨道上滚不动终端）。
+    fn mouse_on_scrollbar_track(&self) -> bool {
+        let ppp = self.egui_ctx.pixels_per_point();
+        if ppp <= 0.0 {
+            return false;
+        }
+        let pos = egui::pos2(
+            self.mouse_pos.0 as f32 / ppp,
+            self.mouse_pos.1 as f32 / ppp,
+        );
+        self.scrollbar_overlays()
+            .iter()
+            .any(|g| g.track.contains(pos))
     }
 
     /// 把当前鼠标像素位置换算成**焦点窗格**的选区端点（绝对行号）。
@@ -2753,6 +2861,7 @@ impl App {
             mouse_pos: (0.0, 0.0),
             hovered_link: None,
             hover_probe_cell: None,
+            scrollbar_drag: None,
             update_tx,
             update_rx,
             update_available: None,
@@ -4216,7 +4325,11 @@ impl ApplicationHandler<PtyWake> for App {
                 // 终端窗格区内滚轮归终端，区外（侧栏等）归 egui；滚动
                 // 作用于**焦点窗格**（F5 拍板：键盘/IME/滚轮/选区全部
                 // 跟焦点，悬停别的窗格不抢路由——要滚哪个先点哪个）。
-                if state.pane_under_mouse().is_none() {
+                //
+                // 指针可能正悬在滚动条轨道（Foreground 层）上，此时
+                // pane_under_mouse 因命中 egui 层返回 None——但用户意图仍是
+                // 滚终端，故补一判：在轨道上也放行，避免右缘整列成滚轮死区。
+                if state.pane_under_mouse().is_none() && !state.mouse_on_scrollbar_track() {
                     return;
                 }
                 let lines = match delta {
@@ -4591,6 +4704,12 @@ impl ApplicationHandler<PtyWake> for App {
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
                 let scroll_to_bottom_targets = state.scroll_to_bottom_overlays();
                 let mut scroll_to_bottom_req: Option<SessionId> = None;
+                // 终端滚动条目标几何（同样须在借 shell_state 前算好）。
+                // 拖动/点击后把目标绝对 display_offset 记入 scroll_set_req，
+                // 闭包后落到对应 grid。
+                let scrollbar_targets = state.scrollbar_overlays();
+                let mut scroll_set_req: Option<(SessionId, usize)> = None;
+                let scrollbar_drag = &mut state.scrollbar_drag;
                 let shell_state = &mut state.shell_state;
                 let app_settings = &mut state.settings;
                 // F3 更新弹窗配色（当前主题色板；app_settings 借用后用 disjoint
@@ -4696,6 +4815,86 @@ impl ApplicationHandler<PtyWake> for App {
                         if resp.inner.clicked() {
                             scroll_to_bottom_req = Some(*sid);
                         }
+                    }
+                    // ── 终端区滚动条（有历史的窗格右缘竖向拖动条）──
+                    // 滑块：平时半透明，hover/拖动时提亮。拖滑块跟手（记
+                    // 抓取锚点）、点轨道空白处跳转（滑块中心落到点击点）。
+                    for geom in &scrollbar_targets {
+                        let track = geom.track;
+                        let thumb = geom.thumb;
+                        let sb = geom.scrollback;
+                        let sid = geom.sid;
+                        let resp = egui::Area::new(egui::Id::new(("lumen_scrollbar", sid)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(track.min)
+                            .show(ui.ctx(), |ui| {
+                                let (_r, resp) = ui
+                                    .allocate_exact_size(track.size(), egui::Sense::click_and_drag());
+                                resp
+                            })
+                            .inner;
+                        let dragging = matches!(*scrollbar_drag, Some((s, _)) if s == sid);
+                        let active = dragging || resp.hovered();
+                        // 轨道反算：把指针 Y（减抓取锚点）映射回 display_offset。
+                        // offset = sb × (1 - top/movable)，top∈[0, movable]。
+                        let movable = (track.height() - thumb.height()).max(0.0);
+                        let offset_from_top = |anchor: f32, p: egui::Pos2| -> usize {
+                            if movable <= 0.0 {
+                                return 0;
+                            }
+                            let top = (p.y - track.top() - anchor).clamp(0.0, movable);
+                            (sb as f32 * (1.0 - top / movable)).round().clamp(0.0, sb as f32)
+                                as usize
+                        };
+                        if resp.drag_started() {
+                            // 抓滑块 → 锚点 = 指针到滑块顶的距离（跟手）；
+                            // 抓轨道空白 → 锚点 = 半个滑块（中心对准指针，跳转）。
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let anchor = if thumb.contains(p) {
+                                    p.y - thumb.top()
+                                } else {
+                                    thumb.height() / 2.0
+                                };
+                                *scrollbar_drag = Some((sid, anchor));
+                            }
+                        }
+                        if let (Some((dsid, anchor)), Some(p)) =
+                            (*scrollbar_drag, resp.interact_pointer_pos())
+                        {
+                            if dsid == sid && (resp.dragged() || resp.drag_started()) {
+                                scroll_set_req = Some((sid, offset_from_top(anchor, p)));
+                            }
+                        }
+                        // 纯点击（未达拖动阈值）：与拖动起步同构——点滑块本体
+                        // 用跟手锚点（offset 不变、不跳），只有点轨道空白才把
+                        // 滑块中心对准点击点跳转。否则单击滑块上/下半区会窜走
+                        // （offset 跳数千行），违反「点滑块不动」的标准滚动条语义。
+                        if resp.clicked() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let anchor = if thumb.contains(p) {
+                                    p.y - thumb.top()
+                                } else {
+                                    thumb.height() / 2.0
+                                };
+                                scroll_set_req = Some((sid, offset_from_top(anchor, p)));
+                            }
+                        }
+                        if resp.drag_stopped() {
+                            *scrollbar_drag = None;
+                        }
+                        if active {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                        }
+                        // 绘制：active 时画淡轨道底；滑块 active 提亮、平时半透明。
+                        // 圆角半径取轨道半宽（10/2），画成胶囊。
+                        let painter = ui.painter();
+                        if active {
+                            painter.rect_filled(track, 5.0, modal_pal.fg_dim.gamma_multiply(0.10));
+                        }
+                        // 滑块横向内缩 2px、画成胶囊，观感更轻。
+                        let tr = thumb.shrink2(egui::vec2(2.0, 0.0));
+                        let alpha = if active { 0.85 } else { 0.40 };
+                        painter.rect_filled(tr, 5.0, modal_pal.fg_dim.gamma_multiply(alpha));
                     }
                     if link_hover_active {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -4992,6 +5191,37 @@ impl ApplicationHandler<PtyWake> for App {
                         p.term.grid_mut().scroll_to_bottom();
                         state.window.request_redraw();
                     }
+                }
+
+                // 滚动条拖动/点击：把目标绝对 display_offset 落到对应窗格。
+                // grid 无「设绝对偏移」API，按目标与当前偏移之差走
+                // scroll_display（内部夹紧范围），等价且无需改 lumen-term。
+                if let Some((sid, target)) = scroll_set_req {
+                    if let Some(p) = state.tabs[state.active_tab]
+                        .panes
+                        .iter_mut()
+                        .find(|p| p.id == sid)
+                    {
+                        let g = p.term.grid_mut();
+                        let delta = target as isize - g.display_offset() as isize;
+                        if delta != 0 {
+                            g.scroll_display(delta);
+                            state.window.request_redraw();
+                        }
+                    }
+                }
+
+                // 滚动条拖动态兜底清理：唯一的 drag_stopped 清零点在 run_ui 闭包
+                // 的 scrollbar 循环内，被拖窗格若在拖动中从 scrollbar_targets 掉出
+                // （切 tab/关窗格/清屏致 sb=0/内容区跌破 MIN_THUMB），或拖动中窗口
+                // 失焦/系统接管指针（Alt+Tab 等）致 egui 漏发 drag_stopped，
+                // scrollbar_drag 会滞留 Some → 滚动条恒高亮、状态机不闭环。指针
+                // 松开是 OS 级事实，本帧非按下态即无条件清零（与 divider 的
+                // layout_dirty/B3-8 松手兜底同款惯例）。
+                if state.scrollbar_drag.is_some()
+                    && !state.egui_ctx.input(|i| i.pointer.any_down())
+                {
+                    state.scrollbar_drag = None;
                 }
 
                 // 底部状态栏「经典模式」按钮：复用 ToggleFallback 同路径（M4.1 批E）。
