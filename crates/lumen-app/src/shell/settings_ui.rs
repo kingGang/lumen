@@ -64,14 +64,16 @@ enum Category {
     Account,
     Appearance,
     Shortcuts,
+    Network,
     About,
 }
 
 impl Category {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Account,
         Self::Appearance,
         Self::Shortcuts,
+        Self::Network,
         Self::About,
     ];
 
@@ -82,6 +84,7 @@ impl Category {
             Self::Account => s.nav_account,
             Self::Appearance => s.nav_appearance,
             Self::Shortcuts => s.nav_keyboard_shortcuts,
+            Self::Network => s.nav_network,
             Self::About => s.nav_about,
         }
     }
@@ -156,6 +159,8 @@ pub struct SettingsOutput {
     pub update_check_now: bool,
     /// About 页改了更新设置（auto_check 开关）：main 进 need_save 落盘。
     pub update_changed: bool,
+    /// Network 页改了代理设置（开关 / 地址）：main 落盘并刷新生效代理。
+    pub proxy_changed: bool,
 }
 
 /// 绘制设置页覆盖层。调用方保证 `st.open == true` 时才调用。
@@ -255,6 +260,7 @@ pub fn show(
                     Category::Account => account(ui, profile, pal, &mut out),
                     Category::Appearance => appearance(ui, st, settings, pal, &mut out, os_dark),
                     Category::Shortcuts => shortcuts(ui, pal),
+                    Category::Network => network(ui, settings, pal, &mut out),
                     Category::About => about(ui, settings, pal, &mut out),
                 });
         });
@@ -988,4 +994,34 @@ fn about(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut Se
     if ui.button(s.update_btn_check_now).clicked() {
         out.update_check_now = true;
     }
+}
+
+/// Network（网络代理）：启用开关 + 代理地址输入 + 格式说明。改动经
+/// `out.proxy_changed` 回 main 落盘并刷新生效代理（下次出网请求即用）。
+fn network(ui: &mut egui::Ui, settings: &mut Settings, pal: &Palette, out: &mut SettingsOutput) {
+    let s = i18n::strings();
+    heading(ui, pal, s.proxy_section);
+    ui.horizontal(|ui| {
+        if toggle_switch(ui, &mut settings.proxy.enabled, pal).changed() {
+            out.proxy_changed = true;
+        }
+        ui.label(egui::RichText::new(s.proxy_enable).color(pal.fg));
+    });
+    ui.add_space(12.0);
+    ui.label(egui::RichText::new(s.proxy_url_label).color(pal.fg_dim));
+    ui.add_space(4.0);
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut settings.proxy.url)
+            .hint_text(s.proxy_url_placeholder)
+            .desired_width(360.0),
+    );
+    if resp.changed() {
+        out.proxy_changed = true;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(s.proxy_hint)
+            .size(11.0)
+            .color(pal.fg_dim),
+    );
 }

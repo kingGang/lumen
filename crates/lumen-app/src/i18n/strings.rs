@@ -79,6 +79,8 @@ pub struct Strings {
     pub nav_appearance: &'static str,
     /// 导航 "Keyboard shortcuts"
     pub nav_keyboard_shortcuts: &'static str,
+    /// 导航 "Network"（网络代理）
+    pub nav_network: &'static str,
     /// 导航 "About"
     pub nav_about: &'static str,
     // Account 页
@@ -417,6 +419,16 @@ pub struct Strings {
     pub update_settings_auto_check: &'static str,
     /// 设置页：检查更新按钮
     pub update_btn_check_now: &'static str,
+    /// 设置页「网络」分区标题
+    pub proxy_section: &'static str,
+    /// 设置页：启用代理开关标签
+    pub proxy_enable: &'static str,
+    /// 设置页：代理地址输入框标签
+    pub proxy_url_label: &'static str,
+    /// 设置页：代理地址输入框占位提示
+    pub proxy_url_placeholder: &'static str,
+    /// 设置页：代理格式说明
+    pub proxy_hint: &'static str,
     /// 正在检查更新 toast
     pub update_toast_checking: &'static str,
     /// 已是最新版本 toast

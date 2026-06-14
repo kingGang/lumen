@@ -49,12 +49,16 @@ impl PtySession {
     /// `cwd` 为 shell 初始工作目录（会话恢复用，F4）；None 沿用
     /// 本进程当前目录。调用方需保证目录存在——不存在时子进程会
     /// 启动失败。
+    /// `extra_env` 为追加到子进程环境的键值对（如网络代理变量
+    /// HTTP_PROXY/HTTPS_PROXY/ALL_PROXY），在内置 TERM/COLORTERM 之后
+    /// 注入；空切片即无追加。
     pub fn spawn(
         shell: Option<&str>,
         args: &[String],
         rows: u16,
         cols: u16,
         cwd: Option<&Path>,
+        extra_env: &[(String, String)],
     ) -> Result<(Self, Receiver<PtyEvent>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -76,6 +80,10 @@ impl PtySession {
         // 终端能力声明：上层实现了 256 色与真彩 SGR。
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // 调用方追加的环境（网络代理等）：覆盖同名内置/继承值。
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
 
         let child = pair
             .slave

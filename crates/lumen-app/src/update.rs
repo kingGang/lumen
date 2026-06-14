@@ -166,14 +166,29 @@ fn latest_release_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases/latest")
 }
 
+/// 给 `AgentBuilder` 按需挂网络代理：`proxy` 为完整 URL（http(s)/socks5）。
+/// 地址非法时记 warn 并忽略（回退直连），绝不因代理配置错误而完全断网。
+fn with_proxy(builder: ureq::AgentBuilder, proxy: Option<&str>) -> ureq::AgentBuilder {
+    if let Some(p) = proxy {
+        match ureq::Proxy::new(p) {
+            Ok(px) => return builder.proxy(px),
+            Err(e) => log::warn!("F3：代理地址无效，忽略走直连: {p}（{e}）"),
+        }
+    }
+    builder
+}
+
 /// 请求并解析 GitHub 的 latest Release。失败（网络/HTTP 非 2xx/解析）返回
-/// `Err`。在后台线程内调用（阻塞）。
-fn fetch_release(repo: &str) -> Result<UpdateInfo, String> {
+/// `Err`。在后台线程内调用（阻塞）。`proxy` 为生效的网络代理（None=直连）。
+fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> {
     let url = latest_release_url(repo);
-    let agent = ureq::AgentBuilder::new()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(concat!("Lumen/", env!("CARGO_PKG_VERSION")))
-        .build();
+    let agent = with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(concat!("Lumen/", env!("CARGO_PKG_VERSION"))),
+        proxy,
+    )
+    .build();
     let resp = agent
         .get(&url)
         .set("Accept", "application/json")
@@ -208,9 +223,9 @@ pub enum CheckResult {
 /// 查更新：请求 GitHub latest Release，与当前版本比较裁决。
 /// 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。
 /// 在后台线程内调用（阻塞）。
-pub fn check_for_update() -> CheckResult {
+pub fn check_for_update(proxy: Option<&str>) -> CheckResult {
     let current = current_version();
-    match fetch_release(GITHUB_REPO) {
+    match fetch_release(GITHUB_REPO, proxy) {
         Ok(info) if info.version > current => {
             log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
             CheckResult::Newer(info)
@@ -231,16 +246,20 @@ pub fn check_for_update() -> CheckResult {
 pub fn download_installer(
     url: &str,
     dest: &Path,
+    proxy: Option<&str>,
     mut progress: impl FnMut(u64, Option<u64>),
 ) -> Result<(), String> {
     // timeout_read 防慢响应/中途僵死把下载线程永久挂起（审查 finding：
     // 仅 timeout_connect 不够，连上后 read 默认可无限阻塞）。单次读阻塞
     // 上限 60s（大包逐块读，每块远快于此，不会误杀正常慢速下载）。
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(60))
-        .user_agent(concat!("Lumen/", env!("CARGO_PKG_VERSION")))
-        .build();
+    let agent = with_proxy(
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .user_agent(concat!("Lumen/", env!("CARGO_PKG_VERSION"))),
+        proxy,
+    )
+    .build();
     let result = download_to_file(&agent, url, dest, &mut progress);
     if result.is_err() {
         // 出错清半截文件（同 tag 重下会覆盖，但留半截既占空间又可能被

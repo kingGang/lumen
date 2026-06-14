@@ -279,6 +279,8 @@ pub struct ShellOutput {
     pub update_check_now: bool,
     /// 设置页改了更新设置（auto_check 开关，F3）：main 进 need_save 落盘。
     pub settings_update_changed: bool,
+    /// 设置页改了网络代理（开关/地址）：main 落盘并刷新生效代理镜像。
+    pub settings_proxy_changed: bool,
     /// 头像菜单「更新到 vX」：有就绪更新时显示更新弹窗（main 清 dismissed）。
     pub open_update: bool,
     /// 头像菜单「更新日志」：main 打开 GitHub Releases 页。
@@ -357,6 +359,7 @@ pub fn show(
         completion_closed: false,
         update_check_now: false,
         settings_update_changed: false,
+        settings_proxy_changed: false,
         open_update: false,
         open_whats_new: false,
         open_documentation: false,
@@ -1159,6 +1162,7 @@ pub fn show(
         out.settings_language_changed = s_out.language_changed;
         out.update_check_now = s_out.update_check_now;
         out.settings_update_changed = s_out.update_changed;
+        out.settings_proxy_changed = s_out.proxy_changed;
         if s_out.log_out {
             out.logged_out = true;
         }

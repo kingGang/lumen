@@ -199,6 +199,32 @@ impl Default for UpdateSettings {
     }
 }
 
+/// 网络代理设置（用于检查 / 下载更新等出网请求）。
+///
+/// 单字段 URL：支持 `http://host:port`、`https://host:port`、
+/// `socks5://host:port`（最灵活，覆盖 clash/v2ray 等常见代理）。
+/// 空白 URL 视为未配置——即使 `enabled` 也不生效。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxySettings {
+    /// 是否启用代理。
+    pub enabled: bool,
+    /// 代理 URL（含协议前缀）。
+    pub url: String,
+}
+
+impl ProxySettings {
+    /// 生效的代理 URL：启用且去空白后非空时返回，否则 `None`
+    /// （供 update 等网络请求按需挂 `ureq::Proxy`）。
+    pub fn effective_url(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        let u = self.url.trim();
+        (!u.is_empty()).then_some(u)
+    }
+}
+
 /// 应用设置根结构。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -224,6 +250,9 @@ pub struct Settings {
     /// 热更设置（F3）：`#[serde(default)]` 旧文件无此节时补默认值。
     #[serde(default)]
     pub update: UpdateSettings,
+    /// 网络代理：`#[serde(default)]` 旧文件无此节时补默认值（关闭）。
+    #[serde(default)]
+    pub proxy: ProxySettings,
 }
 
 impl Default for Settings {
@@ -235,6 +264,7 @@ impl Default for Settings {
             language: crate::i18n::Language::default(),
             classic_mode: false,
             update: UpdateSettings::default(),
+            proxy: ProxySettings::default(),
         }
     }
 }
@@ -453,6 +483,17 @@ impl Settings {
                 log::warn!("设置节 update 不是对象，整节降级默认值: {}", path.display());
             }
         }
+        // proxy（网络代理）：旧文件缺整节时静默补默认值；逐字段宽松解析。
+        if let Some(px) = root.get("proxy") {
+            if px.is_object() {
+                let d = ProxySettings::default();
+                s.proxy.enabled =
+                    lenient_field(px, "enabled", "proxy.enabled", d.enabled, path);
+                s.proxy.url = lenient_field(px, "url", "proxy.url", d.url, path);
+            } else {
+                log::warn!("设置节 proxy 不是对象，整节降级默认值: {}", path.display());
+            }
+        }
         s
     }
 
@@ -574,6 +615,11 @@ impl Settings {
             BACKGROUND_DIM_MAX,
             BackgroundSettings::default().dim,
         );
+        // 代理 URL 去首尾空白（用户手改文件 / 粘贴带空格）。
+        let trimmed = self.proxy.url.trim();
+        if trimmed.len() != self.proxy.url.len() {
+            self.proxy.url = trimmed.to_owned();
+        }
     }
 }
 
@@ -680,12 +726,64 @@ mod tests {
                 skip_version: Some("v9.9.9".to_owned()),
                 last_check_ms: Some(123_456),
             },
+            proxy: ProxySettings {
+                enabled: true,
+                url: "http://127.0.0.1:7890".to_owned(),
+            },
         };
         let p = temp_path("roundtrip");
         s.save_to(&p).expect("写盘失败");
         let loaded = Settings::load_from(&p);
         let _ = std::fs::remove_file(&p);
         assert_eq!(loaded, s);
+    }
+
+    #[test]
+    fn 代理_默认关闭且effective为none() {
+        let s = Settings::default();
+        assert!(!s.proxy.enabled);
+        assert!(s.proxy.url.is_empty());
+        assert_eq!(s.proxy.effective_url(), None, "默认无代理");
+    }
+
+    #[test]
+    fn 代理_effective_url规则() {
+        // 启用 + 非空 → Some（去空白）；关闭或空白 → None。
+        let mut p = ProxySettings {
+            enabled: true,
+            url: "  socks5://127.0.0.1:1080  ".to_owned(),
+        };
+        assert_eq!(p.effective_url(), Some("socks5://127.0.0.1:1080"));
+        p.enabled = false;
+        assert_eq!(p.effective_url(), None, "关闭即不生效");
+        p.enabled = true;
+        p.url = "   ".to_owned();
+        assert_eq!(p.effective_url(), None, "纯空白视为未配置");
+    }
+
+    #[test]
+    fn 代理_旧文件缺节补默认() {
+        // 旧 settings.json 无 proxy 节：加载后补默认值（关闭），其余字段不受影响。
+        let p = temp_path("proxy_missing");
+        std::fs::write(&p, r#"{ "appearance": { "font_size": 18.0 } }"#).expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.proxy, ProxySettings::default(), "缺 proxy 节补默认值");
+        assert_eq!(loaded.appearance.font_size, 18.0, "其余字段不受影响");
+    }
+
+    #[test]
+    fn 代理_url去空白() {
+        let p = temp_path("proxy_trim");
+        std::fs::write(
+            &p,
+            r#"{ "proxy": { "enabled": true, "url": "  http://h:1  " } }"#,
+        )
+        .expect("写测试文件失败");
+        let loaded = Settings::load_from(&p);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(loaded.proxy.url, "http://h:1", "加载 sanitize 去首尾空白");
+        assert!(loaded.proxy.enabled);
     }
 
     #[test]

@@ -222,7 +222,9 @@ impl Session {
     /// 自己的有界通道，并以去重信号唤醒事件循环（信号挂起期间不重复
     /// 发，避免事件风暴——协议与单会话时代一致）。
     /// `cwd` 为 shell 初始工作目录（会话恢复用，F4；调用方须先验证
-    /// 目录存在）；None 沿用默认目录。
+    /// 目录存在）；None 沿用默认目录。`net_proxy` 为生效的网络代理 URL
+    /// （None=直连），注入子进程环境。
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: SessionId,
         rows: usize,
@@ -231,14 +233,20 @@ impl Session {
         wake_pending: Arc<AtomicBool>,
         proxy: EventLoopProxy<PtyWake>,
         cwd: Option<&Path>,
+        net_proxy: Option<&str>,
     ) -> Result<Self> {
         let term = Terminal::new(rows, cols, scrollback);
+        // 网络代理（C 方案）：启用时把代理地址注入子进程环境，里面运行的
+        // claude/codex/git/curl/npm 等遵循标准代理变量的程序随之走代理。
+        // 仅对本次新开会话生效（环境在进程启动时固定）。
+        let env = net_proxy.map(proxy_env_vars).unwrap_or_default();
         let (pty, pty_rx) = PtySession::spawn(
             None,
             &shell_integration_args(),
             rows as u16,
             cols as u16,
             cwd,
+            &env,
         )?;
         // per-session 有界通道：主循环持接收端，转发线程持发送端。
         let (tx, rx) = crossbeam_channel::bounded::<PtyEvent>(SESSION_EVENT_CAP);
@@ -430,6 +438,25 @@ impl Session {
             error!("粘贴写入 PTY 失败: {e:#}");
         }
     }
+}
+
+/// 由代理 URL 构造标准代理环境变量并返回键值对。键为 HTTP_PROXY、
+/// HTTPS_PROXY、ALL_PROXY 及其小写形式（共六个），值均为传入的完整
+/// URL（含 http、https 或 socks5 协议前缀）。多数命令行工具（claude
+/// code、codex、git、curl、npm、pip 等）遵循这些变量，故全部注入以
+/// 最大化兼容。
+fn proxy_env_vars(url: &str) -> Vec<(String, String)> {
+    [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ]
+    .iter()
+    .map(|k| ((*k).to_owned(), url.to_owned()))
+    .collect()
 }
 
 /// 生成 shell 启动参数，把集成脚本（OSC 133 命令边界 + OSC 9;9 cwd 上报）

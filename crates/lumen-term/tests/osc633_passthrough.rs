@@ -77,6 +77,7 @@ fn osc633_e_透传验证() {
         24,
         220,
         None,
+        &[],
     )
     .expect("启动 pwsh.exe 失败——请确认 pwsh.exe 在 PATH 中");
 

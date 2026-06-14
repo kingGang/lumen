@@ -63,6 +63,7 @@ fn bracketed_paste_多行整体执行验证() {
         30,
         120,
         None,
+        &[],
     )
     .expect("启动 pwsh.exe 失败——请确认 pwsh.exe 在 PATH 中");
 

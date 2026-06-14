@@ -549,6 +549,9 @@ struct AppState {
     /// auto_check 设置的原子镜像：供运行期定时检查线程读取（设置页开关
     /// 改动时同步），关闭后定时线程跳过本轮，不再打网络。
     update_auto_check: Arc<AtomicBool>,
+    /// 生效代理 URL 的镜像（None=直连）：供定时检查线程读取，设置页改动时
+    /// 同步刷新。与 `update_auto_check` 同模式（值为 String 故用 Mutex）。
+    update_proxy: Arc<std::sync::Mutex<Option<String>>>,
 
     // —— egui 外壳 ——
     egui_ctx: egui::Context,
@@ -1680,8 +1683,9 @@ impl AppState {
         }
         let tx = self.update_tx.clone();
         let proxy = self.proxy.clone();
+        let net_proxy = self.settings.proxy.effective_url().map(str::to_owned);
         std::thread::spawn(move || {
-            let msg = match update::check_for_update() {
+            let msg = match update::check_for_update(net_proxy.as_deref()) {
                 update::CheckResult::Newer(info) => update::UpdateMsg::Available(info),
                 update::CheckResult::UpToDate if manual => update::UpdateMsg::UpToDate,
                 update::CheckResult::Failed if manual => update::UpdateMsg::CheckFailed,
@@ -1705,6 +1709,7 @@ impl AppState {
         let tx = self.update_tx.clone();
         let proxy = self.proxy.clone();
         let enabled = self.update_auto_check.clone();
+        let net_proxy = self.update_proxy.clone();
         let _ = std::thread::Builder::new()
             .name("lumen-update-poll".into())
             .spawn(move || loop {
@@ -1712,7 +1717,9 @@ impl AppState {
                 if !enabled.load(Ordering::Relaxed) {
                     continue; // 用户已关自动检查：本轮不打网络
                 }
-                if let update::CheckResult::Newer(info) = update::check_for_update() {
+                // 读最新生效代理镜像（设置页改动会同步刷新；锁中毒则退化直连）。
+                let p = net_proxy.lock().ok().and_then(|g| g.clone());
+                if let update::CheckResult::Newer(info) = update::check_for_update(p.as_deref()) {
                     if tx.send(update::UpdateMsg::Available(info)).is_err() {
                         break; // 主循环已退出、通道关闭
                     }
@@ -1730,11 +1737,12 @@ impl AppState {
         }
         let tx = self.update_tx.clone();
         let proxy = self.proxy.clone();
+        let net_proxy = self.settings.proxy.effective_url().map(str::to_owned);
         let url = info.download_url.clone();
         let dest = update::installer_dest(&info.tag);
         self.update_downloading = true;
         std::thread::spawn(move || {
-            let msg = match update::download_installer(&url, &dest, |_d, _t| {}) {
+            let msg = match update::download_installer(&url, &dest, net_proxy.as_deref(), |_d, _t| {}) {
                 Ok(()) => update::UpdateMsg::DownloadDone(dest),
                 Err(e) => update::UpdateMsg::DownloadFailed(e),
             };
@@ -2009,6 +2017,7 @@ impl AppState {
             self.wake_pending.clone(),
             self.proxy.clone(),
             cwd.as_deref(),
+            self.settings.proxy.effective_url(),
         ) {
             Ok(s) => {
                 // 原位替换：旧 Session 随赋值 Drop（杀旧进程——已退出）。
@@ -2044,6 +2053,7 @@ impl AppState {
             self.wake_pending.clone(),
             self.proxy.clone(),
             None,
+            self.settings.proxy.effective_url(),
         ) {
             Ok(s) => {
                 let tab_id = self.next_tab_id;
@@ -2150,6 +2160,7 @@ impl AppState {
             self.wake_pending.clone(),
             self.proxy.clone(),
             cwd.as_deref(),
+            self.settings.proxy.effective_url(),
         ) {
             Ok(s) => {
                 let tab = &mut self.tabs[self.active_tab];
@@ -2612,6 +2623,7 @@ impl App {
                         wake_pending.clone(),
                         self.proxy.clone(),
                         cwd,
+                        app_settings.proxy.effective_url(),
                     ) {
                         Ok(s) => {
                             next_session_id += 1;
@@ -2678,6 +2690,7 @@ impl App {
                     wake_pending.clone(),
                     self.proxy.clone(),
                     None,
+                    app_settings.proxy.effective_url(),
                 )?],
                 focused: 0,
                 layout: PaneLayout::uniform(1),
@@ -2709,6 +2722,8 @@ impl App {
         let init_force_fallback = app_settings.classic_mode;
         // auto_check 初值（app_settings 随后 move 进 settings 字段，先取出）。
         let init_auto_check = app_settings.update.auto_check;
+        // 生效代理初值（同上，先取出 owned）。
+        let init_proxy = app_settings.proxy.effective_url().map(str::to_owned);
 
         // F3：后台更新线程 → 主循环的消息通道。
         let (update_tx, update_rx) = crossbeam_channel::unbounded();
@@ -2745,6 +2760,7 @@ impl App {
             update_ready: None,
             update_dismissed: false,
             update_auto_check: Arc::new(AtomicBool::new(init_auto_check)),
+            update_proxy: Arc::new(std::sync::Mutex::new(init_proxy)),
             egui_ctx,
             egui_state,
             egui_renderer,
@@ -5418,6 +5434,7 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_background_params_changed
                     || shell_out.settings_language_changed
                     || shell_out.settings_update_changed
+                    || shell_out.settings_proxy_changed
                     || sidebar_changed
                     || filetree_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。
@@ -5425,6 +5442,13 @@ impl ApplicationHandler<PtyWake> for App {
                     state
                         .update_auto_check
                         .store(state.settings.update.auto_check, Ordering::Relaxed);
+                }
+                // 网络代理改动 → 刷新生效代理镜像（定时检查线程下轮即用；
+                // 手动检查/下载每次从 settings 取，不依赖此镜像）。
+                if shell_out.settings_proxy_changed {
+                    if let Ok(mut g) = state.update_proxy.lock() {
+                        *g = state.settings.proxy.effective_url().map(str::to_owned);
+                    }
                 }
                 // F3：设置页「检查更新」按钮 → 手动检查（无更新/失败也回 toast）。
                 // 手动检查清掉「已消解/已知版本」状态：用户主动检查即视为想重新

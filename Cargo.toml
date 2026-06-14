@@ -86,7 +86,7 @@ rfd = { version = "0.15", default-features = false }
 # HTTP 客户端（F3 热更）：同步、轻量，后台线程内阻塞请求 GitHub/Gitee
 # Release API 并下载安装包。自带 rustls TLS（不依赖系统 OpenSSL）。HTTP+TLS
 # 自实现成本高且无法离线 E2E 测试，选成熟库以最大化首次正确率。
-ureq = "2"
+ureq = { version = "2", features = ["socks-proxy"] }
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。
