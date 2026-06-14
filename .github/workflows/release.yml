@@ -33,11 +33,6 @@ jobs:
     steps:
       - name: 检出
         uses: actions/checkout@v4
-        with:
-          # 取全历史 + tag 对象：否则浅克隆下 annotated tag 的注释取不到，
-          # 「提取更新说明」的 git for-each-ref %(contents) 会回退成 commit 消息。
-          fetch-depth: 0
-          fetch-tags: true
 
       - name: 安装 Rust（stable）
         uses: dtolnay/rust-toolchain@stable
@@ -92,13 +87,24 @@ jobs:
 
       # 更新说明取自 annotated tag 的注释正文（发版时手写的面向用户中文
       # changelog）。客户端 update.rs 把它原样展示在「发现新版本」弹窗里，
-      # 故**不能**用 SHA256/自动生成的 compare 链接等技术噪音（海风哥 2026-
-      # 06-14：更新内容要给用户看）。tag 无注释时回落版本名。
-      - name: 提取更新说明（tag 注释）
+      # 故**不能**用 SHA256/自动生成的 compare 链接等技术噪音。
+      #
+      # **经 GitHub API 读取**（不走本地 git）：actions/checkout 浅克隆会把
+      # annotated tag 退化成轻量 tag（指向 commit），`git for-each-ref
+      # %(contents)` 会误取 commit 消息（v0.1.4 实测踩过，即便加 fetch-tags
+      # 仍如此）。API 直接读 tag 对象的 message，不受本地 tag 类型影响。
+      - name: 提取更新说明（annotated tag，经 GitHub API）
         id: notes
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = (git for-each-ref "refs/tags/${{ github.ref_name }}" --format='%(contents)') -join "`n"
+          $ref = gh api "repos/${{ github.repository }}/git/refs/tags/${{ github.ref_name }}" | ConvertFrom-Json
+          $notes = if ($ref.object.type -eq 'tag') {
+            (gh api "repos/${{ github.repository }}/git/tags/$($ref.object.sha)" | ConvertFrom-Json).message
+          } else {
+            "Lumen ${{ github.ref_name }}"
+          }
           if ([string]::IsNullOrWhiteSpace($notes)) { $notes = "Lumen ${{ github.ref_name }}" }
           $path = Join-Path $env:RUNNER_TEMP "release_notes.txt"
           Set-Content -LiteralPath $path -Value $notes -Encoding utf8
