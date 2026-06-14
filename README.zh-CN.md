@@ -150,4 +150,4 @@ crates/
 
 ## 📄 许可
 
-[MIT](LICENSE) © jimhy
+[Apache-2.0](LICENSE) © jimhy

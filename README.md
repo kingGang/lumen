@@ -175,4 +175,4 @@ See [docs/架构设计.md](docs/架构设计.md) and
 
 ## 📄 License
 
-[MIT](LICENSE) © jimhy
+[Apache-2.0](LICENSE) © jimhy
