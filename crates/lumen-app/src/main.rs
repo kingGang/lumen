@@ -4585,6 +4585,9 @@ impl ApplicationHandler<PtyWake> for App {
                         let s = crate::i18n::strings();
                         let p = &modal_pal;
                         egui::Modal::new(egui::Id::new("lumen_update_modal"))
+                            // backdrop 透明：不 dim 背景（海风哥 2026-06-14：弹窗
+                            // 背景不要半透明；对话框本体仍 bg_dark 实色 + 边框）。
+                            .backdrop_color(egui::Color32::TRANSPARENT)
                             .frame(
                                 egui::Frame::new()
                                     .fill(p.bg_dark)

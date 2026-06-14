@@ -1355,7 +1355,7 @@ fn sidebar_ui(
 
                 // 两行条目（F7②样式）：左终端图标 + 名称行 + 路径行。
                 // 激活=selection 底（控件梯度最高档，一眼可辨），悬停=
-                // bg_highlight；圆角 6。
+                // bg_highlight；圆角 2（海风哥 2026-06-14：6 太大）。
                 const ROW_H: f32 = 46.0;
                 const ICON_COL: f32 = 30.0;
                 let (rect, mut resp) = ui.allocate_exact_size(
@@ -1370,7 +1370,7 @@ fn sidebar_ui(
                     egui::Color32::TRANSPARENT
                 };
                 if bg != egui::Color32::TRANSPARENT {
-                    ui.painter().rect_filled(rect, 6.0, bg);
+                    ui.painter().rect_filled(rect, 2.0, bg);
                 }
                 // 左侧图标（垂直居中于行）：有真实程序图标则画纹理，
                 // 否则回退自绘终端字形。

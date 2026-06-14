@@ -332,6 +332,12 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     v.error_fg_color = pal.error;
     v.window_corner_radius = egui::CornerRadius::same(10);
     v.window_stroke = egui::Stroke::new(1.0, pal.bg_highlight);
+    // 弹窗/菜单/窗口去半透明投影（海风哥 2026-06-14：弹窗背景不要半透明）。
+    // egui 默认 window/popup_shadow 是 from_black_alpha(96) 的柔和黑投影，把弹窗
+    // 周围终端内容压暗、显半透明观感；改无投影，靠上面 window_stroke 实色边框
+    // 区隔（弹窗 body 本就是 window_fill=bg_panel 实色，无 alpha）。
+    v.window_shadow = egui::Shadow::NONE;
+    v.popup_shadow = egui::Shadow::NONE;
 
     // 控件状态梯度（核心诉求「按钮要明显」）：平时 btn_bg → 悬停
     // bg_highlight → 按下/选中 selection，深色逐级递亮、浅色递深。
