@@ -1087,13 +1087,15 @@ pub fn show(
             }
 
             // P16b：命令行区（CentralPanel 整体）轮廓描边——右/上/下三边。
-            // 使用 Foreground 层 painter：egui 在帧末将 Foreground 层叠在
-            // 所有面板内容（终端纹理贴图、窗格标题栏等）之上，确保描边
-            // 可见（P16b 问题3 修复——原来画的时机比终端纹理早，被盖住）。
-            // 不画左边：文件树栏右边线即为本区左边线，共享边不重复画。
+            // 用 **Middle 层** painter：高于 Background（终端纹理贴图、窗格标题
+            // 栏等都在 Background，故描边盖在其上、可见——P16b 问题3 要求），但
+            // **低于 Foreground**（toast / 头像菜单 / 各弹窗 / 模态框都是
+            // Foreground），故描边不再盖在这些弹窗之上（海风哥 2026-06-14：底部
+            // 描边线显示在弹窗上面——下边线在终端区/状态栏边界，原 Foreground 与
+            // toast 同层冲突）。不画左边：文件树栏右边线即为本区左边线。
             {
                 let fg_painter = ui.ctx().layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
+                    egui::Order::Middle,
                     egui::Id::new("central_panel_outline"),
                 ));
                 let hw = 0.5 / ppp;
