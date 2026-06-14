@@ -54,8 +54,8 @@ const LEFT_GROUP_MARGIN: f32 = 10.0;
 const VIEW_BTN_GAP: f32 = 4.0;
 /// 头像直径。
 const AVATAR_SIZE: f32 = 24.0;
-/// 下拉菜单宽度。
-const MENU_WIDTH: f32 = 190.0;
+/// 下拉菜单宽度（set_min_width 强撑生效后 304 偏宽，海风哥反馈砍半）。
+const MENU_WIDTH: f32 = 152.0;
 
 /// 一帧顶栏 UI 的产出。
 #[derive(Default)]
@@ -282,7 +282,7 @@ pub fn show(
 
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);
-                let resp = avatar_button(ui, profile, pal);
+                let resp = avatar_button(ui, profile, pal, view.update_version.is_some());
                 let update_version = view.update_version.as_deref();
                 let _ = egui::Popup::menu(&resp)
                     .align(egui::RectAlign::BOTTOM_END)
@@ -530,7 +530,13 @@ fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette)
 }
 
 /// 圆形头像按钮：已登录 = 强调色圆底 + 首字母；未登录 = 占位人形。
-fn avatar_button(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette) -> egui::Response {
+/// `has_update` 为真时右上角叠一个小红圆点（有可用更新提示）。
+fn avatar_button(
+    ui: &mut egui::Ui,
+    profile: Option<&Profile>,
+    pal: &Palette,
+    has_update: bool,
+) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(AVATAR_SIZE, AVATAR_SIZE), egui::Sense::click());
     let center = rect.center();
@@ -564,6 +570,15 @@ fn avatar_button(ui: &mut egui::Ui, profile: Option<&Profile>, pal: &Palette) ->
         ui.painter()
             .circle_stroke(center, radius, egui::Stroke::new(1.5, pal.fg_dim));
     }
+    // 有可用更新：右上角小红圆点。先垫一圈顶栏底色再填红，确保在 accent
+    // 头像底 / 顶栏底上都清晰可辨。
+    if has_update {
+        let dot = egui::pos2(center.x + radius * 0.66, center.y - radius * 0.66);
+        let dot_r = 3.5;
+        ui.painter().circle_filled(dot, dot_r + 1.2, pal.bg_dark);
+        ui.painter()
+            .circle_filled(dot, dot_r, egui::Color32::from_rgb(0xE5, 0x48, 0x4D));
+    }
     resp.on_hover_text(profile.map_or_else(
         || i18n::strings().topbar_not_logged_in.to_owned(),
         |p| p.email.clone(),
@@ -581,6 +596,9 @@ fn menu_ui(
     out: &mut TopbarOutput,
 ) {
     let s = i18n::strings();
+    // 强制菜单内容区最小宽度：`Popup::menu().width()` 仅作建议，内容窄时
+    // 菜单仍按内容收窄（海风哥反馈菜单太窄即此因），这里硬撑到 MENU_WIDTH。
+    ui.set_min_width(MENU_WIDTH);
     // 顶部：已登录展示名（灰字不可点）+ 分隔线。
     if let Some(p) = profile {
         ui.add_enabled(
