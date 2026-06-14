@@ -1530,7 +1530,7 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
 name = "lumen-app"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1558,7 +1558,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-editor"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-pty"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-renderer"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1593,7 +1593,7 @@ dependencies = [
 
 [[package]]
 name = "lumen-term"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bitflags 2.13.0",
  "crossbeam-channel",
