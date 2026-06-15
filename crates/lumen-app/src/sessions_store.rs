@@ -46,6 +46,10 @@ fn legacy_format_version() -> u32 {
 pub struct PaneEntry {
     /// 最后上报的 cwd（OSC 9;9）；恢复时作为 shell 初始工作目录。
     pub cwd: Option<PathBuf>,
+    /// 窗格用户自定义名（需求2）：双击/右键标题栏重命名后的名字；空白
+    /// /缺失（旧配置）反序列化为 None（容器级 #[serde(default)] 保证向后
+    /// 兼容）。非空时窗格标题优先显示它。
+    pub custom_title: Option<String>,
 }
 
 impl PaneEntry {
@@ -184,7 +188,10 @@ impl SessionsFile {
                 .drain(..)
                 .map(|e| TabEntry {
                     custom_title: e.custom_title,
-                    panes: vec![PaneEntry { cwd: e.cwd }],
+                    panes: vec![PaneEntry {
+                        cwd: e.cwd,
+                        custom_title: None,
+                    }],
                     focused: 0,
                     // 旧平铺条目无布局概念：空权重 = 恢复侧均分。
                     ..Default::default()
@@ -275,6 +282,7 @@ mod tests {
     fn pane(cwd: Option<&str>) -> PaneEntry {
         PaneEntry {
             cwd: cwd.map(PathBuf::from),
+            custom_title: None,
         }
     }
 
@@ -559,6 +567,7 @@ mod tests {
         std::fs::write(&file_path, b"x").expect("写测试文件失败");
         let not_dir = PaneEntry {
             cwd: Some(file_path.clone()),
+            custom_title: None,
         };
         let usable = not_dir.usable_cwd().is_none();
         let _ = std::fs::remove_file(&file_path);

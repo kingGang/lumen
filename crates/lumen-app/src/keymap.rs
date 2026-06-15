@@ -259,28 +259,25 @@ pub fn lookup_input(
         return None;
     }
 
-    // ── 层 5（安全规则最高优先）：Ctrl+C 中断 / 复制分场景 ──────────────────
-    // Running（命令运行中）/ AltScreen（全屏 TUI）：无条件 Interrupt——运行中
-    // 中断优先，决不被选区拦截（跑飞进程必须可杀、TUI 必须收 SIGINT）。
-    // Fallback（集成未生效、无 OSC 133、分不清待命/运行）：折中——有终端选区/
-    // 选中块先复制（CopySelection/CopyBlock 复制后即清选区，下次 Ctrl+C 即
-    // 中断），无任何选择才中断。Compose（提示符待命）走层 9：有选区复制。
-    // 理想体验「待命复制 + 运行无条件中断」需 shell 集成生效（进 Compose/Running）。
+    // ── 层 5（安全规则最高优先）：Ctrl+C 复制 / 中断分场景 ──────────────────
+    // Running（命令运行中）/ AltScreen（全屏 TUI）/ Fallback（集成未生效）三态
+    // 统一为标准终端惯例：有终端选区/选中块先复制（CopySelection/CopyBlock 复制
+    // 后即清选区，下次 Ctrl+C 即中断），无任何选择才 Interrupt。Compose（提示符
+    // 待命）走层 9：同样有选区复制。海风哥反馈：claude code 等全屏 TUI 选中文本
+    // Ctrl+C 必须能复制（对标 PowerShell / Windows Terminal），不再「运行中无条件
+    // 中断」——中断仍随时可达（复制是一次性让路，清选区/无选区再按即中断）。
     if ctrl && is_char(input, 'c') && !shift {
         match mode {
-            // 运行中 / 全屏 TUI：无条件 Interrupt——命令运行中 Ctrl+C 必须可靠
-            // 中断（杀跑飞进程 / 让 TUI 收 SIGINT），决不被选区拦截。选区复制
-            // 在提示符待命（Compose 态层 9）进行，或用右键。
-            InputMode::Running | InputMode::AltScreen => {
-                return Some(LookupResult::TerminalAction(Action::Term(
-                    TermAction::Interrupt,
-                )));
-            }
-            // Fallback（集成未生效，无 OSC 133、分不清待命/运行）：折中——有
-            // 终端选区/选中块先复制（复制后清选区，下次 Ctrl+C 即中断），无任
-            // 何选择才中断。理想的「待命复制 + 运行无条件中断」需 shell 集成
-            // 生效进入 Compose/Running 态。
-            InputMode::Fallback => {
+            // Running（命令运行中）/ AltScreen（全屏 TUI）/ Fallback（集成未生效）
+            // 三态统一为标准终端惯例（对标 PowerShell / Windows Terminal，海风哥
+            // 反馈：claude code 等全屏 TUI 里选中文本 Ctrl+C 应能复制，而非直通
+            // 中断）——有终端选区 → 复制选区；无选区但有选中块 → 复制块输出；
+            // 无任何选择 → Interrupt。
+            //
+            // 中断仍随时可达：复制是一次性动作，CopySelection/CopyBlock 复制后
+            // 立即清选区（见 main.rs），故再按一次 Ctrl+C 即落到 Interrupt——想杀
+            // 跑飞进程 / 给 TUI 发 SIGINT，清掉选区（或本就无选区）再按即可。
+            InputMode::Running | InputMode::AltScreen | InputMode::Fallback => {
                 if guard.has_selection {
                     return Some(LookupResult::TerminalAction(Action::Term(
                         TermAction::CopySelection,
@@ -789,10 +786,9 @@ mod tests {
     }
 
     #[test]
-    fn safety_ctrl_c_running_with_selection_is_interrupt() {
-        // Running 态（命令运行中）安全规则：即使有选区也无条件 Interrupt——
-        // 运行中中断优先，不被选区拦截（跑飞进程必须可杀）。选区复制在提示符
-        // 待命（Compose 态）进行。
+    fn ctrl_c_running_with_selection_is_copy_selection() {
+        // 海风哥反馈后变更：Running 态（命令运行中）有终端选区时 Ctrl+C 先复制
+        // 选区（对标 PowerShell/Windows Terminal），复制后清选区、再按即中断。
         let guard = GuardState {
             terminal_focused: true,
             has_selection: true,
@@ -809,10 +805,36 @@ mod tests {
             matches!(
                 result,
                 Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopySelection
+                )))
+            ),
+            "Running 态 Ctrl+C 有选区应复制选区（复制后清选区，再按即中断）"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_running_no_selection_is_interrupt() {
+        // 中断可达性铁律：Running 无任何选择时 Ctrl+C 仍直接 Interrupt，
+        // 保证跑飞进程随时可杀（复制是有选区时的一次性让路）。
+        let guard = GuardState {
+            terminal_focused: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::Running,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
                     TermAction::Interrupt
                 )))
             ),
-            "Running 态 Ctrl+C 即使有选区也应 Interrupt（运行中中断优先）"
+            "Running 态 Ctrl+C 无选区应 Interrupt（中断随时可达）"
         );
     }
 
@@ -869,9 +891,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_alt_screen_with_selection_still_interrupt() {
-        // AltScreen 态刻意排除：即使有选区也无条件 Interrupt，让 TUI 立即收
-        // Ctrl+C（右键仍可复制）。锁定这一刻意取舍。
+    fn ctrl_c_alt_screen_with_selection_is_copy_selection() {
+        // 海风哥反馈后变更：AltScreen（claude code 等全屏 TUI）有终端选区时
+        // Ctrl+C 先复制选区（对标 PowerShell/Windows Terminal），复制后清选区、
+        // 再按即给 TUI 发 SIGINT。无选区时仍直接 Interrupt（见下方用例）。
         let guard = GuardState {
             terminal_focused: true,
             is_alt_screen: true,
@@ -889,10 +912,37 @@ mod tests {
             matches!(
                 result,
                 Some(LookupResult::TerminalAction(Action::Term(
+                    TermAction::CopySelection
+                )))
+            ),
+            "AltScreen 态 Ctrl+C 有选区应复制选区（复制后清选区，再按即中断）"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_alt_screen_no_selection_is_interrupt() {
+        // 中断可达性铁律：AltScreen 无任何选择时 Ctrl+C 仍直接 Interrupt，
+        // 保证全屏 TUI 随时可收 SIGINT（复制是有选区时的一次性让路）。
+        let guard = GuardState {
+            terminal_focused: true,
+            is_alt_screen: true,
+            ..Default::default()
+        };
+        let result = lookup_char(
+            "c",
+            ModifiersState::CONTROL,
+            InputMode::AltScreen,
+            true,
+            &guard,
+        );
+        assert!(
+            matches!(
+                result,
+                Some(LookupResult::TerminalAction(Action::Term(
                     TermAction::Interrupt
                 )))
             ),
-            "AltScreen 态 Ctrl+C 即使有选区也应 Interrupt（刻意排除）"
+            "AltScreen 态 Ctrl+C 无选区应 Interrupt（中断随时可达）"
         );
     }
 

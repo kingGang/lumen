@@ -1129,6 +1129,13 @@ impl Renderer {
                             // fg_dim = 前景色 50% alpha（与外壳 fg_dim 同语义）。
                             let dim_color = glyphon::Color::rgba(fg.0, fg.1, fg.2, 128);
                             let dim_attrs = base_attrs.clone().color(dim_color);
+                            // ghost（历史联想/推荐文本）紧贴用户输入右侧，50% alpha
+                            // 与用户输入（满 alpha）仍偏接近、不易分辨（海风哥反馈）；
+                            // 单独用更低 alpha（约 31%）压暗，明显区分「已输入」与
+                            // 「联想建议」。placeholder 独占空行、不与用户文字相邻，
+                            // 维持 dim 不动。
+                            let ghost_color = glyphon::Color::rgba(fg.0, fg.1, fg.2, 80);
+                            let ghost_attrs = base_attrs.clone().color(ghost_color);
 
                             // placeholder：仅当所有行均为空时显示。
                             let all_empty = cv.lines.iter().all(|l| l.is_empty());
@@ -1192,7 +1199,7 @@ impl Renderer {
                                         buf.set_text(
                                             &mut self.font_system,
                                             ghost,
-                                            &dim_attrs,
+                                            &ghost_attrs,
                                             Shaping::Advanced,
                                             None,
                                         );

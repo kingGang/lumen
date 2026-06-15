@@ -288,11 +288,12 @@ pub struct Strings {
     /// 关闭经典直通模式的 toast（Ctrl+Shift+E 关闭）
     pub toast_fallback_disabled: &'static str,
 
-    // ── M4.1 批C：footer 状态条文案（input-editor feature）──────────
-    // 字段在 feature 剔除时不被读取（dead_code）；用 cfg_attr 消除警告，
-    // 字段仍保留在 struct 内（三语编译期完备性要求不能 cfg 删字段）。
-    /// Running 态状态条主文案（等高状态条中央文本）
-    #[cfg_attr(not(feature = "input-editor"), allow(dead_code))]
+    // ── M4.1 批C：footer 状态条文案（已停用，保留供三语完备性）──────────
+    // 海风哥反馈后 Running 态 footer 改为隐藏（见 composer.rs），本文案不再被
+    // 任何代码读取；字段仍保留在 struct 内——删它会让 zh_cn/zh_tw/en 三语实例
+    // 编译报错（Strings 完备性约束），故无条件 allow(dead_code)。
+    /// Running 态状态条主文案（旧·已停用：Running footer 现为隐藏，不再渲染）。
+    #[allow(dead_code)]
     pub footer_running_text: &'static str,
 
     // ── M4.1 批D1：Compose 态键位占位提示 ──────────────────────────

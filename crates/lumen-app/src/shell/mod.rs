@@ -58,6 +58,13 @@ pub struct ShellState {
     pub renaming: Option<(u64, String)>,
     /// 重命名刚开始，下一帧把焦点交给编辑框。
     rename_focus: bool,
+    /// 进行中的窗格重命名（需求2）：(窗格会话 id, 编辑中文本)。与侧栏
+    /// tab renaming 并行的独立状态——窗格按【稳定 id】定位（非下标，
+    /// 避免后台 shell 异步退出 close_pane 重排下标后失配，致编辑框永不
+    /// 重绘、pane_renaming 永久 Some、终端键盘死锁）。编辑期间键盘归 egui。
+    pub pane_renaming: Option<(u64, String)>,
+    /// 窗格重命名刚开始，下一帧把焦点交给标题栏编辑框。
+    pane_rename_focus: bool,
     /// 文件树（树根/展开/可见性等跨帧状态）。
     pub filetree: filetree::FileTreeState,
     /// 设置页（开关/分类/字体编辑缓冲等跨帧状态）。
@@ -74,6 +81,9 @@ pub struct ShellState {
 
 /// 激活 tab 中一个窗格的展示数据（终端工作区分屏用，F5）。
 pub struct PaneView {
+    /// 窗格稳定会话 id（= Session.id）：窗格重命名按 id 定位（需求2），
+    /// 避免下标随异步增删/换位失配致死锁或改错窗格。
+    pub id: u64,
     /// 窗格离屏纹理的 egui 句柄（注册失败的极端情况为 None，该
     /// 窗格本帧只占位不画图像）。
     pub tex: Option<egui::TextureId>,
@@ -225,6 +235,11 @@ pub struct ShellOutput {
     /// 别处取消时为 false——main 只在键盘结束时把焦点还给终端，
     /// 点击结束时尊重鼠标仲裁的结果（点面板不抢回焦点）。
     pub rename_ended_by_key: bool,
+    /// 提交的窗格重命名（需求2）：(窗格会话 id, 新名字)。空字符串 = 清除
+    /// 自定义名（回退默认标题）。按窗格【稳定 id】定位（同 tab 的 id 语义）。
+    pub pane_rename: Option<(u64, String)>,
+    /// 窗格重命名编辑本帧以**键盘**结束（语义同 rename_ended_by_key）。
+    pub pane_rename_ended_by_key: bool,
     /// 点击了「新建会话」。
     pub new_session: bool,
     /// 文件树：激活了目录且 shell 空闲，请求向焦点窗格注入 cd。
@@ -336,6 +351,8 @@ pub fn show(
         close: None,
         rename: None,
         rename_ended_by_key: false,
+        pane_rename: None,
+        pane_rename_ended_by_key: false,
         new_session: false,
         cd_dir: None,
         open_file: None,
@@ -384,6 +401,19 @@ pub fn show(
         // 编辑框已随会话消失，视同键盘结束：焦点交还终端（否则键盘
         // 焦点悬空，用户必须再点一次终端区才能打字）。
         out.rename_ended_by_key = true;
+    }
+    // 同理清窗格重命名孤儿态（需求2）：目标窗格已关闭（含后台 shell 异步
+    // 退出走 close_pane）或已切到别的 tab（不在当前 input.panes 里）时，
+    // 编辑框永不渲染也永不失焦，pane_renaming 会永久 Some——main 焦点仲裁
+    // 据此每帧强制 terminal_focused=false、guard.renaming 恒真，终端键盘被
+    // 永久锁死。按【id】比对清孤儿，视同键盘结束交还焦点（对标 tab）。
+    if st
+        .pane_renaming
+        .as_ref()
+        .is_some_and(|(id, _)| !input.panes.iter().any(|p| p.id == *id))
+    {
+        st.pane_renaming = None;
+        out.pane_rename_ended_by_key = true;
     }
 
     // —— 顶栏（先于侧栏加入面板布局，横贯整窗）：标题 + 头像菜单 ——
@@ -911,44 +941,101 @@ pub fn show(
                     egui::pos2(title_hit.min.x + 8.0, title_hit.min.y),
                     title_hit.max,
                 );
-                let mut title_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(text_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                );
-                title_ui.add(
-                    egui::Label::new(egui::RichText::new(&pane.title).size(12.0).color(bar_fg))
+                // 窗格标题栏（需求2）：重命名中画行内 TextEdit，否则画
+                // 标题 Label（点击聚焦 / 双击进重命名 / 右键菜单重命名 /
+                // 拖动换位）。镜像侧栏标签重命名机制（见 sidebar_ui），
+                // 窗格用下标 i 定位（侧栏用会话 id）。
+                let is_pane_renaming =
+                    st.pane_renaming.as_ref().is_some_and(|(id, _)| *id == pane.id);
+                if is_pane_renaming {
+                    // 行内编辑框替代标题：Enter 提交、Esc 或点击别处取消
+                    // （三种情况 TextEdit 都失焦）。缓冲取自 st.pane_renaming
+                    // （pane 是不可变借用，不能改 pane.title）。
+                    if let Some((_, buf)) = st.pane_renaming.as_mut() {
+                        let mut edit_ui = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(text_rect)
+                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                        );
+                        let resp = edit_ui
+                            .add(egui::TextEdit::singleline(buf).desired_width(f32::INFINITY));
+                        if st.pane_rename_focus {
+                            resp.request_focus();
+                            st.pane_rename_focus = false;
+                        }
+                        if resp.lost_focus() {
+                            // 与侧栏 tab 重命名同构：键盘（Enter/Esc）结束才让
+                            // main 把焦点还终端；点击别处取消尊重鼠标仲裁。
+                            let by_key = ui.input(|inp| {
+                                inp.key_pressed(egui::Key::Enter)
+                                    || inp.key_pressed(egui::Key::Escape)
+                            });
+                            if ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                                // 空名 = 清除自定义名（main 据空串回退默认标题）。
+                                out.pane_rename = Some((pane.id, buf.trim().to_owned()));
+                            }
+                            out.pane_rename_ended_by_key = by_key;
+                            st.pane_renaming = None;
+                        }
+                    }
+                } else {
+                    let mut title_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(text_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    title_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&pane.title).size(12.0).color(bar_fg),
+                        )
                         .truncate()
                         .selectable(false),
-                );
-                let tresp = ui.interact(
-                    title_hit,
-                    ui.id().with(("pane_title", i)),
-                    egui::Sense::click_and_drag(),
-                );
-                if tresp.clicked() {
-                    out.pane_clicked = Some(i);
-                    out.term_clicked = true;
-                }
-                // 拖动换位（F7②）：仅多窗格时有交换对象；最大化期间
-                // 只剩一格可见、无落点，禁用（P14）。悬停标题栏给
-                // Grab 光标提示可拖；拖动中/松手的状态循环后处理。
-                if input.panes.len() > 1 && maximized.is_none() {
-                    if tresp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    );
+                    let tresp = ui.interact(
+                        title_hit,
+                        ui.id().with(("pane_title", i)),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if tresp.clicked() {
+                        out.pane_clicked = Some(i);
+                        out.term_clicked = true;
                     }
-                    if tresp.dragged() {
-                        if let Some(p) = tresp.interact_pointer_pos() {
-                            title_drag = Some((i, p));
+                    // 双击标题进重命名（需求2）：以当前显示标题为编辑初值，
+                    // 下一帧把焦点交给编辑框。
+                    if tresp.double_clicked() {
+                        st.pane_renaming = Some((pane.id, pane.title.clone()));
+                        st.pane_rename_focus = true;
+                    }
+                    // 右键菜单「重命名」（需求2，复用 i18n menu_rename）。
+                    // context_menu 取 &self，放在下方 on_hover_text（移动
+                    // tresp）之前。
+                    tresp.context_menu(|ui| {
+                        if ui.button(crate::i18n::strings().menu_rename).clicked() {
+                            st.pane_renaming = Some((pane.id, pane.title.clone()));
+                            st.pane_rename_focus = true;
+                            ui.close();
                         }
-                    } else if tresp.drag_stopped() {
-                        if let Some(p) = tresp.interact_pointer_pos() {
-                            title_drop = Some((i, p));
+                    });
+                    // 拖动换位（F7②）：仅多窗格时有交换对象；最大化期间
+                    // 只剩一格可见、无落点，禁用（P14）。悬停标题栏给
+                    // Grab 光标提示可拖；拖动中/松手的状态循环后处理。
+                    if input.panes.len() > 1 && maximized.is_none() {
+                        if tresp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                        }
+                        if tresp.dragged() {
+                            if let Some(p) = tresp.interact_pointer_pos() {
+                                title_drag = Some((i, p));
+                            }
+                        } else if tresp.drag_stopped() {
+                            if let Some(p) = tresp.interact_pointer_pos() {
+                                title_drop = Some((i, p));
+                            }
                         }
                     }
-                }
-                if let Some(path) = &pane.title_hover {
-                    tresp.on_hover_text(path.clone());
+                    if let Some(path) = &pane.title_hover {
+                        tresp.on_hover_text(path.clone());
+                    }
                 }
 
                 // 终端内容区：离屏纹理 + 点击聚焦。选区/块点击/滚轮仍

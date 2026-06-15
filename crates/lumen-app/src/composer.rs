@@ -16,6 +16,7 @@
 //! 本模块实现历史前缀匹配 ghost text 作为替代，保留补全体验。
 //! ghost = history.find_ghost_prefix(current_text)，由 main.rs 计算后作为参数传入。
 
+#[cfg(feature = "input-editor")]
 use crate::i18n;
 use crate::mode::InputMode;
 use lumen_renderer::composer_view::ComposerView;
@@ -124,7 +125,16 @@ pub fn compose_view_for_mode(
                 highlight,   // M4.2 批2：语法高亮 spans（逐行）
             }
         }
-        InputMode::Running => ComposerView::running(s.footer_running_text),
+        // Running（命令运行中）：footer 隐藏（海风哥反馈——命令运行时不要那条
+        // 「运行中…（直通模式）」横条，让终端内容占满到底）。footer_px=0、grid
+        // 收回全高，与 AltScreen/Fallback 同路径。
+        //
+        // ⚠ 取舍（勿轻易回退）：此前 Running 刻意产 StatusBar（与 Compose 等高）
+        // 以避免 Compose↔Running 切换触发 term.resize/pty.resize（设计稿 §7.1
+        // 防 resize 风暴）。现按海风哥要求改隐藏，代价是每条命令起/止时 footer
+        // 高度在「1 行 ↔ 0」间变化，底部约 1 行高度轻微抖动并触发一次 resize——
+        // 这是有意接受的权衡（用户要彻底隐藏 > 避免抖动）。
+        InputMode::Running => ComposerView::hidden(),
         // AltScreen：全屏 TUI 让位，footer 隐藏，grid 收回全高。
         InputMode::AltScreen => ComposerView::hidden(),
         // Fallback：shell integration 未生效，footer 隐藏（与 AltScreen 同路径，
@@ -136,11 +146,13 @@ pub fn compose_view_for_mode(
 /// 无 input-editor feature 时的退化版本（保持原批C 兼容行为）。
 #[cfg(not(feature = "input-editor"))]
 pub fn compose_view_for_mode(mode: InputMode) -> ComposerView {
-    let s = i18n::strings();
     match mode {
         InputMode::Compose => ComposerView::compose_empty(),
-        InputMode::Running => ComposerView::running(s.footer_running_text),
-        InputMode::AltScreen | InputMode::Fallback => ComposerView::hidden(),
+        // Running 也隐藏（海风哥反馈，取舍详见 feature 版注释）——与
+        // AltScreen/Fallback 同路径，footer_px=0、grid 收回全高。
+        InputMode::Running | InputMode::AltScreen | InputMode::Fallback => {
+            ComposerView::hidden()
+        }
     }
 }
 
@@ -222,15 +234,17 @@ mod tests {
         }
 
         #[test]
-        fn running_模式_产出_statusbar_形态() {
+        fn running_模式_产出_hidden_形态() {
+            // 海风哥反馈：Running 态 footer 改为隐藏（不再显示「运行中…」横条），
+            // 与 AltScreen/Fallback 同路径，footer_px=0、grid 收回全高。
             let editor = empty_view();
             let v = compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             assert_eq!(
                 v.kind,
-                FooterKind::StatusBar,
-                "Running 模式应产出 StatusBar 形态"
+                FooterKind::Hidden,
+                "Running 模式应产出 Hidden 形态（footer 隐藏）"
             );
-            assert!(v.is_visible(), "Running 形态应可见");
+            assert!(!v.is_visible(), "Running 形态应隐藏");
         }
 
         #[test]
@@ -259,9 +273,11 @@ mod tests {
             assert!(!v.is_visible(), "Fallback 形态应隐藏");
         }
 
-        /// Compose ↔ Running 等高铁律：两者均为 1 行，footer_height_px 返回相同值。
+        /// Running 态隐藏（海风哥反馈后变更）：Running footer 高度为 0（彻底
+        /// 隐藏），Compose 仍有高度。此前为「Compose↔Running 等高」防 resize，
+        /// 现按用户要求 Running 隐藏，等高约束作废，改钉新行为。
         #[test]
-        fn compose_与_running_等高() {
+        fn running_隐藏_高度为零_compose_有高度() {
             use lumen_renderer::composer_view::footer_height_px;
             let editor = empty_view();
             let v_compose =
@@ -270,10 +286,8 @@ mod tests {
                 compose_view_for_mode(InputMode::Running, editor.view(), None, None, None);
             let h_c = footer_height_px(Some(&v_compose), 20.0, 6.0, 1000.0);
             let h_r = footer_height_px(Some(&v_running), 20.0, 6.0, 1000.0);
-            assert_eq!(
-                h_c, h_r,
-                "Compose({h_c}) 与 Running({h_r}) 应等高，否则切换触发 resize"
-            );
+            assert_eq!(h_r, 0.0, "Running footer 应隐藏（高度 0）");
+            assert!(h_c > 0.0, "Compose footer 应有高度");
         }
 
         /// AltScreen 隐藏态高度为 0（grid 收回全高）。
@@ -321,11 +335,11 @@ mod tests {
                 None,
                 Some("suffix".to_owned()),
             );
-            // Running 态不消费 ghost，ComposerView::running 不含 ghost
+            // Running 态不消费 ghost，且现产 Hidden 形态（footer 隐藏）
             assert_eq!(
                 v.kind,
-                lumen_renderer::composer_view::FooterKind::StatusBar,
-                "Running 态形态不受 ghost 影响"
+                lumen_renderer::composer_view::FooterKind::Hidden,
+                "Running 态形态不受 ghost 影响（且为 Hidden）"
             );
         }
 

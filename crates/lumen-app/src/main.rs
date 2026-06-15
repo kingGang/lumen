@@ -1970,6 +1970,7 @@ impl AppState {
             || self.shell_state.history_search.open
             || self.shell_state.completion.open
             || self.shell_state.renaming.is_some()
+            || self.shell_state.pane_renaming.is_some()
             || self.shell_state.filetree.dialog_open());
         self.update_window_title();
         self.window.request_redraw();
@@ -1999,6 +2000,86 @@ impl AppState {
         self.window.request_redraw();
         // 焦点窗格下标是持久化状态的一部分（F5）。
         self.persist_sessions();
+    }
+
+    /// 把路径文本插入指定窗格的命令行（需求3）：文件树拖放与外部文件
+    /// 拖入终端共用。下标 pi 对应本帧布局，结构若已变（增删窗格）则越界
+    /// 防御跳过。先聚焦落点窗格（插入后接着编辑的就是它）。Compose 态
+    /// 进 footer 编辑器（dispatch InsertText），其余态直写 PTY。转义/同形
+    /// 引号/控制字符防御见 filetree::path_insert_text（空串 = 路径被拒）。
+    fn insert_path_into_pane(&mut self, pi: usize, path: &std::path::Path) {
+        // 覆盖层/重命名打开时吞掉拖入（与 activate 的 open 标志门控对齐）：
+        // 否则 OS 级 WindowEvent::DroppedFile 会越过可见的设置/登录/历史/
+        // 补全模态，把路径文本注入背后 shell 并抢回 terminal_focused。文件
+        // 树拖放本被模态 backdrop 遮挡不触发，这里加闸是纵深防御 + 专门
+        // 覆盖新增的外部 DroppedFile 路径。
+        if self.shell_state.settings.open
+            || self.shell_state.login.open
+            || self.shell_state.history_search.open
+            || self.shell_state.completion.open
+            || self.shell_state.renaming.is_some()
+            || self.shell_state.pane_renaming.is_some()
+            || self.shell_state.filetree.dialog_open()
+        {
+            return;
+        }
+        // 下标对应布局快照；本帧结构若已被改变则跳过本次插入（防御，
+        // 拖放与增删同帧发生的概率可忽略）。
+        if pi >= self.tabs[self.active_tab].panes.len() {
+            return;
+        }
+        // 先聚焦落点窗格（落点若非焦点窗格，先切焦点再插入，与原行为一致）。
+        self.focus_pane(pi);
+        let (ti, pi_focused) = (self.active_tab, self.tabs[self.active_tab].focused);
+
+        // Compose 态分流：进编辑器；其余态直写 PTY。
+        #[cfg(feature = "input-editor")]
+        {
+            let mode = mode::effective_mode(
+                &self.tabs[ti].panes[pi_focused].term,
+                self.force_fallback,
+            );
+            if mode == mode::InputMode::Compose {
+                // path_insert_text_str 与 path_insert_text 同一引号规则；
+                // 控制字符路径返回 None，静默跳过（纵深防御）。
+                if let Some(text) = shell::filetree::path_insert_text_str(path) {
+                    // 尾随空格：路径后方便光标继续编辑（与 PTY 路径行为对称）。
+                    let text_with_space = format!("{text} ");
+                    self.dispatch(
+                        action::Action::Edit(action::EditAction::InsertText(text_with_space)),
+                        ti,
+                        pi_focused,
+                    );
+                    self.terminal_focused = true;
+                }
+                // Compose 路径处理完毕，不走下方 PTY 路径
+                // （下方 PTY 块受 feature-gate else 保护）。
+            } else {
+                // 非 Compose 态：原写 PTY 路径。
+                let bytes = shell::filetree::path_insert_text(path);
+                if !bytes.is_empty() {
+                    let s = self.focused_pane_mut();
+                    s.term.grid_mut().scroll_to_bottom();
+                    if let Err(e) = s.write_user_input(&bytes) {
+                        error!("写入 PTY 失败: {e:#}");
+                    }
+                    self.terminal_focused = true;
+                }
+            }
+        }
+        // feature = "input-editor" 未开启时：全量走原 PTY 路径。
+        #[cfg(not(feature = "input-editor"))]
+        {
+            let bytes = shell::filetree::path_insert_text(path);
+            if !bytes.is_empty() {
+                let s = self.focused_pane_mut();
+                s.term.grid_mut().scroll_to_bottom();
+                if let Err(e) = s.write_user_input(&bytes) {
+                    error!("写入 PTY 失败: {e:#}");
+                }
+                self.terminal_focused = true;
+            }
+        }
     }
 
     /// 释放窗格的渲染资源：离屏纹理 + 行排版缓存即刻释放；egui 侧
@@ -2497,6 +2578,8 @@ impl AppState {
                                 .cwd()
                                 .map(std::path::Path::to_path_buf)
                                 .or_else(|| p.initial_cwd.clone()),
+                            // 窗格自定义名（需求2）：持久化镜像运行时 Session。
+                            custom_title: p.custom_title.clone(),
                         })
                         .collect(),
                     focused: t.focused,
@@ -2748,7 +2831,9 @@ impl App {
                         cwd,
                         app_settings.proxy.effective_url(),
                     ) {
-                        Ok(s) => {
+                        Ok(mut s) => {
+                            // 恢复窗格自定义名（F4 持久化）。
+                            s.custom_title = pane_entry.custom_title.clone();
                             next_session_id += 1;
                             panes.push(s);
                         }
@@ -3642,6 +3727,15 @@ impl ApplicationHandler<PtyWake> for App {
                 state.history.flush_on_exit();
                 event_loop.exit();
             }
+            // 外部文件拖入终端（需求3）：winit 的 DroppedFile 不携带落点
+            // 坐标（平台限制），故插入**焦点窗格**的命令行（区别于文件树
+            // 拖放按鼠标落点窗格）。路径转义 / Compose 分流与文件树拖放
+            // 共用 insert_path_into_pane。
+            WindowEvent::DroppedFile(path) => {
+                let idx = state.tabs[state.active_tab].focused;
+                state.insert_path_into_pane(idx, &path);
+                state.window.request_redraw();
+            }
             WindowEvent::ModifiersChanged(mods) => state.modifiers = mods.state(),
             WindowEvent::ThemeChanged(t) => {
                 // 系统深浅模式切换（P12 Sync with OS）：记录新状态；
@@ -3718,7 +3812,8 @@ impl ApplicationHandler<PtyWake> for App {
                         || state.shell_state.login.open
                         || state.shell_state.history_search.open
                         || state.shell_state.completion.open,
-                    renaming: state.shell_state.renaming.is_some(),
+                    renaming: state.shell_state.renaming.is_some()
+                        || state.shell_state.pane_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
                     terminal_focused: state.terminal_focused,
                     win32_input: state.tabs[ti].panes[pi].term.win32_input()
@@ -4564,21 +4659,29 @@ impl ApplicationHandler<PtyWake> for App {
                         // 取尾目录名（盘根等无尾名时回完整路径）；悬停
                         // 提示完整 cwd。两者皆无回退「窗格 N」。
                         let cwd = p.term.cwd();
-                        let title = cwd
-                            .map(|c| {
-                                c.file_name().map_or_else(
-                                    || c.display().to_string(),
-                                    |t| t.to_string_lossy().into_owned(),
-                                )
-                            })
-                            .or_else(|| {
-                                let t = p.term.title();
-                                (!t.is_empty()).then(|| t.to_owned())
-                            })
+                        // 自定义名（需求2）非空时优先；否则回退默认链
+                        // （cwd 尾目录名 > OSC 标题 > 「窗格 N」）。
+                        let title = p
+                            .custom_title
+                            .clone()
+                            .filter(|s| !s.trim().is_empty())
                             .unwrap_or_else(|| {
-                                i18n::fmt1(i18n::strings().pane_default_name_fmt, i + 1)
+                                cwd.map(|c| {
+                                    c.file_name().map_or_else(
+                                        || c.display().to_string(),
+                                        |t| t.to_string_lossy().into_owned(),
+                                    )
+                                })
+                                .or_else(|| {
+                                    let t = p.term.title();
+                                    (!t.is_empty()).then(|| t.to_owned())
+                                })
+                                .unwrap_or_else(|| {
+                                    i18n::fmt1(i18n::strings().pane_default_name_fmt, i + 1)
+                                })
                             });
                         shell::PaneView {
+                            id: p.id,
                             tex: state.pane_textures.get(&p.id).copied(),
                             focused: i == tab.focused,
                             title,
@@ -4587,6 +4690,7 @@ impl ApplicationHandler<PtyWake> for App {
                     })
                     .collect();
                 let was_renaming = state.shell_state.renaming.is_some();
+                let was_pane_renaming = state.shell_state.pane_renaming.is_some();
                 // 文件树输入：焦点窗格的 cwd（OSC 9;9 上报）与空闲态
                 // （cd 注入闸门，见 Terminal::shell_waiting_input）。
                 let active_cwd = tab
@@ -5261,9 +5365,13 @@ impl ApplicationHandler<PtyWake> for App {
                 // 取消时那次点击已按鼠标仲裁决定焦点归属（点头像/面板
                 // 为 false），无条件翻回 true 会让头像菜单开着时键盘
                 // 直通 PTY（Esc 关不掉菜单、打字进 shell）。
-                if state.shell_state.renaming.is_some() {
+                if state.shell_state.renaming.is_some()
+                    || state.shell_state.pane_renaming.is_some()
+                {
                     state.terminal_focused = false;
-                } else if was_renaming && shell_out.rename_ended_by_key {
+                } else if (was_renaming && shell_out.rename_ended_by_key)
+                    || (was_pane_renaming && shell_out.pane_rename_ended_by_key)
+                {
                     state.terminal_focused = true;
                 }
                 // —— egui 弹层（右键菜单/头像菜单等 Popup）焦点路由 ——
@@ -5279,6 +5387,7 @@ impl ApplicationHandler<PtyWake> for App {
                     state.terminal_focused = false;
                 } else if state.was_popup_open
                     && state.shell_state.renaming.is_none()
+                    && state.shell_state.pane_renaming.is_none()
                     && !state.shell_state.settings.open
                     && !state.shell_state.login.open
                     && !state.shell_state.history_search.open
@@ -5305,6 +5414,24 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.update_window_title();
                     // 重命名是结构性变更：落盘（F4）。
+                    state.persist_sessions();
+                }
+                // 窗格重命名（需求2）：按窗格【会话 id】定位焦点 tab 内的
+                // 窗格，写其 custom_title（空名 = 清除，回退默认标题）。按 id
+                // 而非下标查找——避免后台 shell 异步退出 close_pane 重排下标后
+                // 写错窗格（见 pane_renaming 注释）。刷新标题 + 落盘（F4）。
+                // 注：OS 窗口标题取 tab 维度（update_window_title 不读窗格自定义
+                // 名），调用与 tab 重命名路径保持一致兼作刷新；窗格名生效处在
+                // 标题栏（PaneView.title 已优先取 custom_title）。
+                if let Some((sid, name)) = shell_out.pane_rename {
+                    if let Some(p) = state.tabs[state.active_tab]
+                        .panes
+                        .iter_mut()
+                        .find(|p| p.id == sid)
+                    {
+                        p.custom_title = (!name.is_empty()).then_some(name);
+                    }
+                    state.update_window_title();
                     state.persist_sessions();
                 }
                 if shell_out.new_session {
@@ -5802,68 +5929,7 @@ impl ApplicationHandler<PtyWake> for App {
                 // dispatch 内实时查 effective_mode，防落点窗格聚焦瞬间
                 // 与执行时刻的模式漂移。
                 if let Some((pi, path)) = shell_out.insert_path {
-                    // 下标对应 run_ui 时的布局；本帧结构若已被上方动作
-                    // 改变（增删窗格）则跳过本次插入（防御，拖放与增删
-                    // 同帧发生的概率可忽略）。
-                    if pi < state.tabs[state.active_tab].panes.len() {
-                        // 先聚焦落点窗格（落点若非焦点窗格，先切焦点再插入，
-                        // 与原行为一致）。
-                        state.focus_pane(pi);
-                        let (ti, pi_focused) =
-                            (state.active_tab, state.tabs[state.active_tab].focused);
-
-                        // Compose 态分流：进编辑器；其余态直写 PTY。
-                        #[cfg(feature = "input-editor")]
-                        {
-                            let mode = mode::effective_mode(
-                                &state.tabs[ti].panes[pi_focused].term,
-                                state.force_fallback,
-                            );
-                            if mode == mode::InputMode::Compose {
-                                // path_insert_text_str 与 path_insert_text 同一引号规则；
-                                // 控制字符路径返回 None，静默跳过（纵深防御）。
-                                if let Some(text) = shell::filetree::path_insert_text_str(&path) {
-                                    // 尾随空格：路径后方便光标继续编辑（与 PTY 路径行为对称）。
-                                    let text_with_space = format!("{text} ");
-                                    state.dispatch(
-                                        action::Action::Edit(action::EditAction::InsertText(
-                                            text_with_space,
-                                        )),
-                                        ti,
-                                        pi_focused,
-                                    );
-                                    state.terminal_focused = true;
-                                }
-                                // Compose 路径处理完毕，不走下方 PTY 路径。
-                                // （continue 不可用——在 if-let 块而非循环内；
-                                //  显式跳过：下方 PTY 块受 feature-gate else 保护。）
-                            } else {
-                                // 非 Compose 态：原写 PTY 路径。
-                                let bytes = shell::filetree::path_insert_text(&path);
-                                if !bytes.is_empty() {
-                                    let s = state.focused_pane_mut();
-                                    s.term.grid_mut().scroll_to_bottom();
-                                    if let Err(e) = s.write_user_input(&bytes) {
-                                        error!("写入 PTY 失败: {e:#}");
-                                    }
-                                    state.terminal_focused = true;
-                                }
-                            }
-                        }
-                        // feature = "input-editor" 未开启时：全量走原 PTY 路径。
-                        #[cfg(not(feature = "input-editor"))]
-                        {
-                            let bytes = shell::filetree::path_insert_text(&path);
-                            if !bytes.is_empty() {
-                                let s = state.focused_pane_mut();
-                                s.term.grid_mut().scroll_to_bottom();
-                                if let Err(e) = s.write_user_input(&bytes) {
-                                    error!("写入 PTY 失败: {e:#}");
-                                }
-                                state.terminal_focused = true;
-                            }
-                        }
-                    }
+                    state.insert_path_into_pane(pi, &path);
                 }
                 // —— 文件树右键菜单：复制绝对/相对路径到剪贴板 ——
                 if let Some(text) = shell_out.copy_text {

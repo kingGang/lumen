@@ -164,6 +164,10 @@ pub struct Session {
     /// 就触发写盘（如切 tab）会把保存的 cwd 冲成 None。新建会话为
     /// None（cwd 未知，等首个提示符上报）。
     pub initial_cwd: Option<PathBuf>,
+    /// 窗格自定义名（F4 持久化，需求2）：用户双击/右键标题栏重命名后的
+    /// 名字；非空时窗格标题栏优先显示它，空/None 时回退默认（cwd 尾目录
+    /// 名 > OSC 标题 > 「窗格 N」）。运行时态，持久化镜像在 PaneEntry。
+    pub custom_title: Option<String>,
     /// 上次处理批的 ESU 标记，用于检测「本批完成了同步帧」。
     pub last_esu_mark: u64,
     /// 实际绘制中的光标态 (行, 列, 可见)。光标处于「帧尾未归位」
@@ -282,6 +286,7 @@ impl Session {
             pty,
             rx,
             initial_cwd: cwd.map(Path::to_path_buf),
+            custom_title: None,
             last_esu_mark: 0,
             cursor_displayed: (0, 0, true),
             cursor_frozen_at: None,
