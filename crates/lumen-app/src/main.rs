@@ -595,6 +595,10 @@ struct AppState {
     /// 一帧 egui 布局（鼠标命中/IME 候选框定位用）。tab 结构变更后
     /// 的陈旧条目按 id 解析不到窗格、自然失效。
     pane_rects_px: Vec<(SessionId, (f32, f32, f32, f32))>,
+    /// 无边框窗口边缘拖动 resize 的待发起方向：MouseInput 命中窗口外缘时
+    /// 置位，下一帧 RedrawRequested 内调 drag_resize_window（窗口操作须在
+    /// RedrawRequested 同帧执行，见 drag_window 处注释）。
+    pending_resize_dir: Option<winit::window::ResizeDirection>,
     /// 各窗格右上角关闭按钮的命中矩形（物理像素 x/y/w/h；仅多窗格
     /// 时非空），来自最近一帧 egui 布局。raw 鼠标路由对它让位：✕ 的
     /// 点击由 egui 处理（pane_close 动作），按下不聚焦/不建选区。
@@ -2617,6 +2621,56 @@ impl AppState {
     }
 }
 
+/// 无边框窗口外缘 resize 命中检测（左/右/下及下方两角）：鼠标物理坐标
+/// `mouse_pos` 落在客户区外缘约 6 逻辑像素带内时返回对应 [`ResizeDirection`]。
+/// Windows 无边框窗口客户区铺满整窗、系统不再对边缘做 NCHITTEST resize
+/// （WS_THICKFRAME 命中区被吞），故手动命中 + drag_resize_window 补回拖边
+/// resize。顶边让位自绘标题栏拖动移动与右上角窗控按钮，不做 resize。
+/// 最大化态 / 非 Windows（保留系统装饰、原生 resize 可用）返回 None。
+fn resize_edge_dir(
+    window: &winit::window::Window,
+    mouse_pos: (f64, f64),
+    ppp: f32,
+) -> Option<winit::window::ResizeDirection> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, mouse_pos, ppp);
+        None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use winit::window::ResizeDirection;
+        if window.is_maximized() {
+            return None;
+        }
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let (w, h) = (size.width as f64, size.height as f64);
+        let (mx, my) = mouse_pos;
+        // 命中带：约 6 逻辑像素（随 DPI 缩放），最低 4 物理像素。
+        let b = (6.0 * ppp as f64).max(4.0);
+        let left = mx < b;
+        let right = mx > w - b;
+        let bottom = my > h - b;
+        let dir = if bottom && left {
+            ResizeDirection::SouthWest
+        } else if bottom && right {
+            ResizeDirection::SouthEast
+        } else if left {
+            ResizeDirection::West
+        } else if right {
+            ResizeDirection::East
+        } else if bottom {
+            ResizeDirection::South
+        } else {
+            return None;
+        };
+        Some(dir)
+    }
+}
+
 impl App {
     fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<AppState> {
         // M3.8 自绘标题栏：无边框窗口 + DWM 阴影/Win11 圆角。
@@ -2979,6 +3033,7 @@ impl App {
             session_icon_tex: HashMap::new(),
             last_icon_probe: None,
             pane_rects_px: Vec::new(),
+            pending_resize_dir: None,
             pane_close_rects_px: Vec::new(),
             divider_rects_px: Vec::new(),
             panel_resize_rects_px: Vec::new(),
@@ -4196,6 +4251,19 @@ impl ApplicationHandler<PtyWake> for App {
                 ..
             } => match (button, btn_state) {
                 (MouseButton::Left, ElementState::Pressed) => {
+                    // 无边框窗口边缘拖动 resize（左/右/下及下方两角）：命中窗口
+                    // 外缘则记下方向、下一帧 RedrawRequested 内发起系统 resize 拖动
+                    // （窗口操作须在该处执行，见 drag_window 注释）；本次按下不
+                    // 聚焦/不建选区/不交出焦点。优先于其余命中判定（最外缘几像素）。
+                    if let Some(dir) = resize_edge_dir(
+                        &state.window,
+                        state.mouse_pos,
+                        state.egui_ctx.pixels_per_point(),
+                    ) {
+                        state.pending_resize_dir = Some(dir);
+                        state.window.request_redraw();
+                        return;
+                    }
                     // 点的是窗格关闭按钮：动作由 egui 侧处理（✕ →
                     // pane_close），这里不聚焦不建选区，也不视作
                     // 「点击面板交出焦点」——关完接着打字不该断流。
@@ -4875,6 +4943,23 @@ impl ApplicationHandler<PtyWake> for App {
                     None
                 };
                 let mut update_action: Option<UpdateAction> = None;
+                // 边缘 resize 光标反馈（窗口外缘 → 对应方向；None=不在边缘）：本帧
+                // 在 run_ui 闭包末用 egui set_cursor_icon 注入（走 egui 光标缓存、
+                // 离开边缘时能正确恢复）。drag 的发起在下方 RedrawRequested 内。
+                let resize_cursor = resize_edge_dir(
+                    &state.window,
+                    state.mouse_pos,
+                    state.egui_ctx.pixels_per_point(),
+                )
+                .map(|dir| {
+                    use winit::window::ResizeDirection as D;
+                    match dir {
+                        D::West | D::East => egui::CursorIcon::ResizeHorizontal,
+                        D::South | D::North => egui::CursorIcon::ResizeVertical,
+                        D::SouthWest | D::NorthEast => egui::CursorIcon::ResizeNeSw,
+                        D::SouthEast | D::NorthWest => egui::CursorIcon::ResizeNwSe,
+                    }
+                });
                 let full_output = state.egui_ctx.run_ui(raw_input, |ui| {
                     shell_out = Some(shell::show(
                         ui,
@@ -4883,6 +4968,11 @@ impl ApplicationHandler<PtyWake> for App {
                         app_settings,
                         is_maximized,
                     ));
+                    // 边缘 resize 光标：放在 shell::show 之后设，覆盖边缘处控件的
+                    // 默认光标（egui 末次 set_cursor_icon 生效）。
+                    if let Some(c) = resize_cursor {
+                        ui.ctx().set_cursor_icon(c);
+                    }
                     // ── 「回到底部」浮动按钮（窗格上滚超过一整屏时，底部
                     // 居中的圆形向下箭头；点击回到最新输出）──
                     for (sid, rect) in &scroll_to_bottom_targets {
@@ -5450,6 +5540,14 @@ impl ApplicationHandler<PtyWake> for App {
                 // —— M3.8 自绘标题栏：窗口控制动作处理 ——
                 // drag_window / set_minimized / set_maximized 须在 shell::show
                 // 同帧（RedrawRequested 内）执行，时序成立（调研 §3 已证）。
+                // 无边框窗口边缘 resize 同理在此发起（MouseInput 命中外缘时置位
+                // pending_resize_dir）：drag_resize_window 启动系统 resize 模态
+                // 循环，失败（如最大化态）静默忽略。
+                if let Some(dir) = state.pending_resize_dir.take() {
+                    if let Err(e) = state.window.drag_resize_window(dir) {
+                        log::debug!("drag_resize_window 失败（忽略）：{e}");
+                    }
+                }
                 if shell_out.drag_title_bar {
                     // drag_window 内部发 WM_NCLBUTTONDOWN + HTCAPTION 启动系统拖动。
                     // 失败（如最大化态下操作）静默忽略——不影响应用逻辑。
