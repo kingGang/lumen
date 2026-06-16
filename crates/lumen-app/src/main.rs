@@ -126,6 +126,10 @@ fn load_icon(bytes: &[u8]) -> Option<Icon> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // [BUILD-MARKER] composer-IME 修复专用构建标记（坐实后移除）：日志开头
+    // 出现此行 = 你跑的就是带「Ime::Enabled 即定位候选框」修复的最新版；
+    // 若日志里没有这行，就是拷了旧 exe，本次测试无效。
+    log::info!("[BUILD-MARKER] composer-ime-fix-r4 ime-enabled-cursor-area+pos-log+title 2026-06-16");
     // F8 单实例限制（事件循环创建前检测）：release 默认单开——已有
     // 实例在跑时通知其前台化、本实例静默退出；debug 构建与
     // --multi-instance / LUMEN_MULTI_INSTANCE=1 放行多开。
@@ -1462,6 +1466,70 @@ impl AppState {
             .map(|(_, r)| *r)
     }
 
+    /// 把 IME 候选框钉到焦点窗格光标所在格子（Compose 态跟 footer 编辑器
+    /// 光标，其余态跟终端光标）。egui 会按自身文本焦点开关整窗 IME / 把
+    /// 候选框挪到它的默认控件位，终端聚焦时必须强制复位回光标处。
+    ///
+    /// 调用点有二：① 每帧 `RedrawRequested` 末（`handle_platform_output`
+    /// 之后，纠正 egui 本帧的挪动）；② **焦点失而复得后首个 `Ime::Enabled`
+    /// 立即调**——否则「窗口/tab/窗格失焦再回来」时，首字组合串会赶在下一
+    /// 帧复位前用 egui 残留的左上角位置画在最左，且该 OS 自绘组合串成孤儿
+    /// 删不掉（Win10 焦点回来首字缩最左/删不掉的真因；WT/Warp 无此问题）。
+    fn update_ime_cursor_area(&self, log_it: bool) {
+        if !self.terminal_focused {
+            return;
+        }
+        self.window.set_ime_allowed(true);
+        let Some((px, py, pw, ph)) = self.focused_pane_rect_px() else {
+            if log_it {
+                log::info!("[IME-ENABLED] 无焦点窗格矩形（首帧布局未完成），跳过本次定位");
+            }
+            return;
+        };
+        let s = self.focused_pane();
+        let (cw, ch) = self.renderer.cell_size();
+        #[cfg(feature = "input-editor")]
+        let (ime_x, ime_y) = {
+            let mode = mode::effective_mode(&s.term, self.force_fallback);
+            if mode == crate::mode::InputMode::Compose {
+                let cv_cursor = s.editor.view().cursor();
+                let footer_top_y = py + ph
+                    - ch * (s.editor.view().line_count().max(1) as f32)
+                    - self.renderer.padding() * 0.8;
+                let col_approx = cv_cursor.byte.min(200) as f32;
+                let footer_x = px + col_approx * cw;
+                let footer_y = footer_top_y + cv_cursor.line as f32 * ch;
+                (footer_x, footer_y)
+            } else {
+                let g = s.term.grid();
+                let view_row = (g.display_offset() + s.cursor_displayed.0)
+                    .min(g.rows().saturating_sub(1));
+                let (cx, cy) = self.renderer.cell_origin(view_row, s.cursor_displayed.1);
+                (px + cx, py + cy)
+            }
+        };
+        #[cfg(not(feature = "input-editor"))]
+        let (ime_x, ime_y) = {
+            let g = s.term.grid();
+            let view_row =
+                (g.display_offset() + s.cursor_displayed.0).min(g.rows().saturating_sub(1));
+            let (cx, cy) = self.renderer.cell_origin(view_row, s.cursor_displayed.1);
+            (px + cx, py + cy)
+        };
+        let _ = pw; // pw 仅防未使用 warning（IME 候选框宽度用 cw）
+        self.window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(ime_x as f64, ime_y as f64),
+            winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
+        );
+        if log_it {
+            log::info!(
+                "[IME-ENABLED] 候选框→({ime_x:.0},{ime_y:.0}) cursor_displayed=(行{},列{}) 窗格原点=({px:.0},{py:.0}) cell={cw:.0}x{ch:.0}",
+                s.cursor_displayed.0,
+                s.cursor_displayed.1
+            );
+        }
+    }
+
     /// 「回到底部」浮动按钮的目标矩形（每个上滚超过一整屏的可见窗格各
     /// 一个）。返回 `(SessionId, 按钮命中区逻辑矩形)`，按钮置于窗格底部
     /// 居中；焦点窗格扣除 footer 高度，避免压在输入区上。
@@ -1932,6 +2000,46 @@ impl AppState {
         want_exit
     }
 
+    /// IME 事件是否应路由给 composer 编辑器，即便 `terminal_focused` 因切
+    /// tab / 点击 composer 时的焦点翻转**时序**短暂为 `false`（composer Win10
+    /// 中文首字 bug 的激进修复，H1）。
+    ///
+    /// 条件：**无任何 egui 覆盖层/模态打开**（否则 IME 应归 egui 输入框，
+    /// 放行会双投/劫持）+ 焦点窗格处于 [`mode::InputMode::Compose`]（提示符
+    /// 等待输入，composer 可用）。满足时，焦点翻转窗口期到达的首个
+    /// `Ime::Preedit` 不再漏给 egui（画在默认控件位 ≈ 最左）、也不再被
+    /// Lumen 的 `!terminal_focused` 闸丢弃，而是直达 composer。
+    ///
+    /// Win11 常态下打字时 `terminal_focused` 已为 `true`，根本不进此分支
+    /// （`bypass_egui` 的 `terminal_focused && Ime` 项已覆盖），故对 Win11
+    /// 正常路径零影响；仅焦点翻转窗口期生效。
+    fn ime_should_route_to_composer(&self) -> bool {
+        #[cfg(feature = "input-editor")]
+        {
+            let overlay = self.shell_state.settings.open
+                || self.shell_state.login.open
+                || self.shell_state.history_search.open
+                || self.shell_state.completion.open
+                || self.shell_state.renaming.is_some()
+                || self.shell_state.pane_renaming.is_some()
+                || self.shell_state.filetree.dialog_open()
+                // 文件树搜索框（egui TextEdit）聚焦时能收 IME，须视作覆盖层、
+                // 把 IME 交还 egui，否则激进路由会把往搜索框打的中文劫持进
+                // 终端 composer（对抗审查 IME 项）。
+                || self.shell_state.filetree.search_open();
+            if overlay {
+                return false;
+            }
+            let (ti, pi) = (self.active_tab, self.tabs[self.active_tab].focused);
+            mode::effective_mode(&self.tabs[ti].panes[pi].term, self.force_fallback)
+                == mode::InputMode::Compose
+        }
+        #[cfg(not(feature = "input-editor"))]
+        {
+            false
+        }
+    }
+
     /// 切换激活 tab：清掉目标 tab **全部窗格**的冻结计时与渲染计划
     /// （属于「上次激活期间」的旧时间轴，带过来会借用过期的调度），
     /// 清未读点，同步窗口标题并立即重绘。无覆盖层/重命名时终端拿
@@ -1976,6 +2084,21 @@ impl AppState {
             || self.shell_state.renaming.is_some()
             || self.shell_state.pane_renaming.is_some()
             || self.shell_state.filetree.dialog_open());
+        // 防御（composer Win10 IME）：切 tab 复位焦点窗格的 IME 预编辑残留，
+        // 防止切回时上一 tab 半成品组合串串入。激进修复（见
+        // ime_should_route_to_composer）负责焦点翻转期首字直达 composer。
+        #[cfg(feature = "input-editor")]
+        {
+            let pi = self.tabs[idx].focused;
+            if let Some(p) = self.tabs[idx].panes.get_mut(pi) {
+                p.preedit = None;
+            }
+        }
+        log::info!(
+            "[IME-ACTIVATE] active_tab={} terminal_focused={}",
+            self.active_tab,
+            self.terminal_focused
+        );
         self.update_window_title();
         self.window.request_redraw();
         // 激活下标是持久化状态的一部分：切换即落盘（F4）。
@@ -2488,7 +2611,10 @@ impl AppState {
     /// 焦点窗格 cwd > OSC 标题 > 「会话 N」，恒非空）。
     fn update_window_title(&self) {
         let title = self.tabs[self.active_tab].display_title();
-        self.window.set_title(&format!("Lumen — {title}"));
+        // [BUILD-MARKER r4]（composer-IME 取证临时）：标题栏带版本标记，海风哥
+        // 一眼确认跑的是不是带修复的新版，不用翻日志。坐实后连同诊断一并移除。
+        self.window
+            .set_title(&format!("Lumen [ime-r4] — {title}"));
     }
 
     /// F7② 节流轮询各 tab 焦点窗格的前台运行程序 exe（进程快照较重，
@@ -3733,12 +3859,18 @@ impl ApplicationHandler<PtyWake> for App {
         // CentralPanel 覆盖，悬停即视为「在 egui 区域上」）——鼠标按
         // 终端区矩形路由（mouse_in_term），键盘/IME 按 terminal_focused
         // 路由，不依赖 consumed。
+        // 激进修复（composer Win10 IME，H1）：焦点翻转窗口期的 IME 事件，
+        // 若焦点窗格 Compose 态且无覆盖层，也绕过 egui 直达 composer
+        // ——否则首个 Ime::Preedit 会漏给 egui 画在默认控件位（≈最左）。
+        let ime_route_composer =
+            matches!(event, WindowEvent::Ime(_)) && state.ime_should_route_to_composer();
         let bypass_egui = matches!(event, WindowEvent::RedrawRequested)
             || (state.terminal_focused
                 && matches!(
                     event,
                     WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
                 ))
+            || ime_route_composer
             // 诊断开关（B1）：无交互桌面的自动化环境里物理光标不在窗口
             // 内，每个注入的 WM_MOUSEMOVE 都伴随系统补发的 WM_MOUSELEAVE
             // （TrackMouseEvent 语义），egui 的指针态被清空导致注入的
@@ -3746,6 +3878,15 @@ impl ApplicationHandler<PtyWake> for App {
             // CursorLeft 喂给 egui（仅自动化拖动测试用，正常使用不设）。
             || (matches!(event, WindowEvent::CursorLeft { .. })
                 && std::env::var_os("LUMEN_DIAG_IGNORE_CURSOR_LEFT").is_some());
+        // IME 诊断（composer Win10 取证，核心判据）：观察焦点翻转期首个
+        // Ime::Preedit 的 bypass_egui / terminal_focused / 路由决策。坐实 H1
+        // 后可移除。
+        if let WindowEvent::Ime(ref ime) = event {
+            log::info!(
+                "[IME-RAW] {ime:?} bypass_egui={bypass_egui} tf={} route_composer={ime_route_composer}",
+                state.terminal_focused
+            );
+        }
         if !bypass_egui {
             let resp = state.egui_state.on_window_event(&state.window, &event);
             if resp.repaint {
@@ -4431,12 +4572,28 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 _ => {}
             },
+            // IME 组合开始（焦点失而复得后的首个组合串关键）：立即把候选框
+            // 钉到焦点窗格光标，**别等下一帧 RedrawRequested**——否则首字组合串
+            // 会用 egui 残留的左上角位置画在最左、且 OS 自绘组合串成孤儿删不掉
+            // （Win10「窗口/tab/窗格失焦再回来打字首字缩最左」真因；WT/Warp 无此
+            // 问题，是 Lumen 焦点回来未及时复位 IME 候选框所致）。
+            WindowEvent::Ime(Ime::Enabled) => {
+                state.update_ime_cursor_area(true);
+            }
             // IME 预编辑（M4.1 批D2，设计稿 §7.3）：
             // Compose 态：更新 session.preedit（不进编辑器文档，不参与 undo）。
             // text 为空或 cursor_range 为 None + 空串 → 清空预编辑（预编辑取消）。
             // 其余态：事件本身已由 egui-winit 处理（路由已交 egui），此处忽略。
             WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
-                if !state.terminal_focused {
+                // 激进修复（composer Win10）：焦点翻转期首字也归 composer。
+                let route = state.ime_should_route_to_composer();
+                log::info!(
+                    "[IME-PREEDIT] text={text:?} cursor={cursor:?} tf={} route_composer={route} \
+                     will_drop={}",
+                    state.terminal_focused,
+                    !state.terminal_focused && !route
+                );
+                if !state.terminal_focused && !route {
                     return;
                 }
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
@@ -4465,8 +4622,14 @@ impl ApplicationHandler<PtyWake> for App {
             WindowEvent::Ime(Ime::Commit(text)) => {
                 // 仅终端聚焦时把 IME 提交文本写入 shell（焦点窗格）；
                 // egui 输入框聚焦时事件已喂给 egui 消化，再写 PTY 就是
-                // 双投。
-                if !state.terminal_focused {
+                // 双投。激进修复（composer Win10）：焦点翻转期 Compose 态
+                // 也放行，让 preedit 直达 composer 后的 commit 不丢。
+                let route = state.ime_should_route_to_composer();
+                log::info!(
+                    "[IME-COMMIT] text={text:?} tf={} route_composer={route}",
+                    state.terminal_focused
+                );
+                if !state.terminal_focused && !route {
                     return;
                 }
                 // M4.1 批D1：IME 分流——设计稿 §7.3
@@ -6500,55 +6663,10 @@ impl ApplicationHandler<PtyWake> for App {
                 state
                     .egui_state
                     .handle_platform_output(&state.window, full_output.platform_output);
-                if state.terminal_focused {
-                    state.window.set_ime_allowed(true);
-                    if let Some((px, py, pw, ph)) = state.focused_pane_rect_px() {
-                        let s = state.focused_pane();
-                        let (cw, ch) = state.renderer.cell_size();
-
-                        // M4.1 批D2：Compose 态时 IME 候选框跟随 footer 内编辑器光标。
-                        // 其余态：跟随终端光标所在格子（原行为）。
-                        #[cfg(feature = "input-editor")]
-                        let (ime_x, ime_y) = {
-                            let mode = mode::effective_mode(&s.term, state.force_fallback);
-                            if mode == crate::mode::InputMode::Compose {
-                                // footer 光标位置：footer 在窗格底部
-                                // cursor = (行, 字节偏移)，此处近似为字符列 = cursor.1 / cell_w
-                                // 精确列需要 ComposerView 里的字节转 glyph 列，
-                                // 此处用字节偏移粗估（常用 ASCII 场景 1:1，CJK 偏差 1 格内）。
-                                let cv_cursor = s.editor.view().cursor();
-                                let footer_top_y = py + ph
-                                    - ch * (s.editor.view().line_count().max(1) as f32)
-                                    - state.renderer.padding() * 0.8;
-                                let col_approx = cv_cursor.byte.min(200) as f32;
-                                let footer_x = px + col_approx * cw;
-                                let footer_y = footer_top_y + cv_cursor.line as f32 * ch;
-                                (footer_x, footer_y)
-                            } else {
-                                let g = s.term.grid();
-                                let view_row = (g.display_offset() + s.cursor_displayed.0)
-                                    .min(g.rows().saturating_sub(1));
-                                let (cx, cy) =
-                                    state.renderer.cell_origin(view_row, s.cursor_displayed.1);
-                                (px + cx, py + cy)
-                            }
-                        };
-                        #[cfg(not(feature = "input-editor"))]
-                        let (ime_x, ime_y) = {
-                            let g = s.term.grid();
-                            let view_row = (g.display_offset() + s.cursor_displayed.0)
-                                .min(g.rows().saturating_sub(1));
-                            let (cx, cy) =
-                                state.renderer.cell_origin(view_row, s.cursor_displayed.1);
-                            (px + cx, py + cy)
-                        };
-                        let _ = pw; // pw 仅防未使用 warning（IME 候选框宽度用 cw）
-                        state.window.set_ime_cursor_area(
-                            winit::dpi::PhysicalPosition::new(ime_x as f64, ime_y as f64),
-                            winit::dpi::PhysicalSize::new(cw as f64, ch as f64),
-                        );
-                    }
-                }
+                // 终端聚焦时强制把 IME 候选框复位到光标处（纠正 egui 本帧对
+                // 候选框/整窗 IME 的挪动）。同一逻辑也在焦点回来后首个
+                // Ime::Enabled 立即调用一次，修「失焦再回来首字缩最左」。
+                state.update_ime_cursor_area(false);
 
                 // —— egui 渲染到 surface（单 pass，Clear 装载）——
                 let clipped = state.egui_ctx.tessellate(full_output.shapes, ppp);

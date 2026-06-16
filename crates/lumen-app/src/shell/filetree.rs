@@ -320,6 +320,14 @@ impl FileTreeState {
         self.dialog.is_some()
     }
 
+    /// 搜索输入框是否展开。其 `egui::TextEdit` 聚焦时能接收 IME 合成，
+    /// 故 main 的 IME 路由仲裁（`ime_should_route_to_composer`）必须把它
+    /// 视作覆盖层、把 IME 焦点交给 egui，否则激进路由会把往搜索框打的
+    /// 中文劫持进终端 composer（对抗审查 IME 项）。与 `dialog_open` 同款。
+    pub fn search_open(&self) -> bool {
+        self.search_open
+    }
+
     /// 文件树栏当前实际占用宽度（逻辑点）：展开时为用户设置的展开宽度，
     /// 收起时返回 0.0（问题7：收起态不再画窄条，不占用任何宽度）。
     /// new_pane() 预计算新窗格尺寸时用此值估算终端工作区。

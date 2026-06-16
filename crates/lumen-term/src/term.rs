@@ -41,8 +41,28 @@ impl Terminal {
     }
 
     /// 调整尺寸（窗口 resize 时由上层调用，同时应通知 PTY）。
+    ///
+    /// 列宽变化触发 scrollback reflow（见 [`crate::Grid::resize`]）：reflow
+    /// 改变 scrollback 行数会让命令块的**绝对行号**整体漂移，故据返回的
+    /// `LineRemap` 重映射 `blocks` 的各行号字段，保块边界/跳转/输出提取不
+    /// 错位。
+    ///
+    /// **已知局限（end_col 不重映射）**：`end_col` 是相对旧物理行第 0 列的
+    /// 列偏移，本方法只重映射行号、不重映射列。对「最后一行输出无结尾换行
+    /// （`end_col>0`）且该行是软折行续接行」且已滚入 scrollback 的历史块，
+    /// reflow 后 [`Self::block_output_text`] 提取该块输出可能取到错位/截断文本
+    /// （不止行尾微小误差，极端时整段错位）。影响面窄：仅该特定形态历史块
+    /// 的「复制/提取输出」，不损坏 grid、不触发 panic、不破坏绝对行号单调
+    /// 性。完整修复需位置级 (行,列) 重映射，留作后续（对抗审查 minor 项）。
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.inner.grid.resize(rows, cols);
+        if let Some(remap) = self.inner.grid.resize(rows, cols) {
+            for b in &mut self.inner.blocks {
+                b.prompt_line = remap.apply(b.prompt_line);
+                b.cmd_line = b.cmd_line.map(|l| remap.apply(l));
+                b.output_line = b.output_line.map(|l| remap.apply(l));
+                b.end_line = b.end_line.map(|l| remap.apply(l));
+            }
+        }
         self.inner.scroll_top = 0;
         self.inner.scroll_bottom = rows - 1;
     }
@@ -447,10 +467,15 @@ impl TermInner {
 
         if self.grid.cursor.pending_wrap {
             self.grid.cursor.pending_wrap = false;
+            // autowrap：当前行写满后软折行续接下一行，标记 wrapped 供
+            // scrollback reflow 解折行重排（req6）。须在 linefeed 之前标记
+            // ——linefeed 可能把本行滚入 scrollback（标记随行一并带入）。
+            let r = self.grid.cursor.row;
+            self.grid.set_line_wrapped(r, true);
             self.grid.cursor.col = 0;
             self.linefeed();
         }
-        // 宽字符在行尾放不下时，先补空格换行。
+        // 宽字符在行尾放不下时，先补空格换行（同属 autowrap，标记 wrapped）。
         if width == 2 && self.grid.cursor.col + 2 > cols {
             let (r, c0) = (self.grid.cursor.row, self.grid.cursor.col);
             for c in c0..cols {
@@ -459,6 +484,7 @@ impl TermInner {
                 cell.ch = ' ';
                 cell.flags = self.pen.flags;
             }
+            self.grid.set_line_wrapped(r, true);
             self.grid.cursor.col = 0;
             self.linefeed();
         }
@@ -705,6 +731,10 @@ impl Perform for TermInner {
             }
             b'\n' | 0x0b | 0x0c => {
                 self.grid.cursor.pending_wrap = false;
+                // 硬换行：本行以换行结束、不续接下一行，清 wrapped（防陈旧
+                // autowrap 标记随本行滚入 scrollback 后误导 reflow 解折行）。
+                let r = self.grid.cursor.row;
+                self.grid.set_line_wrapped(r, false);
                 self.linefeed();
             }
             0x08 => {
@@ -988,9 +1018,17 @@ impl Perform for TermInner {
                     self.grid.mark_dirty();
                 }
             }
-            b'D' => self.linefeed(),
+            b'D' => {
+                // IND：硬换行（下移一行），清 wrapped（同 LF）。
+                let r = self.grid.cursor.row;
+                self.grid.set_line_wrapped(r, false);
+                self.linefeed();
+            }
             b'E' => {
+                // NEL：回车 + 硬换行，清 wrapped。
                 self.grid.cursor.col = 0;
+                let r = self.grid.cursor.row;
+                self.grid.set_line_wrapped(r, false);
                 self.linefeed();
             }
             b'M' => self.reverse_linefeed(),
@@ -1713,5 +1751,109 @@ mod tests {
             t.shell_waiting_input(),
             "D 闭合后新 prompt 周期（新块 B 到）：应再次判定为等待输入"
         );
+    }
+
+    // ── req6 端到端：真实 autowrap → scrollback → reflow ──
+
+    fn line_text(t: &Terminal, abs: u64) -> String {
+        t.grid()
+            .line_by_abs(abs)
+            .unwrap()
+            .cells()
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn reflow_端到端_autowrap历史放大后解折行() {
+        // 真实 autowrap 触发 wrapped 标记 → 滚入 scrollback → 放大列宽解折行。
+        let mut t = Terminal::new(3, 4, 100);
+        t.advance(b"ABCDEFGH\r\nP\r\nQ\r\nR\r\n");
+        // "ABCDEFGH" 的两折行（ABCD + EFGH）此时已滚入 scrollback。
+        assert_eq!(t.grid().scrollback_len(), 3);
+        t.resize(3, 8);
+        assert_eq!(line_text(&t, 0), "ABCDEFGH", "放大后历史首行应解折回整行");
+    }
+
+    #[test]
+    fn autowrap置位wrapped而硬换行清除() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.advance(b"ABCDEFGH\r\nZ\r\nW\r\nV\r\n");
+        // abs0 = "ABCD"（autowrap 续行），abs1 = "EFGH"（被 \r\n 硬换行结束）。
+        assert!(
+            t.grid().line_by_abs(0).unwrap().is_wrapped(),
+            "autowrap 行应标记 wrapped"
+        );
+        assert!(
+            !t.grid().line_by_abs(1).unwrap().is_wrapped(),
+            "硬换行结束的行不应 wrapped"
+        );
+    }
+
+    #[test]
+    fn reflow_块绝对行号随scrollback行数变化重映射() {
+        // 块提示符在屏幕区；放大列宽使 scrollback 两折行合回一行（-1 行），
+        // 屏幕区块行号必须同步 -1（绝对行号随 reflow 平移），仍指向同一行。
+        let mut t = Terminal::new(3, 4, 1000);
+        t.advance(b"ABCDEFGH\r\nX\r\nY\r\n");
+        assert_eq!(t.grid().scrollback_len(), 2, "前置：两折行在 scrollback");
+        t.advance(b"\x1b]133;A\x07");
+        let before = t.blocks()[0].prompt_line;
+        assert_eq!(
+            before,
+            t.grid().absolute_cursor_line(),
+            "块提示符 = 当前光标行"
+        );
+        t.resize(3, 8);
+        assert_eq!(t.grid().scrollback_len(), 1, "解折行后 scrollback 减 1 行");
+        assert_eq!(
+            t.blocks()[0].prompt_line,
+            t.grid().absolute_cursor_line(),
+            "重映射后块提示符仍指向同一光标行"
+        );
+        assert_eq!(t.blocks()[0].prompt_line, before - 1, "屏幕区块行号 -1");
+    }
+
+    #[test]
+    fn reflow_块输出文本跨缩放解折合并() {
+        // 块输出完整滚入 scrollback 后放大列宽：两折行解折合并、块行号
+        // 重映射，block_output_text 提取到合并后的整行（行号未错位/越界）。
+        let mut t = Terminal::new(3, 8, 1000);
+        t.advance(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        t.advance(b"hello world\r\n"); // 8 列下折成 "hello wo" + "rld"
+        t.advance(b"\x1b]133;D;0\x07"); // 闭合块（end_line 固定，后续滚动不再延伸）
+        // 把已闭合块的输出滚入 scrollback（J/K 落在 end_line 之外，不污染提取）。
+        t.advance(b"J\r\nK\r\n");
+        assert_eq!(t.grid().scrollback_len(), 2, "前置：输出两折行在 scrollback");
+        let before = t.block_output_text(&t.blocks()[0].clone());
+        assert_eq!(before, "hello wo\nrld", "前置：折行态按行提取");
+        t.resize(3, 20); // 放大：输出两折行解折合并
+        let after = t.block_output_text(&t.blocks()[0].clone());
+        assert_eq!(after, "hello world", "reflow 后块输出解折合并、行号重映射正确");
+    }
+
+    #[test]
+    fn wrap_lifecycle_擦到行尾清wrapped防reflow误合并() {
+        // 对抗审查 critical 回归：autowrap 标 wrapped 的行被 EL 擦到行尾后，
+        // wrapped 必须复位，否则它滚入 scrollback 后 reflow 会把它与下一条
+        // 无关历史行错误合并（内容损坏，如 "X     B"）。
+        let mut t = Terminal::new(4, 6, 100);
+        t.advance(b"AAAAAA"); // 写满首行（6 列）→ pending_wrap
+        t.advance(b"B"); // autowrap：row0 wrapped=true，'B' 落 row1
+        // 回 row0 整行擦除（EL 2，擦到行尾）+ 重写独立短行 "X"。
+        t.advance(b"\x1b[1;1H\x1b[2KX");
+        assert!(
+            !t.grid().row(0).is_wrapped(),
+            "EL 擦到行尾后该行 wrapped 必须复位"
+        );
+        // 把 row0("X")/row1("B") 顶入 scrollback。
+        t.advance(b"\x1b[4;1H\r\n\r\n\r\n\r\n\r\n\r\n");
+        // 缩放触发 reflow：两条无关历史行不得被合并。
+        t.resize(4, 12);
+        assert_eq!(line_text(&t, 0), "X", "独立短行不被误合并（非 \"X     B\"）");
+        assert_eq!(line_text(&t, 1), "B", "下一历史行保持独立");
     }
 }

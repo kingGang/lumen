@@ -11,6 +11,6 @@ mod term;
 
 pub use block::Block;
 pub use cell::{Cell, CellFlags, Color};
-pub use grid::{Cursor, Grid, Row};
+pub use grid::{Cursor, Grid, LineRemap, Row};
 pub use selection::{SelPoint, Selection};
 pub use term::Terminal;
