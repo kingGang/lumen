@@ -1,0 +1,28 @@
+[package]
+name = "lumen-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lumen 云服务端：账户、设备、设置/历史同步（M5.1），及后续远程控制中继"
+
+[dependencies]
+lumen-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+# 纯跨平台依赖：Windows（本地测试）与 Linux（生产发布）均可编译。
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+# Postgres：tokio-postgres + deadpool 连接池。
+# 弃用 sqlx —— sqlx-postgres 0.8.6 在 rustc 1.96 下触发编译器 ICE
+# （pre-expansion lint 崩溃）；tokio-postgres 宏更少、成熟稳定，编译可靠。
+# 本地连库走 NoTls（docker 不强制 SSL）；生产 server↔Postgres 同主机/内网。
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+argon2 = { version = "0.5", features = ["std"] }
+jsonwebtoken = "9"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

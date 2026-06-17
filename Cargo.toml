@@ -6,6 +6,11 @@ members = [
     "crates/lumen-renderer",
     "crates/lumen-app",
     "crates/lumen-editor",
+    # M5 远程控制新增：协议（跨平台，client/server 共享）+ 云服务端。
+    # server 仅用纯跨平台 crate，Linux 发布用 `cargo build -p lumen-server`
+    # 只编其依赖树，不触及 windows-sys/ConPTY 等客户端 crate。
+    "crates/lumen-protocol",
+    "server/lumen-server",
 ]
 
 [workspace.package]
@@ -19,6 +24,7 @@ lumen-pty = { path = "crates/lumen-pty" }
 lumen-term = { path = "crates/lumen-term" }
 lumen-renderer = { path = "crates/lumen-renderer" }
 lumen-editor = { path = "crates/lumen-editor" }
+lumen-protocol = { path = "crates/lumen-protocol" }
 
 anyhow = "1"
 arboard = "3"

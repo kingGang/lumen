@@ -3,6 +3,11 @@
 
 mod action;
 mod background;
+// M5 远程控制：客户端与 lumen-server 的 REST 通道 + 设备 id 持久化。
+// cloud.rs 提供 M5.1–M5.4 的完整 REST API；设备列表/重命名/删除、设置/历史
+// 同步等方法在 M5.2+ 才接线，故暂允许 dead_code（脚手架，非真死代码）。
+#[allow(dead_code)]
+mod cloud;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
 mod completion;
@@ -532,7 +537,7 @@ struct AppState {
     /// 只凭加载日志不能证明 UI 真用了持久化值，首帧布局后把实际
     /// 侧栏/文件树宽与窗格权重打进日志，一次性）。
     layout_apply_logged: bool,
-    /// 登录档案（mock）：None = 未登录。顶栏头像、头像菜单、设置页
+    /// 登录档案：None = 未登录。顶栏头像、头像菜单、设置页
     /// Account 三处 UI 同源此字段；登录写盘 / 登出删盘（profile.json）。
     profile: Option<profile::Profile>,
     modifiers: ModifiersState,
@@ -2903,7 +2908,7 @@ impl App {
         // —— 登录态加载（profile.json；缺失=未登录、损坏=未登录+警告）——
         let user_profile = profile::Profile::load();
         match &user_profile {
-            Some(p) => info!("登录态加载：{} <{}>（本地 mock）", p.display_name, p.email),
+            Some(p) => info!("登录态加载：{} <{}>", p.display_name, p.email),
             None => info!("登录态：未登录"),
         }
 
@@ -6143,9 +6148,9 @@ impl ApplicationHandler<PtyWake> for App {
                 // —— 登录/登出动作：state.profile 是唯一数据源，更新后
                 // 顶栏头像、头像菜单、设置页 Account 三处下一帧即联动 ——
                 if let Some(p) = shell_out.logged_in {
-                    // mock 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
+                    // 登录成功：原子写盘（重启保持登录态）+ 更新内存态。
                     p.save();
-                    info!("登录成功（mock）：{} <{}>", p.display_name, p.email);
+                    info!("登录成功：{} <{}>", p.display_name, p.email);
                     state.shell_state.toast.push(
                         shell::toast::ToastKind::Info,
                         i18n::fmt1(i18n::strings().toast_logged_in_fmt, &p.display_name),

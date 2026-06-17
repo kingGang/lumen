@@ -29,6 +29,18 @@ pub struct Profile {
     pub display_name: String,
     /// 登录时刻（Unix 秒，展示/排查用）。
     pub logged_in_at: u64,
+    /// M5：服务端账户 id（mock / 未登录为 None）。
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// M5：本设备 id（服务端分配；同时镜像到 `cloud::save_device_id` 持久文件）。
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// M5：鉴权 token（JWT，短期）。**不是密码**，仅用于后续 REST 鉴权。
+    #[serde(default)]
+    pub token: Option<String>,
+    /// M5：token 过期 Unix 秒（0 = 无）。
+    #[serde(default)]
+    pub token_expires_at: i64,
 }
 
 impl Profile {
@@ -39,6 +51,23 @@ impl Profile {
             .next()
             .map(|c| c.to_uppercase().to_string())
             .unwrap_or_else(|| "?".to_owned())
+    }
+
+    /// 由服务端登录响应构造档案（含 token / 设备 id）——真账户登录（M5）。
+    pub fn from_auth(resp: lumen_protocol::AuthResponse) -> Self {
+        let logged_in_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        Self {
+            email: resp.user.email,
+            display_name: resp.user.display_name,
+            logged_in_at,
+            user_id: Some(resp.user.id),
+            device_id: Some(resp.device_id),
+            token: Some(resp.token),
+            token_expires_at: resp.expires_at,
+        }
     }
 
     /// 档案文件路径：应用数据目录下的 `profile.json`（目录按构建类型
@@ -171,6 +200,8 @@ impl LoginError {
 /// 展示名取 `@` 前段。失败返回 [`LoginError`]，由 UI 侧调用 `.message()`
 /// 取当前语言的展示文案。
 /// 密码仅在此过手用于「非空」校验，**绝不落盘**。
+// M5 真账户登录上线后，mock_login 仅供单元测试 / 离线兜底，主流程不再调用。
+#[allow(dead_code)]
 pub fn mock_login(email: &str, password: &str) -> std::result::Result<Profile, LoginError> {
     let email = email.trim();
     let valid = email
@@ -190,6 +221,7 @@ pub fn mock_login(email: &str, password: &str) -> std::result::Result<Profile, L
         email: email.to_owned(),
         display_name: display_name_of(email),
         logged_in_at,
+        ..Default::default()
     })
 }
 

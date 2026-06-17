@@ -44,7 +44,7 @@ pub static STRINGS: Strings = Strings {
     nav_network: "網路",
     nav_about: "關於",
     account_not_logged_in: "未登入",
-    account_not_logged_in_sub: "本機模擬登入，真實帳號後續版本接入",
+    account_not_logged_in_sub: "登入以同步裝置與遠端控制",
     account_log_out: "登出",
     account_log_in: "登入",
     appearance_heading: "外觀",
@@ -88,7 +88,7 @@ pub static STRINGS: Strings = Strings {
     about_heading: "關於",
     about_version_fmt: "版本 {}",
     // 登入頁
-    login_subtitle: "登入（本機模擬，真實帳號後續版本接入）",
+    login_subtitle: "登入到 Lumen 雲帳戶",
     login_email_hint: "電子郵件",
     login_password_hint: "密碼",
     login_btn: "登入",

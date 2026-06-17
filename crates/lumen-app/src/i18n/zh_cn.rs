@@ -38,7 +38,7 @@ pub static STRINGS: Strings = Strings {
     nav_network: "网络",
     nav_about: "关于",
     account_not_logged_in: "未登录",
-    account_not_logged_in_sub: "本地模拟登录，真账号后续版本接入",
+    account_not_logged_in_sub: "登录以同步设备与远程控制",
     account_log_out: "退出登录",
     account_log_in: "登录",
     appearance_heading: "外观",
@@ -82,7 +82,7 @@ pub static STRINGS: Strings = Strings {
     about_heading: "关于",
     about_version_fmt: "版本 {}",
     // 登录页
-    login_subtitle: "登录（本地模拟，真账号后续版本接入）",
+    login_subtitle: "登录到 Lumen 云账户",
     login_email_hint: "邮箱",
     login_password_hint: "密码",
     login_btn: "登录",

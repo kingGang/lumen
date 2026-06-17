@@ -1,0 +1,13 @@
+[package]
+name = "lumen-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lumen 远程控制协议：客户端与 lumen-server 共享的线缆类型（零平台依赖）"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

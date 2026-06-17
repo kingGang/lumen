@@ -38,7 +38,7 @@ pub static STRINGS: Strings = Strings {
     nav_network: "Network",
     nav_about: "About",
     account_not_logged_in: "Not logged in",
-    account_not_logged_in_sub: "Local mock login; real accounts in a future version",
+    account_not_logged_in_sub: "Sign in to sync devices and enable remote control",
     account_log_out: "Log out",
     account_log_in: "Log in",
     appearance_heading: "Appearance",
@@ -84,7 +84,7 @@ pub static STRINGS: Strings = Strings {
     about_heading: "About",
     about_version_fmt: "Version {}",
     // Login page
-    login_subtitle: "Log in (local mock; real accounts in a future version)",
+    login_subtitle: "Sign in to your Lumen account",
     login_email_hint: "Email",
     login_password_hint: "Password",
     login_btn: "Log in",
