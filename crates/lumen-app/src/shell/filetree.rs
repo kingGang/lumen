@@ -1986,7 +1986,9 @@ fn remote_placeholder_row(ui: &mut egui::Ui, pal: &theme::Palette, text: &str) {
 /// 新建文件/文件夹的名字校验（Windows 文件名规则 + 注入防御）。
 ///
 /// 返回值的 `&'static str` 是当前语言的错误文案（由 i18n 表提供）。
-fn validate_entry_name(name: &str) -> Result<(), &'static str> {
+///
+/// part3c-2 片5：被控端 Put/MkDir 写盘前复用此校验拒绝非法 / 穿越名字（`pub(crate)`）。
+pub(crate) fn validate_entry_name(name: &str) -> Result<(), &'static str> {
     let s = crate::i18n::strings();
     if name.is_empty() {
         return Err(s.validate_name_empty);
@@ -2007,6 +2009,18 @@ fn validate_entry_name(name: &str) -> Result<(), &'static str> {
         // Win32 命名空间会静默吞掉结尾点/空格，建出来的名字和输入
         // 对不上，直接拒绝。
         return Err(s.validate_name_trailing);
+    }
+    // Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）：去扩展名后大小写不敏感匹配则拒——
+    // 否则 `rename(.tmp, dir\NUL)` 会被 Win32 解析成设备、写入被静默重定向（part3c-2 片5 LOW-2）。
+    let stem = name.split('.').next().unwrap_or(name);
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0');
+    if reserved {
+        return Err(s.validate_name_illegal);
     }
     Ok(())
 }

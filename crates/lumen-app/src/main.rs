@@ -3064,6 +3064,22 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
                 i18n::fmt3(s.remote_download_done_fmt, done, skipped, errors),
             )
         }
+        Notice::UploadStarted => (ToastKind::Info, s.remote_upload_started.to_string()),
+        Notice::UploadDone {
+            done,
+            skipped,
+            errors,
+        } => {
+            let kind = if *errors > 0 {
+                ToastKind::Warn
+            } else {
+                ToastKind::Info
+            };
+            (
+                kind,
+                i18n::fmt3(s.remote_upload_done_fmt, done, skipped, errors),
+            )
+        }
     }
 }
 
@@ -5592,7 +5608,11 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_view_active: state.is_mirror_active(),
                     // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
                     file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
-                    overwrite_conflict_count: state.pending_paste.as_ref().map(|p| p.conflict_count),
+                    overwrite_conflict_count: state
+                        .pending_paste
+                        .as_ref()
+                        .map(|p| p.conflict_count)
+                        .or_else(|| state.remote_ws.upload_conflict_count()),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -6850,18 +6870,18 @@ impl ApplicationHandler<PtyWake> for App {
                                     state.remote_ws.start_download(items, dir, true);
                                 }
                             }
-                            // 上传（控制端本地 → 被控端目录）：片5 实装。本片仅记日志，不弹
-                            // 用户可见（避免硬编码文案破坏 i18n；菜单本不应在无上传能力时让点）。
+                            // 上传（控制端本地 → 被控端目录）：递归编排（撞名由被控端 Probe
+                            // 决议、首个冲突弹覆盖模态一次性决策套用整次递归）。
                             (remote_ws::ClipSide::Local, remote_ws::ClipSide::Remote) => {
-                                let _ = (items, dir);
-                                log::debug!("上传（local→remote）将在片5 实装");
+                                state.remote_ws.start_upload(items, dir);
                             }
                             // 同侧（本地→本地 / 远程→远程）：本期不支持。
                             _ => {}
                         }
                     }
                 }
-                // #7：覆盖模态选择 → 续传 / 跳过 / 取消待决下载。
+                // #7 / 片5：覆盖模态选择 → 续传 / 跳过 / 取消。先看待决下载（pending_paste），
+                // 否则路由到待决上传冲突（resolve_upload_conflict）。两者互斥（同一模态）。
                 if let Some(choice) = shell_out.overwrite_choice {
                     if let Some(p) = state.pending_paste.take() {
                         match choice {
@@ -6873,6 +6893,8 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                             shell::OverwriteChoice::Cancel => {}
                         }
+                    } else {
+                        state.remote_ws.resolve_upload_conflict(choice);
                     }
                 }
                 if let Some(dir) = shell_out.cd_dir {

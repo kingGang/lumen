@@ -119,6 +119,8 @@ pub static STRINGS: Strings = Strings {
     remote_fetch_too_large: "File too large to fetch",
     remote_download_started: "Downloading…",
     remote_download_done_fmt: "Download done: {0} ok, {1} skipped, {2} errors",
+    remote_upload_started: "Uploading…",
+    remote_upload_done_fmt: "Upload done: {0} ok, {1} skipped, {2} errors",
     remote_menu_paste: "Paste into this folder",
     remote_menu_copy: "Copy",
     remote_overwrite_prompt_fmt: "{} item(s) with the same name exist. What to do?",

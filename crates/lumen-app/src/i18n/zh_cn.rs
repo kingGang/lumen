@@ -117,6 +117,8 @@ pub static STRINGS: Strings = Strings {
     remote_fetch_too_large: "文件过大，无法获取",
     remote_download_started: "开始下载…",
     remote_download_done_fmt: "下载完成：{0} 个，跳过 {1}，出错 {2}",
+    remote_upload_started: "开始上传…",
+    remote_upload_done_fmt: "上传完成：{0} 个，跳过 {1}，出错 {2}",
     remote_menu_paste: "粘贴到此目录",
     remote_menu_copy: "复制",
     remote_overwrite_prompt_fmt: "目标已有 {} 个同名项，如何处理？",

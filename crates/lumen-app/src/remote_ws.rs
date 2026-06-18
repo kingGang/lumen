@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -29,8 +29,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C,
-    Role, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PutConflict, PutOverwrite,
+    PutStatus, RemoteC2S, RemoteFrame, RemoteS2C, Role, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -134,6 +134,17 @@ pub enum Notice {
         /// 出错数。
         errors: usize,
     },
+    /// part3c-2 片5：开始上传（复制本地项粘贴到被控端目录，传输中）。
+    UploadStarted,
+    /// part3c-2 片5：上传结束汇总（完成 / 跳过 / 出错文件数）。
+    UploadDone {
+        /// 成功写入被控端的文件数。
+        done: usize,
+        /// 因撞名跳过数。
+        skipped: usize,
+        /// 出错数。
+        errors: usize,
+    },
 }
 
 /// 后台线程 → 主线程事件。
@@ -204,6 +215,16 @@ pub struct RemoteWs {
     file_clipboard: Option<FileClipboard>,
     /// 控制端：进行中的 #7 下载编排（远程 → 本地递归传输）；同一时刻一个。
     download: Option<DownloadWalk>,
+    /// 被控端：在途 Put 目标（接收方）：req_id → 落被控端临时文件的写盘任务（片5 上传）。
+    inflight_put: HashMap<u64, PutDstJob>,
+    /// 控制端：在途 Put 源（发送方）：req_id → 给 worker 发「可再发一块」许可的句柄
+    /// （每收一个 [`RemoteFrame::PutChunkAck`] +1，滑动窗口背压；对称于 `inflight_fetch_src`）。
+    inflight_put_src: HashMap<u64, PutSrcJob>,
+    /// 控制端：在途 Put 的元信息：req_id → (本地源路径, 被控端目标目录, 落地名)，供 `PutReady`
+    /// 决策（开始发送 / 重发 Force / 暂停等覆盖）与统计。
+    inflight_put_meta: HashMap<u64, PutMeta>,
+    /// 控制端：进行中的片5 上传编排（本地 → 被控端递归传输）；同一时刻一个。
+    upload: Option<UploadWalk>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -531,6 +552,12 @@ enum SvcReply {
     /// Fetch 源 worker 已结束（文件读完 / 出错 / 被中止）：主线程移除 `inflight_fetch_src`
     /// 该项（worker 自己经 `cmd_tx` 直发 `FileBegin/Chunk/End/Err`，此信号仅用于清理 map）。
     FetchSrcDone { req_id: u64 },
+    /// 片5 上传：Put 源 worker 正常发完 `PutEnd`：主线程移除 `inflight_put_src`（等被控端
+    /// `PutResult` 减 `active_puts`、计统计）。
+    PutSrcDone { req_id: u64 },
+    /// 片5 上传：Put 源 worker open/read 失败中止（未发 `PutEnd`）：被控端不会回 `PutResult`，
+    /// 故主线程须自行计错 + 减 `active_puts` + 清元信息 + 续 pump（H2 修复，否则上传挂死）。
+    PutSrcFailed { req_id: u64 },
 }
 
 /// 控制端在途 Fetch 的用途：决定落地位置与收完动作。
@@ -613,10 +640,70 @@ struct DownloadWalk {
     errors: usize,
 }
 
+/// 片5 上传编排（本地 → 被控端）：控制端用 MkDir 递归建被控端目录结构、PutBegin/Chunk/End
+/// 把本地文件写到被控端对应路径。复用 `inflight_put_src`/`inflight_put_meta` 做文件传输，本
+/// 结构跟踪目录遍历 + 队列 + 撞名决策（镜像 [`DownloadWalk`]，方向相反）。
+struct UploadWalk {
+    /// 被控端落地根目录（粘贴目标目录；仅供日志 / 不变量）。
+    remote_root: String,
+    /// 撞名策略：`None` = 遇冲突弹覆盖模态（暂停）、`Some(true)` = 覆盖全部、`Some(false)` =
+    /// 跳过全部已存在（一次性决策后套用整次递归）。
+    policy: Option<bool>,
+    /// 待发送文件队列 (本地源路径, 被控端目标目录, 落地名)（受 [`DOWNLOAD_MAX_FILES`] 节流）。
+    file_queue: VecDeque<(PathBuf, String, String)>,
+    /// 在途 MkDir：req_id → (本地目录, 深度)。回 [`RemoteFrame::MkDirResult`] 后读该本地目录、
+    /// 把子项入队（子目录续发 MkDir、文件入 file_queue）。
+    inflight_mkdir: HashMap<u64, (PathBuf, usize)>,
+    /// 正在传输（PutBegin 已发、未 PutResult）的文件数（并发上限 [`DOWNLOAD_MAX_FILES`]）。
+    active_puts: usize,
+    /// 已访问本地目录 canonical 路径（防 junction / symlink 成环）。
+    visited: HashSet<PathBuf>,
+    /// 撞名待决队列（`policy==None` 期间 Probe 探得冲突的 req_id；**队列**而非单值——并发探测
+    /// 时多个冲突同时回来不会互相覆盖，H1 修复）。非空 + 未决期间 pump 不起新文件。决策后
+    /// 一次性套用 policy 排空。元信息复用 `inflight_put_meta[req_id]`。
+    conflict_queue: VecDeque<u64>,
+    /// 统计：完成 / 跳过 / 出错文件数（结束 toast 汇总）。
+    done: usize,
+    skipped: usize,
+    errors: usize,
+}
+
 /// 被控端在途 Fetch 源（发送方）：仅持给 worker 发许可的句柄，worker 经 `cmd_tx` 直发帧。
 struct FetchSrcJob {
     /// 每收一个 [`RemoteFrame::FileChunkAck`] 发一个许可，worker 领许可才读发下一块（背压）。
     permit_tx: Sender<()>,
+}
+
+/// 被控端在途 Put 目标（接收方，片5 上传）：把控制端分块传来的字节顺序写**临时文件**
+/// （同目录 `.lumen-put-{req_id}.tmp` 保证 rename 同卷原子），`PutEnd` 时 flush + rename 到目标。
+struct PutDstJob {
+    /// 临时文件路径（`dir/.lumen-put-{req_id}.tmp`；同目标目录同卷）。
+    tmp_path: PathBuf,
+    /// 最终目标路径（`dir.join(name)`；rename 落地点，Force 覆盖语义）。
+    target: PathBuf,
+    /// 已打开的写入句柄（`PutBegin` 建临时文件后 `Some`）。
+    file: Option<std::fs::File>,
+    /// 下一个期望块序号（连续性校验）。
+    next_seq: u32,
+    /// 已写入字节累计（控制端硬上限：超 [`FETCH_MAX_LEN`] 中止；对称于 `FetchJob`）。
+    written: u64,
+}
+
+/// 控制端在途 Put 源（发送方，片5 上传）：仅持给 worker 发许可的句柄，worker 经 `cmd_tx`
+/// 直发 [`RemoteFrame::PutChunk`] / [`RemoteFrame::PutEnd`]（对称于 [`FetchSrcJob`]）。
+struct PutSrcJob {
+    /// 每收一个 [`RemoteFrame::PutChunkAck`] 发一个许可，worker 领许可才读发下一块（背压）。
+    permit_tx: Sender<()>,
+}
+
+/// 控制端在途 Put 的元信息（片5 上传）：req_id → 决策 `PutReady` / 重发 Force / 统计所需的上下文。
+struct PutMeta {
+    /// 本地源文件路径（worker 读取源；冲突后重发 Force 复用）。
+    local_path: PathBuf,
+    /// 被控端目标目录（不透明；重发 Force 复用）。
+    remote_dir: String,
+    /// 落地文件名（被控端 `dir.join(name)` 拼路径；重发 Force 复用）。
+    name: String,
 }
 
 /// 取路径末段作显示名（`C:\Users\hf` → `hf`；盘符根 `C:\` 等无末段时返回整串）。
@@ -733,6 +820,59 @@ fn fetch_src_worker(
             return;
         }
         send(&RemoteFrame::FileChunk {
+            req_id,
+            seq,
+            data: buf[..n].to_vec(),
+        });
+        seq = seq.wrapping_add(1);
+    }
+}
+
+/// 控制端 Put 源后台线程（片5 上传，镜像 [`fetch_src_worker`]，方向相反）：编排已先发
+/// `PutBegin` 并收到 `PutReady{conflict:None}`，本 worker 只在领许可（ACK 窗口）后逐块读
+/// **本地源文件**发 [`RemoteFrame::PutChunk`]，EOF 发 [`RemoteFrame::PutEnd`]。读失败静默退出
+/// （不发 PutChunk/PutEnd，被控端临时文件会因会话清理或停滞被回收）。帧经 `cmd_tx` 直投 WS
+/// 出站（不经主线程）；许可通道关闭（会话结束 / 编排清 `inflight_put_src` / 取消）即中止。
+/// 返回 `true`=正常发完 `PutEnd`；`false`=open/read 失败或许可通道中途关闭（中止）。调用方据此
+/// 发 `PutSrcDone`（成功，等被控端 `PutResult`）或 `PutSrcFailed`（失败，控制端即时计错收尾，
+/// 否则 `active_puts` 永不归零 → 上传挂死，H2 修复）。
+fn put_send_worker(
+    req_id: u64,
+    local_path: &str,
+    cmd_tx: &Sender<RemoteC2S>,
+    permit_rx: &Receiver<()>,
+) -> bool {
+    let send = |frame: &RemoteFrame| {
+        if let Ok(v) = frame.to_value() {
+            let _ = cmd_tx.send(RemoteC2S::Relay(v));
+        }
+    };
+    let mut file = match std::fs::File::open(local_path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("上传打开本地文件失败 {local_path}: {e}");
+            return false;
+        }
+    };
+    let mut seq: u32 = 0;
+    let mut buf = vec![0u8; FILE_CHUNK];
+    loop {
+        // 领许可：控制端收 PutChunkAck 驱动；通道关闭（会话结束 / 被清理 / 取消）即中止。
+        if permit_rx.recv().is_err() {
+            return false;
+        }
+        let n = match file.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                log::warn!("上传读本地文件失败 {local_path}: {e}");
+                return false;
+            }
+        };
+        if n == 0 {
+            send(&RemoteFrame::PutEnd { req_id });
+            return true;
+        }
+        send(&RemoteFrame::PutChunk {
             req_id,
             seq,
             data: buf[..n].to_vec(),
@@ -1115,6 +1255,20 @@ impl RemoteWs {
                 SvcReply::FetchSrcDone { req_id } => {
                     self.inflight_fetch_src.remove(&req_id);
                 }
+                SvcReply::PutSrcDone { req_id } => {
+                    self.inflight_put_src.remove(&req_id);
+                }
+                SvcReply::PutSrcFailed { req_id } => {
+                    // H2：worker open/read 失败、被控端不会回 PutResult → 主线程自行收尾，
+                    // 否则 active_puts 永不归零、上传挂死。
+                    self.inflight_put_src.remove(&req_id);
+                    self.inflight_put_meta.remove(&req_id);
+                    if let Some(u) = self.upload.as_mut() {
+                        u.errors += 1;
+                        u.active_puts = u.active_puts.saturating_sub(1);
+                    }
+                    self.pump_upload();
+                }
             }
         }
     }
@@ -1321,8 +1475,8 @@ impl RemoteWs {
         if items.is_empty() || !self.is_controlling() {
             return;
         }
-        if self.download.is_some() {
-            log::debug!("下载进行中，忽略新的粘贴下载请求");
+        if self.download.is_some() || self.upload.is_some() {
+            log::debug!("已有传输进行中，忽略新的粘贴下载请求");
             return;
         }
         self.download = Some(DownloadWalk {
@@ -1543,6 +1697,639 @@ impl RemoteWs {
         }
     }
 
+    /// 控制端：收 `PutChunkAck`（片5 上传）→ 给对应 Put 源 worker 发一个许可（被控端每落一块
+    /// 即放行下一块；对称于 [`Self::fetch_src_ack`]）。
+    fn put_src_ack(&self, req_id: u64) {
+        if let Some(job) = self.inflight_put_src.get(&req_id) {
+            let _ = job.permit_tx.send(()); // worker 已退出 → 通道关 → 忽略。
+        }
+    }
+
+    // ── part3c-2 片5 被控端 Put/MkDir 写盘服务（接收方；同步写，块小本地盘，与 fetch_begin 对称）─
+
+    /// 被控端：`dir`/`name` 的子树断言 + 名字校验。返回 `Ok(target)` = 安全可写的目标路径；
+    /// `Err(FsErr)` = 名字非法 / 路径穿越被拒（H1 安全，critique HIGH）。
+    ///
+    /// 防御：① `validate_entry_name` 拒 `..`/`.`/分隔符/盘符/非法字符/控制字符/结尾点空格；
+    /// ② canonical 子树断言——`dir` 必须 `canonicalize` 成功，且 `dir.join(name)` 的父目录
+    /// canonical 必须 `starts_with(dir_canonical)`（拒 `name` 含未被 ① 拦下的穿越组件 / symlink 逃逸）。
+    fn put_resolve_target(dir: &str, name: &str) -> Result<PathBuf, FsErr> {
+        if crate::shell::filetree::validate_entry_name(name).is_err() {
+            return Err(FsErr::PermissionDenied);
+        }
+        let dir_path = Path::new(dir);
+        let Ok(dir_canon) = dir_path.canonicalize() else {
+            // dir 不存在 / 不可达：上传前目标目录必存在（取自远程树节点），失败即拒。
+            return Err(FsErr::NotFound);
+        };
+        let target = dir_path.join(name);
+        // target 的父目录必须落在 dir_canon 子树内（target 本身可能尚不存在，故按父目录断言）。
+        // canonicalize 失败即拒（不再 fallback 放行，消除「断言永真」的纵深防御假象）。
+        let parent = target.parent().unwrap_or(dir_path);
+        let Ok(parent_canon) = parent.canonicalize() else {
+            return Err(FsErr::PermissionDenied);
+        };
+        if !parent_canon.starts_with(&dir_canon) {
+            log::warn!("Put 子树断言失败（拒穿越）: dir={dir} name={name:?}");
+            return Err(FsErr::PermissionDenied);
+        }
+        Ok(target)
+    }
+
+    /// 被控端：收 `PutBegin`（片5 上传）。两阶段 + 撞名决议 + 子树断言：
+    /// - 名字非法 / 路径穿越 → `PutReady{err}`；
+    /// - `Skip` → `PutResult{Skipped}`（不写）；
+    /// - `Probe` 且目标已存在 → `PutReady{conflict}`（不写，等控制端重发 Force/Skip）；
+    /// - 否则（`Probe` 无冲突 / `Force`）→ 建同目录唯一临时文件、存 `inflight_put`、回 `PutReady{None}`。
+    fn handle_put_begin(
+        &mut self,
+        req_id: u64,
+        dir: String,
+        name: String,
+        _total_len: u64,
+        overwrite: PutOverwrite,
+    ) {
+        let target = match Self::put_resolve_target(&dir, &name) {
+            Ok(t) => t,
+            Err(err) => {
+                self.send_frame(&RemoteFrame::PutReady {
+                    req_id,
+                    conflict: None,
+                    err: Some(err),
+                });
+                return;
+            }
+        };
+        // Skip：用户已选不覆盖（重发 Skip 走这里）→ 直接回跳过，不写。
+        if matches!(overwrite, PutOverwrite::Skip) {
+            self.send_frame(&RemoteFrame::PutResult {
+                req_id,
+                status: PutStatus::Skipped,
+                err: None,
+            });
+            return;
+        }
+        // Probe：探测撞名。命中已存在目标 → 回 conflict，不建临时文件、不写。
+        if matches!(overwrite, PutOverwrite::Probe) && target.try_exists().unwrap_or(false) {
+            let (is_dir, existing_len) = match std::fs::metadata(&target) {
+                Ok(m) => (m.is_dir(), m.len()),
+                Err(_) => (false, 0),
+            };
+            self.send_frame(&RemoteFrame::PutReady {
+                req_id,
+                conflict: Some(PutConflict { is_dir, existing_len }),
+                err: None,
+            });
+            return;
+        }
+        // Probe 无冲突 / Force：建同目录唯一临时文件（保证 rename 同卷原子替换）。
+        let parent = target.parent().map_or_else(|| PathBuf::from(&dir), Path::to_path_buf);
+        let tmp_path = parent.join(format!(".lumen-put-{req_id}.tmp"));
+        match std::fs::File::create(&tmp_path) {
+            Ok(file) => {
+                self.inflight_put.insert(
+                    req_id,
+                    PutDstJob {
+                        tmp_path,
+                        target,
+                        file: Some(file),
+                        next_seq: 0,
+                        written: 0,
+                    },
+                );
+                self.send_frame(&RemoteFrame::PutReady {
+                    req_id,
+                    conflict: None,
+                    err: None,
+                });
+            }
+            Err(e) => {
+                log::warn!("Put 建临时文件失败 {}: {e}", tmp_path.display());
+                self.send_frame(&RemoteFrame::PutReady {
+                    req_id,
+                    conflict: None,
+                    err: Some(io_err_to_fs(&e)),
+                });
+            }
+        }
+    }
+
+    /// 被控端：收 `PutChunk` → 连续性校验 + 累计上限后顺序写临时文件，回 `PutChunkAck`（背压）。
+    /// 乱序 / 写失败 / 超上限 → 删临时 + 移除在途 + `PutResult{err:Io}`。
+    fn handle_put_chunk(&mut self, req_id: u64, seq: u32, data: &[u8]) {
+        let abort: Option<FsErr> = {
+            let Some(job) = self.inflight_put.get_mut(&req_id) else {
+                return;
+            };
+            let Some(file) = job.file.as_mut() else {
+                return; // 临时文件未建 / 已中止：忽略。
+            };
+            if seq != job.next_seq {
+                log::warn!("Put 块乱序 req={req_id} seq={seq} 期望={}", job.next_seq);
+                Some(FsErr::Io)
+            } else if let Err(e) = file.write_all(data) {
+                log::warn!("Put 写临时文件失败: {e}");
+                Some(FsErr::Io)
+            } else {
+                job.next_seq = job.next_seq.wrapping_add(1);
+                job.written = job
+                    .written
+                    .saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                if job.written > FETCH_MAX_LEN {
+                    Some(FsErr::TooLarge)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(err) = abort {
+            self.put_dst_abort(req_id, err);
+        } else {
+            self.send_frame(&RemoteFrame::PutChunkAck { req_id, seq });
+        }
+    }
+
+    /// 被控端：收 `PutEnd` → flush + 关句柄 + 原子 rename 临时文件到目标（Force 覆盖语义，同卷
+    /// 原子替换）→ `PutResult{Written}`；rename 失败 → 删临时 + `PutResult{err:Io}`。
+    fn handle_put_end(&mut self, req_id: u64) {
+        let Some(mut job) = self.inflight_put.remove(&req_id) else {
+            return;
+        };
+        if let Some(mut file) = job.file.take() {
+            let _ = file.flush();
+            drop(file); // 关句柄后再 rename（Windows 替换前须释放写锁）。
+        }
+        match std::fs::rename(&job.tmp_path, &job.target) {
+            Ok(()) => self.send_frame(&RemoteFrame::PutResult {
+                req_id,
+                status: PutStatus::Written,
+                err: None,
+            }),
+            Err(e) => {
+                log::warn!(
+                    "Put rename 失败 {} → {}: {e}",
+                    job.tmp_path.display(),
+                    job.target.display()
+                );
+                let _ = std::fs::remove_file(&job.tmp_path);
+                self.send_frame(&RemoteFrame::PutResult {
+                    req_id,
+                    status: PutStatus::Written,
+                    err: Some(io_err_to_fs(&e)),
+                });
+            }
+        }
+    }
+
+    /// 被控端：中止一个在途 Put（乱序 / 写失败 / 超上限）→ 关句柄、删临时文件、回 `PutResult{err}`。
+    fn put_dst_abort(&mut self, req_id: u64, err: FsErr) {
+        if let Some(mut job) = self.inflight_put.remove(&req_id) {
+            job.file = None; // 关句柄（Windows 删前须释放）。
+            let _ = std::fs::remove_file(&job.tmp_path);
+        }
+        self.send_frame(&RemoteFrame::PutResult {
+            req_id,
+            status: PutStatus::Written,
+            err: Some(err),
+        });
+    }
+
+    /// 被控端：收 `MkDir`（片5 递归上传建目录）→ 名字校验 + 子树断言 + `create_dir`（已存在视为
+    /// 成功）。成功 → `MkDirResult{path:创建目录, err:None}`；失败 → `MkDirResult{path:"", err}`。
+    fn handle_mkdir(&mut self, req_id: u64, dir: String, name: String) {
+        let target = match Self::put_resolve_target(&dir, &name) {
+            Ok(t) => t,
+            Err(err) => {
+                self.send_frame(&RemoteFrame::MkDirResult {
+                    req_id,
+                    path: String::new(),
+                    err: Some(err),
+                });
+                return;
+            }
+        };
+        let err = match std::fs::create_dir(&target) {
+            Ok(()) => None,
+            // 幂等：已存在视为成功（递归上传可能重复建同一目录）。
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(e) => {
+                log::warn!("MkDir 失败 {}: {e}", target.display());
+                Some(io_err_to_fs(&e))
+            }
+        };
+        if let Some(err) = err {
+            self.send_frame(&RemoteFrame::MkDirResult {
+                req_id,
+                path: String::new(),
+                err: Some(err),
+            });
+        } else {
+            self.send_frame(&RemoteFrame::MkDirResult {
+                req_id,
+                path: target.display().to_string(),
+                err: None,
+            });
+        }
+    }
+
+    // ── part3c-2 片5 控制端上传编排（本地 → 被控端递归传输）────────────────────
+
+    /// 控制端：开始把剪贴板里的本地项上传到被控端 `remote_dir`（递归）。
+    ///
+    /// 守卫：非控制中（会话已结束）不起（防死会话复活上传态）；已有上传在途则忽略（同一时刻
+    /// 仅一个上传）。撞名首发用 `Probe`（除非已 `policy==Some(true)` 用 Force），被控端探得已存在
+    /// 时弹覆盖模态一次性决策、套用整次递归。
+    pub fn start_upload(&mut self, items: Vec<ClipItem>, remote_dir: String) {
+        if items.is_empty() || !self.is_controlling() {
+            return;
+        }
+        if self.upload.is_some() || self.download.is_some() {
+            log::debug!("已有传输进行中，忽略新的粘贴上传请求");
+            return;
+        }
+        self.upload = Some(UploadWalk {
+            remote_root: remote_dir.clone(),
+            policy: None,
+            file_queue: VecDeque::new(),
+            inflight_mkdir: HashMap::new(),
+            active_puts: 0,
+            visited: HashSet::new(),
+            conflict_queue: VecDeque::new(),
+            done: 0,
+            skipped: 0,
+            errors: 0,
+        });
+        self.notices.push(Notice::UploadStarted);
+        for item in items {
+            let local_path = PathBuf::from(&item.path);
+            if item.is_dir {
+                self.upload_send_mkdir(local_path, remote_dir.clone(), item.name, 0);
+            } else {
+                self.upload_enqueue_file(local_path, remote_dir.clone(), item.name);
+            }
+        }
+        self.pump_upload();
+    }
+
+    /// 上传编排：发一个 MkDir 在被控端 `remote_dir` 下建 `name`，并记 `inflight_mkdir[req_id]`。
+    /// 环 / 超深 / 名字非法跳过（计错）。
+    fn upload_send_mkdir(
+        &mut self,
+        local_dir: PathBuf,
+        remote_dir: String,
+        name: String,
+        depth: usize,
+    ) {
+        if depth > TRANSFER_MAX_DEPTH {
+            return;
+        }
+        if !is_safe_child_name(&name) {
+            log::warn!("上传目录名非法（拒绝穿越）: {name:?}");
+            if let Some(u) = self.upload.as_mut() {
+                u.errors += 1;
+            }
+            return;
+        }
+        // 防 junction / symlink 成环：按本地 canonical 去重。
+        let canon = local_dir.canonicalize().unwrap_or_else(|_| local_dir.clone());
+        {
+            let Some(u) = self.upload.as_mut() else {
+                return;
+            };
+            if !u.visited.insert(canon) {
+                return;
+            }
+        }
+        let req_id = self.next_req_id();
+        if let Some(u) = self.upload.as_mut() {
+            u.inflight_mkdir.insert(req_id, (local_dir, depth));
+        }
+        self.send_frame(&RemoteFrame::MkDir {
+            req_id,
+            dir: remote_dir,
+            name,
+        });
+    }
+
+    /// 上传编排：把一个本地文件入队（撞名由被控端 `Probe` 决定，不在控制端本地判）。
+    fn upload_enqueue_file(&mut self, local_path: PathBuf, remote_dir: String, name: String) {
+        if !is_safe_child_name(&name) {
+            log::warn!("上传文件名非法（拒绝穿越）: {name:?}");
+            if let Some(u) = self.upload.as_mut() {
+                u.errors += 1;
+            }
+            return;
+        }
+        if let Some(u) = self.upload.as_mut() {
+            u.file_queue.push_back((local_path, remote_dir, name));
+        }
+    }
+
+    /// 上传编排：收 `MkDirResult`（属于上传遍历的 req_id）→ 用返回的被控端 `path` 作为子项 `dir`，
+    /// 读本地目录、子目录续发 MkDir、文件入队。
+    fn upload_mkdir_result(&mut self, req_id: u64, path: String, err: Option<FsErr>) {
+        let Some((local_dir, depth)) = self
+            .upload
+            .as_mut()
+            .and_then(|u| u.inflight_mkdir.remove(&req_id))
+        else {
+            return;
+        };
+        if err.is_some() {
+            if let Some(u) = self.upload.as_mut() {
+                u.errors += 1;
+            }
+            self.pump_upload();
+            return;
+        }
+        // 读本地目录，分流子目录 / 文件（深度受 TRANSFER_MAX_DEPTH 限，环由 visited 防）。
+        if depth < TRANSFER_MAX_DEPTH {
+            match std::fs::read_dir(&local_dir) {
+                Ok(rd) => {
+                    for entry in rd.flatten() {
+                        let child = entry.path();
+                        let child_name = entry.file_name().to_string_lossy().into_owned();
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir {
+                            self.upload_send_mkdir(child, path.clone(), child_name, depth + 1);
+                        } else {
+                            self.upload_enqueue_file(child, path.clone(), child_name);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("上传读本地目录失败 {}: {e}", local_dir.display());
+                    if let Some(u) = self.upload.as_mut() {
+                        u.errors += 1;
+                    }
+                }
+            }
+        }
+        self.pump_upload();
+    }
+
+    /// 上传编排：在并发上限内从 `file_queue` 出队起文件上传（首发 `PutBegin` 探测撞名）；
+    /// 未决期间 `conflict_queue` 非空时暂停起新文件（等覆盖模态）。全队列空 + 无在途 → 结束汇总。
+    fn pump_upload(&mut self) {
+        loop {
+            let next = {
+                let Some(u) = self.upload.as_mut() else {
+                    return;
+                };
+                // 未决期间已积压撞名冲突：暂停起新文件（等用户在覆盖模态拍板）。
+                if u.policy.is_none() && !u.conflict_queue.is_empty() {
+                    break;
+                }
+                if u.active_puts >= DOWNLOAD_MAX_FILES {
+                    break;
+                }
+                u.file_queue.pop_front()
+            };
+            let Some((local_path, remote_dir, name)) = next else {
+                break;
+            };
+            // 本地文件长度（仅供进度；读不到兜底 0，不阻断上传）。
+            let total_len = std::fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+            // 首发策略：policy==Some(true) 用 Force 直接覆盖；否则（None / Some(false)）用 Probe
+            // 探测——None 探到冲突弹模态、Some(false) 探到冲突时被控端按 Skip 重发跳过。
+            let overwrite = if self.upload.as_ref().and_then(|u| u.policy) == Some(true) {
+                PutOverwrite::Force
+            } else {
+                PutOverwrite::Probe
+            };
+            let req_id = self.next_req_id();
+            self.inflight_put_meta.insert(
+                req_id,
+                PutMeta {
+                    local_path,
+                    remote_dir: remote_dir.clone(),
+                    name: name.clone(),
+                },
+            );
+            if let Some(u) = self.upload.as_mut() {
+                u.active_puts += 1;
+            }
+            self.send_frame(&RemoteFrame::PutBegin {
+                req_id,
+                dir: remote_dir,
+                name,
+                total_len,
+                overwrite,
+            });
+        }
+        self.upload_check_complete();
+    }
+
+    /// 控制端：收 `PutReady`（属于上传的 req_id）→ 决策：
+    /// - `err` → 计错 + 减并发 + 续 pump；
+    /// - `conflict:None` → 开始发送（spawn `put_send_worker` + 预授许可）；
+    /// - `conflict:Some` → 按 `policy`：覆盖全部→重发 Force；跳过全部→计跳过 + 减并发；
+    ///   未决（None）→ park 进 `conflict_queue`、暂停起新文件，等覆盖模态。
+    fn put_ready(&mut self, req_id: u64, conflict: Option<PutConflict>, err: Option<FsErr>) {
+        if !self.inflight_put_meta.contains_key(&req_id) {
+            return; // 非上传的 req_id（理论上不会，防御）。
+        }
+        if err.is_some() {
+            self.inflight_put_meta.remove(&req_id);
+            if let Some(u) = self.upload.as_mut() {
+                u.errors += 1;
+                u.active_puts = u.active_puts.saturating_sub(1);
+            }
+            self.pump_upload();
+            return;
+        }
+        if conflict.is_none() {
+            // 无冲突（Probe 探得不存在 / Force 已建临时）→ 开始发送字节流。
+            self.put_start_send(req_id);
+            return;
+        }
+        // 撞名：按 policy 决策。
+        let policy = self.upload.as_ref().and_then(|u| u.policy);
+        match policy {
+            Some(true) => {
+                // 覆盖全部：重发 PutBegin(Force) 让被控端建临时文件（Probe 冲突时没建），再等其
+                // PutReady{None} 才发送。
+                self.put_resend_force(req_id);
+            }
+            Some(false) => {
+                // 跳过全部已存在：计跳过 + 减并发 + 续 pump。
+                self.inflight_put_meta.remove(&req_id);
+                if let Some(u) = self.upload.as_mut() {
+                    u.skipped += 1;
+                    u.active_puts = u.active_puts.saturating_sub(1);
+                }
+                self.pump_upload();
+            }
+            None => {
+                // 未决：把冲突 req park 进队列（**不覆盖**已有的，H1 修复），等覆盖模态拍板。
+                // 不减 active_puts；pump 因 conflict_queue 非空而暂停起新文件。
+                if let Some(u) = self.upload.as_mut() {
+                    u.conflict_queue.push_back(req_id);
+                }
+            }
+        }
+    }
+
+    /// 控制端：对一个 `PutReady{conflict:None}` 的文件开始发送字节流（spawn `put_send_worker` +
+    /// 预授 `FETCH_WINDOW` 许可）。源路径取自 `inflight_put_meta`。
+    fn put_start_send(&mut self, req_id: u64) {
+        // LOW-4 幂等：同 req 已在发送（被控端异常重发 PutReady{None}）则忽略，避免双 worker / 双 seq。
+        if self.inflight_put_src.contains_key(&req_id) {
+            return;
+        }
+        let Some(local_path) = self
+            .inflight_put_meta
+            .get(&req_id)
+            .map(|m| m.local_path.display().to_string())
+        else {
+            return;
+        };
+        let Some(cmd_tx) = self.cmd_tx.clone() else {
+            return;
+        };
+        let (permit_tx, permit_rx) = std::sync::mpsc::channel::<()>();
+        for _ in 0..FETCH_WINDOW {
+            let _ = permit_tx.send(());
+        }
+        self.inflight_put_src
+            .insert(req_id, PutSrcJob { permit_tx });
+        let svc_tx = self.svc_tx.clone();
+        thread::spawn(move || {
+            let ok = put_send_worker(req_id, &local_path, &cmd_tx, &permit_rx);
+            // 成功 → PutSrcDone（等被控端 PutResult 收尾）；失败 → PutSrcFailed（主线程自行收尾）。
+            if let Some(tx) = svc_tx {
+                let _ = tx.send(if ok {
+                    SvcReply::PutSrcDone { req_id }
+                } else {
+                    SvcReply::PutSrcFailed { req_id }
+                });
+            }
+        });
+    }
+
+    /// 控制端：撞名后用户选覆盖 → 对 `req_id` 重发 `PutBegin(Force)`（被控端 Probe 冲突时没建临时
+    /// 文件，须重发 Force 让其建、再等 `PutReady{None}` 才发送）。元信息复用 `inflight_put_meta`。
+    fn put_resend_force(&mut self, req_id: u64) {
+        let Some((remote_dir, name, total_len)) = self.inflight_put_meta.get(&req_id).map(|m| {
+            let total_len = std::fs::metadata(&m.local_path).map(|md| md.len()).unwrap_or(0);
+            (m.remote_dir.clone(), m.name.clone(), total_len)
+        }) else {
+            return;
+        };
+        self.send_frame(&RemoteFrame::PutBegin {
+            req_id,
+            dir: remote_dir,
+            name,
+            total_len,
+            overwrite: PutOverwrite::Force,
+        });
+    }
+
+    /// 控制端：收 `PutResult`（属于上传的 req_id）→ 计统计 + 减并发 + 清元信息 + 续 pump。
+    fn put_result(&mut self, req_id: u64, status: PutStatus, err: Option<FsErr>) {
+        if self.inflight_put_meta.remove(&req_id).is_none() {
+            return;
+        }
+        self.inflight_put_src.remove(&req_id); // worker 通常已自退（PutEnd 后），幂等清理。
+        if let Some(u) = self.upload.as_mut() {
+            if err.is_some() {
+                u.errors += 1;
+            } else {
+                match status {
+                    PutStatus::Written => u.done += 1,
+                    PutStatus::Skipped => u.skipped += 1,
+                }
+            }
+            u.active_puts = u.active_puts.saturating_sub(1);
+        }
+        self.pump_upload();
+    }
+
+    /// 上传编排：全部完成（文件队列空 + 无在途 MkDir + 无在途 Put + 无待决冲突）→ 汇总 + 结束。
+    fn upload_check_complete(&mut self) {
+        let complete = self.upload.as_ref().is_some_and(|u| {
+            u.file_queue.is_empty()
+                && u.inflight_mkdir.is_empty()
+                && u.active_puts == 0
+                && u.conflict_queue.is_empty()
+        });
+        if complete {
+            if let Some(u) = self.upload.take() {
+                log::debug!(
+                    "上传完成 root={} done={} skipped={} errors={}",
+                    u.remote_root,
+                    u.done,
+                    u.skipped,
+                    u.errors
+                );
+                self.notices.push(Notice::UploadDone {
+                    done: u.done,
+                    skipped: u.skipped,
+                    errors: u.errors,
+                });
+            }
+        }
+    }
+
+    /// 控制端：上传撞名时供覆盖模态的待决冲突项数（`conflict_queue` 长度；未决期间非空）。
+    #[must_use]
+    pub fn upload_conflict_count(&self) -> Option<usize> {
+        self.upload.as_ref().and_then(|u| {
+            if u.policy.is_none() && !u.conflict_queue.is_empty() {
+                Some(u.conflict_queue.len())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// 控制端：用户在覆盖模态拍板（上传撞名）：覆盖 → `policy=Some(true)` + 对**全部**待决文件
+    /// 重发 Force；跳过 → `policy=Some(false)` + 计跳过全部待决；取消 → 中止整个上传。决策后
+    /// `policy` 锁定，后续冲突直接套用、不再弹窗。
+    pub fn resolve_upload_conflict(&mut self, choice: crate::shell::OverwriteChoice) {
+        use crate::shell::OverwriteChoice;
+        // 取走整个待决队列（一次决策套用全部，H1：多冲突不丢）。
+        let Some(queued) = self
+            .upload
+            .as_mut()
+            .map(|u| std::mem::take(&mut u.conflict_queue))
+        else {
+            return;
+        };
+        if queued.is_empty() {
+            return;
+        }
+        match choice {
+            OverwriteChoice::Overwrite => {
+                if let Some(u) = self.upload.as_mut() {
+                    u.policy = Some(true);
+                }
+                for req_id in queued {
+                    self.put_resend_force(req_id); // active_puts 已计在内、不变
+                }
+                self.pump_upload();
+            }
+            OverwriteChoice::Skip => {
+                let n = queued.len();
+                for req_id in &queued {
+                    self.inflight_put_meta.remove(req_id);
+                }
+                if let Some(u) = self.upload.as_mut() {
+                    u.policy = Some(false);
+                    u.skipped += n;
+                    u.active_puts = u.active_puts.saturating_sub(n);
+                }
+                self.pump_upload();
+            }
+            OverwriteChoice::Cancel => {
+                // 中止整个上传：清在途源 / 元信息（被控端临时文件由会话清理回收）。
+                self.inflight_put_src.clear();
+                self.inflight_put_meta.clear();
+                self.upload = None;
+            }
+        }
+    }
+
     /// 清空文件树同步态（会话起止 / 断线；**不**在终端 Resize 时清——resize 不动文件树）。
     fn clear_remote_filetree(&mut self) {
         self.remote_filetree = None;
@@ -1559,6 +2346,16 @@ impl RemoteWs {
         self.inflight_fetch_src.clear();
         // #7 下载编排终止（在途文件的部分落地文件已由上面 inflight_fetch.drain 删除）。
         self.download = None;
+        // 片5 被控端在途 Put 目标：关句柄 + 删临时文件（半成品 `.lumen-put-*.tmp`）。
+        for (_, mut job) in self.inflight_put.drain() {
+            job.file = None;
+            let _ = std::fs::remove_file(&job.tmp_path);
+        }
+        // 片5 控制端在途 Put 源：drop permit_tx → worker 领许可失败自行退出。
+        self.inflight_put_src.clear();
+        self.inflight_put_meta.clear();
+        // 片5 上传编排终止。
+        self.upload = None;
         // 远程侧剪贴板失效（被控端不可达，防粘贴野路径）；本地侧保留（仍指向控制端本机）。
         if matches!(
             self.file_clipboard.as_ref().map(|c| c.side),
@@ -2053,15 +2850,69 @@ impl RemoteWs {
                     self.fetch_abort(req_id, err);
                 }
             }
-            // 片4/5：Put*/MkDir*。当前未实现，忽略。
-            RemoteFrame::PutBegin { .. }
-            | RemoteFrame::PutReady { .. }
-            | RemoteFrame::PutChunk { .. }
-            | RemoteFrame::PutChunkAck { .. }
-            | RemoteFrame::PutEnd { .. }
-            | RemoteFrame::PutResult { .. }
-            | RemoteFrame::MkDir { .. }
-            | RemoteFrame::MkDirResult { .. } => {}
+            // ── part3c-2 片5 上传：Put*/MkDir*（按角色路由）─────────────────
+            RemoteFrame::PutBegin {
+                req_id,
+                dir,
+                name,
+                total_len,
+                overwrite,
+            } => {
+                // 仅被控端：建临时文件 + 撞名探测 + 子树断言（写盘服务）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_put_begin(req_id, dir, name, total_len, overwrite);
+                }
+            }
+            RemoteFrame::PutReady {
+                req_id,
+                conflict,
+                err,
+            } => {
+                // 仅控制端：决策开始发送 / 重发 Force / 暂停等覆盖。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.put_ready(req_id, conflict, err);
+                }
+            }
+            RemoteFrame::PutChunk { req_id, seq, data } => {
+                // 仅被控端：顺序写临时文件 + 回 PutChunkAck（背压）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_put_chunk(req_id, seq, &data);
+                }
+            }
+            RemoteFrame::PutChunkAck { req_id, .. } => {
+                // 仅控制端：放行 Put 源 worker 下一块（滑动窗口背压）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.put_src_ack(req_id);
+                }
+            }
+            RemoteFrame::PutEnd { req_id } => {
+                // 仅被控端：flush + 原子 rename 临时文件到目标。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_put_end(req_id);
+                }
+            }
+            RemoteFrame::PutResult {
+                req_id,
+                status,
+                err,
+            } => {
+                // 仅控制端：计统计 + 续推上传队列。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.put_result(req_id, status, err);
+                }
+            }
+            RemoteFrame::MkDir { req_id, dir, name } => {
+                // 仅被控端：建目录（幂等）+ 子树断言。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.handle_mkdir(req_id, dir, name);
+                }
+            }
+            RemoteFrame::MkDirResult { req_id, path, err } => {
+                // 仅控制端：用返回的被控端目录路径递归上传其子项。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
+                    self.upload_mkdir_result(req_id, path, err);
+                }
+            }
             RemoteFrame::Echo(_) => {}
         }
     }
@@ -2592,6 +3443,203 @@ mod tests {
         );
         ws.clear_remote_filetree();
         assert!(ws.file_clipboard().is_some(), "Local 侧保留");
+    }
+
+    #[test]
+    fn 上传_被控端写盘_原子rename落地() {
+        // 直接驱动被控端 Put 接收态（不经线程 / WS）：PutBegin(Force) → chunk → end，验证目标
+        // 文件内容（send_frame 无 cmd_tx → 静默 no-op）。
+        let mut ws = RemoteWs::default();
+        let dir = std::env::temp_dir().join(format!("lumen_put_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        let req = 42u64;
+        // Force：建临时文件 + 存 inflight_put。
+        ws.handle_put_begin(req, dir.display().to_string(), "f.txt".into(), 11, PutOverwrite::Force);
+        let tmp = ws
+            .inflight_put
+            .get(&req)
+            .map(|j| j.tmp_path.clone())
+            .expect("PutBegin(Force) 建了临时文件");
+        assert!(tmp.exists(), "临时文件已创建");
+        // 顺序两块写入。
+        ws.handle_put_chunk(req, 0, b"hello ");
+        ws.handle_put_chunk(req, 1, b"world");
+        assert_eq!(ws.inflight_put.get(&req).map(|j| j.next_seq), Some(2));
+        // PutEnd：flush + 原子 rename 到目标。
+        ws.handle_put_end(req);
+        assert!(!ws.inflight_put.contains_key(&req), "end 后移除在途");
+        assert!(!tmp.exists(), "rename 后临时文件不在");
+        let target = dir.join("f.txt");
+        let content = std::fs::read(&target).expect("目标文件应落地");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(content, b"hello world", "上传内容正确落地");
+    }
+
+    #[test]
+    fn 上传_被控端_路径穿越被拒() {
+        let mut ws = RemoteWs::default();
+        let dir = std::env::temp_dir().join(format!("lumen_put_trav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        // name=".." → validate_entry_name 拒 → 不建临时文件（PutReady{err} 经 send_frame no-op）。
+        ws.handle_put_begin(1, dir.display().to_string(), "..".into(), 0, PutOverwrite::Force);
+        assert!(ws.inflight_put.is_empty(), "穿越名（..）被拒，不建临时");
+        // name 含分隔符 → 同样被拒。
+        ws.handle_put_begin(2, dir.display().to_string(), "a/b".into(), 0, PutOverwrite::Force);
+        assert!(ws.inflight_put.is_empty(), "穿越名（a/b）被拒，不建临时");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 上传_被控端_probe撞名与skip不写() {
+        let mut ws = RemoteWs::default();
+        let dir = std::env::temp_dir().join(format!("lumen_put_conf_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        std::fs::write(dir.join("exist.txt"), b"old").expect("写已存在文件");
+        // Probe 命中已存在 → 回 conflict、不建临时、不写。
+        ws.handle_put_begin(1, dir.display().to_string(), "exist.txt".into(), 3, PutOverwrite::Probe);
+        assert!(ws.inflight_put.is_empty(), "Probe 撞名不建临时文件");
+        assert_eq!(
+            std::fs::read(dir.join("exist.txt")).expect("旧文件仍在"),
+            b"old",
+            "Probe 不动旧文件"
+        );
+        // Skip → 直接 PutResult{Skipped}、不写。
+        ws.handle_put_begin(2, dir.display().to_string(), "exist.txt".into(), 3, PutOverwrite::Skip);
+        assert!(ws.inflight_put.is_empty(), "Skip 不建临时文件");
+        assert_eq!(
+            std::fs::read(dir.join("exist.txt")).expect("旧文件仍在"),
+            b"old",
+            "Skip 不动旧文件"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 上传_被控端_mkdir幂等并回带路径() {
+        let mut ws = RemoteWs::default();
+        let dir = std::env::temp_dir().join(format!("lumen_mkdir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建测试目录");
+        // 首建成功。
+        ws.handle_mkdir(1, dir.display().to_string(), "sub".into());
+        let created = dir.join("sub");
+        assert!(created.is_dir(), "create_dir 落地");
+        // 再建同名 → AlreadyExists 视为成功（幂等，不 panic、目录仍在）。
+        ws.handle_mkdir(2, dir.display().to_string(), "sub".into());
+        assert!(created.is_dir(), "幂等：已存在仍视为成功");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 构造一个「控制中」会话的 `RemoteWs`（上传编排守卫 is_controlling）。
+    fn controlling_ws() -> RemoteWs {
+        RemoteWs {
+            session: Some(ActiveSession {
+                peer_name: "peer".into(),
+                role: Role::Controller,
+            }),
+            ..RemoteWs::default()
+        }
+    }
+
+    #[test]
+    fn 上传_控制端_单文件起编排() {
+        let mut ws = controlling_ws();
+        // 起单文件上传：入 file_queue → pump 起一个 PutBegin（Probe），记 inflight_put_meta。
+        ws.start_upload(
+            vec![ClipItem {
+                path: "C:\\local\\a.txt".into(),
+                name: "a.txt".into(),
+                is_dir: false,
+            }],
+            "/remote/dst".into(),
+        );
+        assert!(ws.upload.is_some(), "上传编排已建");
+        assert_eq!(ws.inflight_put_meta.len(), 1, "发了一个 PutBegin、记一项元信息");
+        let meta = ws.inflight_put_meta.values().next().expect("有元信息");
+        assert_eq!(meta.name, "a.txt");
+        assert_eq!(meta.remote_dir, "/remote/dst");
+        assert_eq!(ws.upload.as_ref().map(|u| u.active_puts), Some(1), "active_puts=1");
+        // 应弹 UploadStarted。
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::UploadStarted)),
+            "应弹 UploadStarted"
+        );
+    }
+
+    #[test]
+    fn 上传_控制端_撞名暂停等覆盖() {
+        let mut ws = controlling_ws();
+        ws.start_upload(
+            vec![ClipItem {
+                path: "C:\\local\\a.txt".into(),
+                name: "a.txt".into(),
+                is_dir: false,
+            }],
+            "/remote/dst".into(),
+        );
+        let req = *ws.inflight_put_meta.keys().next().expect("有在途 Put");
+        // 被控端探得撞名（conflict）且 policy=None → 暂停，等覆盖模态。
+        ws.put_ready(req, Some(PutConflict { is_dir: false, existing_len: 9 }), None);
+        assert_eq!(ws.upload_conflict_count(), Some(1), "暂停 → 弹覆盖模态");
+        // 用户选跳过 → policy=Some(false)、计跳过、清待决，编排完成。
+        ws.resolve_upload_conflict(crate::shell::OverwriteChoice::Skip);
+        assert!(ws.upload.is_none(), "跳过后无其它文件 → 编排完成");
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::UploadDone { skipped: 1, done: 0, .. })),
+            "应弹 UploadDone(skipped=1)"
+        );
+    }
+
+    #[test]
+    fn 上传_多文件同时撞名_不互相覆盖() {
+        // H1 回归：policy=None 时多个 PutReady{conflict} 并发回来必须都进队列、互不覆盖，
+        // 否则被覆盖的 req 永占 active_puts → 上传永久挂死。
+        let mut ws = controlling_ws();
+        ws.start_upload(
+            vec![
+                ClipItem {
+                    path: "C:\\local\\a.txt".into(),
+                    name: "a.txt".into(),
+                    is_dir: false,
+                },
+                ClipItem {
+                    path: "C:\\local\\b.txt".into(),
+                    name: "b.txt".into(),
+                    is_dir: false,
+                },
+            ],
+            "/remote/dst".into(),
+        );
+        let reqs: Vec<u64> = ws.inflight_put_meta.keys().copied().collect();
+        assert_eq!(reqs.len(), 2, "两文件各发一 PutBegin");
+        // 两者都探到撞名（policy=None）→ 都 park 进 conflict_queue（不互相覆盖）。
+        for &req in &reqs {
+            ws.put_ready(
+                req,
+                Some(PutConflict {
+                    is_dir: false,
+                    existing_len: 1,
+                }),
+                None,
+            );
+        }
+        assert_eq!(ws.upload_conflict_count(), Some(2), "两冲突都在队列（H1：未覆盖）");
+        // 跳过全部 → 两者都计跳过、队列清空、编排完成（不挂死）。
+        ws.resolve_upload_conflict(crate::shell::OverwriteChoice::Skip);
+        assert!(ws.upload.is_none(), "跳过全部后编排完成、未挂死");
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::UploadDone { skipped: 2, .. })),
+            "应弹 UploadDone(skipped=2)"
+        );
     }
 
     #[test]

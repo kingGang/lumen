@@ -290,12 +290,15 @@ pub enum RemoteFrame {
         req_id: u64,
     },
     /// 被控端 → 控制端：写入最终结果。
+    ///
+    /// **`err` 优先于 `status`**：`err=Some` 时该次写入失败，`status` 无意义（实现可能填任意值，
+    /// 如中止路径回 `Written`）——消费方必须先判 `err`，再看 `status`。
     PutResult {
         /// 关联请求号。
         req_id: u64,
-        /// 写入 / 跳过。
+        /// 写入 / 跳过（仅 `err=None` 时有意义）。
         status: PutStatus,
-        /// 失败原因（失败时 `Some`）。
+        /// 失败原因（失败时 `Some`；非 `None` 时盖过 `status`）。
         err: Option<FsErr>,
     },
     /// 控制端 → 被控端：在 `dir` 下创建子目录 `name`（递归上传建目录结构；幂等）。
@@ -311,6 +314,8 @@ pub enum RemoteFrame {
     MkDirResult {
         /// 关联请求号。
         req_id: u64,
+        /// 创建成功的子目录被控端完整路径（控制端递归上传时作为其子项的 `dir`；`err=Some` 时为空串）。
+        path: String,
         /// 失败原因。
         err: Option<FsErr>,
     },
@@ -646,7 +651,16 @@ mod tests {
                 dir: "C:\\dst".into(),
                 name: "sub".into(),
             },
-            RemoteFrame::MkDirResult { req_id: 10, err: None },
+            RemoteFrame::MkDirResult {
+                req_id: 10,
+                path: "C:\\dst\\sub".into(),
+                err: None,
+            },
+            RemoteFrame::MkDirResult {
+                req_id: 11,
+                path: String::new(),
+                err: Some(FsErr::PermissionDenied),
+            },
         ];
         for frame in frames {
             let v = frame.to_value().expect("to_value");

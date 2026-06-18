@@ -238,6 +238,10 @@ pub struct Strings {
     pub remote_download_started: &'static str,
     /// part3c-2 #7：下载完成汇总 toast，三参 `{0}`完成 `{1}`跳过 `{2}`出错
     pub remote_download_done_fmt: &'static str,
+    /// part3c-2 片5：开始上传 toast
+    pub remote_upload_started: &'static str,
+    /// part3c-2 片5：上传完成汇总 toast，三参 `{0}`完成 `{1}`跳过 `{2}`出错
+    pub remote_upload_done_fmt: &'static str,
     /// part3c-2 #7：复制项后右键「粘贴到此目录」菜单
     pub remote_menu_paste: &'static str,
     /// part3c-2 #7：远程/本地树右键「复制」菜单

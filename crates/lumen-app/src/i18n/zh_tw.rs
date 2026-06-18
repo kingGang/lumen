@@ -123,6 +123,8 @@ pub static STRINGS: Strings = Strings {
     remote_fetch_too_large: "檔案過大，無法取得",
     remote_download_started: "開始下載…",
     remote_download_done_fmt: "下載完成：{0} 個，跳過 {1}，出錯 {2}",
+    remote_upload_started: "開始上傳…",
+    remote_upload_done_fmt: "上傳完成：{0} 個，跳過 {1}，出錯 {2}",
     remote_menu_paste: "貼上到此目錄",
     remote_menu_copy: "複製",
     remote_overwrite_prompt_fmt: "目標已有 {} 個同名項，如何處理？",
