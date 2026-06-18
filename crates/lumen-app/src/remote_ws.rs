@@ -30,8 +30,10 @@ use lumen_protocol::remote::{
 use lumen_term::Terminal;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
+use winit::event_loop::EventLoopProxy;
 
 use crate::cloud::server_url;
+use crate::PtyWake;
 
 /// 控制端镜像 Terminal 的 scrollback 上限（行）。被控端转发的实时输出滚出可见区后
 /// 进镜像的历史，控制端可上滚回看。
@@ -136,7 +138,18 @@ pub struct RemoteWs {
 
 impl RemoteWs {
     /// 登录后启动后台 WS 线程（已在跑则先停旧的）。`token` 为账户 JWT。
-    pub fn start(&mut self, token: String, ctx: egui::Context) {
+    ///
+    /// `proxy` + `wake_pending`：后台收到消息时除 `ctx.request_repaint()` 外，再发
+    /// `PtyWake` user event 唤醒 winit 事件循环——**否则窗口失焦时 `request_repaint`
+    /// 唤不醒空闲循环，远程消息（配对/输入/镜像）会卡到焦点回来才处理**（与 PTY
+    /// 输出同款唤醒机制，共用 `wake_pending` 去重防事件风暴）。
+    pub fn start(
+        &mut self,
+        token: String,
+        ctx: egui::Context,
+        proxy: EventLoopProxy<PtyWake>,
+        wake_pending: Arc<AtomicBool>,
+    ) {
         self.stop();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
@@ -146,7 +159,7 @@ impl RemoteWs {
         self.stop = Some(stop.clone());
         if let Err(e) = thread::Builder::new()
             .name("lumen-remote-ws".into())
-            .spawn(move || worker(&token, &cmd_rx, &evt_tx, &stop, &ctx))
+            .spawn(move || worker(&token, &cmd_rx, &evt_tx, &stop, &ctx, &proxy, &wake_pending))
         {
             log::error!("启动远程 WS 线程失败: {e}");
         }
@@ -395,6 +408,16 @@ impl RemoteWs {
     }
 }
 
+/// 唤醒主线程：标记 egui 重绘 + 发 `PtyWake` 唤醒 winit 循环（失焦也送达；共用
+/// `wake_pending` 去重，避免高频输出时事件风暴）。
+fn nudge(ctx: &egui::Context, proxy: &EventLoopProxy<PtyWake>, wake_pending: &Arc<AtomicBool>) {
+    ctx.request_repaint();
+    // SeqCst 与主线程清标志（main.rs user_event）配对，避免丢唤醒；swap RMW 恒读最新值。
+    if !wake_pending.swap(true, Ordering::SeqCst) {
+        let _ = proxy.send_event(PtyWake);
+    }
+}
+
 /// 后台线程主体：连接 → 跑读写循环 → 断线退避重连，直到 `stop`。
 fn worker(
     token: &str,
@@ -402,15 +425,17 @@ fn worker(
     evt_tx: &Sender<WsEvent>,
     stop: &Arc<AtomicBool>,
     ctx: &egui::Context,
+    proxy: &EventLoopProxy<PtyWake>,
+    wake_pending: &Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match connect_ws(token) {
             Ok(mut socket) => {
                 let _ = evt_tx.send(WsEvent::Connected);
-                ctx.request_repaint();
-                run_connection(&mut socket, cmd_rx, evt_tx, stop, ctx);
+                nudge(ctx, proxy, wake_pending);
+                run_connection(&mut socket, cmd_rx, evt_tx, stop, ctx, proxy, wake_pending);
                 let _ = evt_tx.send(WsEvent::Disconnected);
-                ctx.request_repaint();
+                nudge(ctx, proxy, wake_pending);
             }
             Err(e) => log::warn!("远程 WS 连接失败: {e}"),
         }
@@ -428,6 +453,8 @@ fn run_connection(
     evt_tx: &Sender<WsEvent>,
     stop: &Arc<AtomicBool>,
     ctx: &egui::Context,
+    proxy: &EventLoopProxy<PtyWake>,
+    wake_pending: &Arc<AtomicBool>,
 ) {
     let mut last_ping = Instant::now();
     loop {
@@ -460,7 +487,7 @@ fn run_connection(
                 match serde_json::from_str::<RemoteS2C>(text.as_str()) {
                     Ok(msg) => {
                         let _ = evt_tx.send(WsEvent::Server(Box::new(msg)));
-                        ctx.request_repaint();
+                        nudge(ctx, proxy, wake_pending);
                     }
                     Err(e) => log::debug!("远程 WS 消息解析失败: {e}"),
                 }

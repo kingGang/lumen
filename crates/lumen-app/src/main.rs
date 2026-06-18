@@ -926,6 +926,66 @@ impl AppState {
     /// 返回 [`Vec<action::StateEvent>`]，消费方后批接（渲染 / 历史库 /
     /// 状态条 / M4 状态增量同步）。批B 仅返回 `ModeChanged` 和
     /// `FallbackToggled` 事件，其余批次逐步填充。
+    /// M5.3：处理远程控制 WS（收帧 + 被控端执行远程输入 + 被控端整屏快照转发）。
+    /// 在 `user_event` 调用（`PtyWake` 失焦也送达），故配对码/远程输入/镜像不再卡到
+    /// 焦点回来才更新（bug2）。在 PTY drain 之前调：先发整屏快照、再由 tee 转发实时
+    /// 增量，保证控制端镜像「快照先于增量」的顺序。
+    fn pump_remote(&mut self) {
+        if !self.remote_ws.is_running() {
+            return;
+        }
+        let changed = self.remote_ws.poll();
+        // 被控端：执行控制端转发来的远程输入（本地输入优先仲裁）。
+        let mut applied = false;
+        let remote_input = self.remote_ws.take_input();
+        if !remote_input.is_empty() {
+            let local_busy = self
+                .last_key_at
+                .is_some_and(|t| t.elapsed() < REMOTE_INPUT_ARBITRATION);
+            if local_busy {
+                log::debug!("本地输入优先：丢弃 {} 段远程输入", remote_input.len());
+            } else {
+                let ti = self.active_tab;
+                let pi = self.tabs[ti].focused;
+                for bytes in remote_input {
+                    self.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
+                    if let Err(e) = self.tabs[ti].panes[pi].write_user_input(&bytes) {
+                        error!("远程输入写 PTY 失败: {e:#}");
+                    }
+                }
+                applied = true;
+            }
+        }
+        // 被控端：焦点窗格 (id,行,列) 变化（会话起始 / resize / 切焦点 / 切 tab）即
+        // 重发尺寸 + 整屏 VT 快照（控制端 advance 重放得起始整屏）。
+        let controlled = matches!(
+            self.remote_ws.session.as_ref().map(|s| s.role),
+            Some(lumen_protocol::remote::Role::Controlled)
+        );
+        if controlled {
+            let pane = self.tabs[self.active_tab].focused_pane();
+            let g = pane.term.grid();
+            let key = (pane.id, g.rows(), g.cols());
+            if self.mirror_src != Some(key) {
+                let snap = remote_mirror::screen_snapshot_vt(&pane.term);
+                self.mirror_src = Some(key);
+                self.remote_ws.send_resize(key.1 as u16, key.2 as u16);
+                self.remote_ws.send_output(&snap);
+            }
+        } else {
+            self.mirror_src = None;
+        }
+        if changed || applied {
+            self.window.request_redraw();
+        }
+    }
+
+    /// 控制端镜像视图是否生效（控制中 且 处于「远程」视图）：决定键盘是否转发给
+    /// 被控端而非本地执行（bug3：切回「本地」视图则本地输入、不转发、不画镜像）。
+    fn is_mirror_active(&self) -> bool {
+        self.remote_ws.is_controlling() && self.settings.layout.view_mode
+    }
+
     fn dispatch(
         &mut self,
         action: action::Action,
@@ -1103,8 +1163,8 @@ impl AppState {
             // ── Term：本批完整实现 ─────────────────────────────────────
             Action::Term(ta) => match ta {
                 TermAction::Interrupt => {
-                    // M5.3 part4：控制中则把中断（Ctrl+C）转发给被控端。
-                    if self.remote_ws.is_controlling() {
+                    // M5.3 part4：镜像视图生效（控制中+远程视图）则把中断转发给被控端。
+                    if self.is_mirror_active() {
                         self.remote_ws.send_input(b"\x03");
                     } else if let Err(e) = self.tabs[ti].panes[pi].write_user_input(b"\x03") {
                         log::error!("写入 PTY 失败（Interrupt）: {e:#}");
@@ -3422,7 +3482,15 @@ impl ApplicationHandler<PtyWake> for App {
             return;
         }
         // 先清挂起标志再 drain：drain 期间新到的数据会触发下一个 wake，不丢。
-        state.wake_pending.store(false, Ordering::Release);
+        // 用 SeqCst（非 Release）：full barrier 阻止下面的 drain/pump_remote 被重排到
+        // 清标志之前——否则存在丢唤醒窗口（后台线程 swap(true) 见旧值跳过发 PtyWake，
+        // 而数据已入队却无人唤醒处理）。后台线程的 swap RMW 恒读最新值，故 store 侧的
+        // 顺序是关键。
+        state.wake_pending.store(false, Ordering::SeqCst);
+
+        // M5.3：先处理远程控制 WS（失焦也经此路径，bug2）——收帧 + 应用远程输入 +
+        // 整屏快照转发。置于 PTY drain 之前，保证「快照先于实时增量」。
+        state.pump_remote();
 
         let drain_t0 = Instant::now();
         let active_tab = state.active_tab;
@@ -4375,10 +4443,11 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::PassThrough) => {
-                        // M5.3 part4：控制中则把按键编码转发给被控端，不写本地窗格。
+                        // M5.3 part4：镜像视图生效（控制中+远程视图）则把按键编码转发
+                        // 给被控端、不写本地窗格（bug3：本地视图时仍是本地输入）。
                         // （win32-input 模式为 env 门控边角，转发统一用标准 encode_key；
                         // IME/粘贴转发留 part4b。）
-                        if state.remote_ws.is_controlling() {
+                        if state.is_mirror_active() {
                             if let Some(bytes) = input::encode_key(&event, state.modifiers) {
                                 state.remote_ws.send_input(&bytes);
                             }
@@ -4978,31 +5047,6 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                     })
                     .collect();
-                // M5.3 part4 被控端：执行控制端转发来的远程输入（受「本地输入优先」
-                // 仲裁：被控端本地用户最近 REMOTE_INPUT_ARBITRATION 内输入过则丢弃）。
-                // 放在借 `tab` 之前（此处 state.tabs 空闲）；取的是上一帧 poll 收下的
-                // 输入（1 帧延迟可忽略）。
-                {
-                    let remote_input = state.remote_ws.take_input();
-                    if !remote_input.is_empty() {
-                        let local_busy = state
-                            .last_key_at
-                            .is_some_and(|t| t.elapsed() < REMOTE_INPUT_ARBITRATION);
-                        if local_busy {
-                            log::debug!("本地输入优先：丢弃 {} 段远程输入", remote_input.len());
-                        } else {
-                            let ti = state.active_tab;
-                            let pi = state.tabs[ti].focused;
-                            for bytes in remote_input {
-                                state.tabs[ti].panes[pi].term.grid_mut().scroll_to_bottom();
-                                if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
-                                    error!("远程输入写 PTY 失败: {e:#}");
-                                }
-                            }
-                            state.window.request_redraw();
-                        }
-                    }
-                }
                 let tab = &state.tabs[state.active_tab];
                 // 本帧布局对应的窗格 id 快照：下方动作（关 tab/增删窗
                 // 格）可能改变结构，矩形与窗格的对应关系以此校验。
@@ -5157,36 +5201,25 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 if !state.remote_ws.is_running() {
                     if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
-                        state.remote_ws.start(tok, state.egui_ctx.clone());
+                        state.remote_ws.start(
+                            tok,
+                            state.egui_ctx.clone(),
+                            state.proxy.clone(),
+                            state.wake_pending.clone(),
+                        );
                     }
                 }
                 let _ = state.remote.poll();
-                let _ = state.remote_ws.poll();
-                // M5.3 part3a 被控端：被控期间，焦点窗格的 (id,行,列) 一旦变化（会话
-                // 起始 / resize / 切焦点 / 切 tab）即重发尺寸 + 整屏 VT 快照（控制端
-                // advance 重放得起始整屏）；之后的实时增量由 PTY tee 处持续转发。
-                {
-                    let controlled = matches!(
-                        state.remote_ws.session.as_ref().map(|s| s.role),
-                        Some(lumen_protocol::remote::Role::Controlled)
-                    );
-                    if controlled {
-                        let pane = state.tabs[state.active_tab].focused_pane();
-                        let g = pane.term.grid();
-                        let key = (pane.id, g.rows(), g.cols());
-                        if state.mirror_src != Some(key) {
-                            let snap = remote_mirror::screen_snapshot_vt(&pane.term);
-                            state.mirror_src = Some(key);
-                            state.remote_ws.send_resize(key.1 as u16, key.2 as u16);
-                            state.remote_ws.send_output(&snap);
-                        }
-                    } else {
-                        state.mirror_src = None;
-                    }
-                }
-                // M5.3 part3a 控制端：控制中则从镜像 Terminal 提取文本视图供渲染
-                // （mirror() 仅 role==Controller 会话期间 Some）。
-                let remote_mirror_view = state.remote_ws.mirror().map(remote_mirror::mirror_view);
+                // 远程 WS 的 poll / 被控端输入应用 / 整屏快照转发已移到 user_event
+                // （App::pump_remote），失焦也能及时处理（否则配对/输入/镜像会卡到
+                // 焦点回来）；此处只读镜像态供渲染。
+                // M5.3 part3a 控制端 + bug3：仅「远程」视图才把镜像画进终端工作区，
+                // 切回「本地」视图显示本地终端（mirror() 仅控制中会话期间 Some）。
+                let remote_mirror_view = if state.settings.layout.view_mode {
+                    state.remote_ws.mirror().map(remote_mirror::mirror_view)
+                } else {
+                    None
+                };
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
