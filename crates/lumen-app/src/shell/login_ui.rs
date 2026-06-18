@@ -154,12 +154,34 @@ pub fn show(ctx: &egui::Context, st: &mut LoginUiState, pal: &Palette) -> LoginO
         .show(ctx, |ui| {
             ui.set_width(CARD_WIDTH);
 
-            // 右上 ✕。
+            // 右上关闭：painter 画线 ✕（r=4.5、线宽 1.2，与设置页/顶栏窗控同款）。
+            // 不用 RichText 字符，避免字体不含 ✕ 字形导致图标不可控。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                let close =
-                    egui::Button::new(egui::RichText::new("✕").size(14.0).color(pal.fg_dim))
-                        .fill(egui::Color32::TRANSPARENT);
-                if ui.add(close).clicked() {
+                let (close_rect, close_resp) =
+                    ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+                {
+                    let painter = ui.painter();
+                    if close_resp.hovered() {
+                        painter.rect_filled(
+                            close_rect,
+                            egui::CornerRadius::same(4),
+                            pal.bg_highlight,
+                        );
+                    }
+                    let fg = if close_resp.hovered() { pal.fg } else { pal.fg_dim };
+                    let r = 4.5_f32;
+                    let c = close_rect.center();
+                    let stroke = egui::Stroke::new(1.2, fg);
+                    painter.line_segment(
+                        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+                        stroke,
+                    );
+                    painter.line_segment(
+                        [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+                        stroke,
+                    );
+                }
+                if close_resp.clicked() {
                     out.closed = true;
                 }
             });
