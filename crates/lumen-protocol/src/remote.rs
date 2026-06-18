@@ -112,6 +112,15 @@ pub enum RemoteFrame {
     /// 控制端 → 被控端：用户输入的 VT 编码字节（按键 / 中断等）。被控端写入焦点
     /// 窗格 PTY（受「本地输入优先」仲裁：被控端本地用户刚输入过则丢弃，part4）。
     Input(Vec<u8>),
+    /// 控制端 → 被控端：请求被控端焦点窗格 resize 到此行列（SSH 式：远端跟随控制
+    /// 端视图尺寸，被控端 shell/程序按此重排，控制端满屏渲染、零 letterbox）。被控
+    /// 期间覆盖被控端自身窗口尺寸；断开后恢复（part3 视口协商）。
+    ViewportResize {
+        /// 行数。
+        rows: u16,
+        /// 列数。
+        cols: u16,
+    },
 }
 
 impl RemoteFrame {

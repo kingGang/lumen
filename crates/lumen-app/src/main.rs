@@ -599,6 +599,11 @@ struct AppState {
     /// M5.3 part3a 被控端镜像源标识 `(焦点窗格 id, 行, 列)`：变化（会话起始 / resize /
     /// 切焦点 / 切 tab）即重发尺寸 + 整屏快照。被控期间外为 None。
     mirror_src: Option<(session::SessionId, usize, usize)>,
+    /// M5.3 被控端远程视口覆盖 `(行, 列)`：被控期间焦点窗格按此 resize（SSH 式跟随
+    /// 控制端视图尺寸），覆盖自身窗口尺寸；非被控时 None（恢复窗口尺寸）。
+    remote_viewport: Option<(usize, usize)>,
+    /// M5.3 控制端上次发给被控端的视口尺寸 `(行, 列)`：变化才重发，避免每帧刷。
+    mirror_viewport_sent: Option<(u16, u16)>,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -974,6 +979,20 @@ impl AppState {
             }
         } else {
             self.mirror_src = None;
+        }
+        // 被控端视口跟随（SSH 式）：应用控制端请求的视口尺寸，覆盖自身窗口尺寸；
+        // 非被控时清除以恢复窗口尺寸（resize 循环据 remote_viewport 决定焦点窗格尺寸）。
+        if controlled {
+            if let Some((r, c)) = self.remote_ws.take_viewport() {
+                let dims = (usize::from(r).max(1), usize::from(c).max(1));
+                if self.remote_viewport != Some(dims) {
+                    self.remote_viewport = Some(dims);
+                    self.window.request_redraw();
+                }
+            }
+        } else if self.remote_viewport.take().is_some() {
+            // 断开/不再被控：恢复窗口尺寸（下一帧 resize 循环按矩形重算）。
+            self.window.request_redraw();
         }
         if changed || applied {
             self.window.request_redraw();
@@ -3290,6 +3309,8 @@ impl App {
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
             mirror_src: None,
+            remote_viewport: None,
+            mirror_viewport_sent: None,
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -5899,6 +5920,25 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.end_remote_session {
                     state.remote_ws.end_session();
                 }
+                // M5.3 控制端视口跟随（SSH 式）：控制中（远程视图）按自己终端区尺寸
+                // （同款 grid_size_for）算行列，请求被控端 resize 到此 → 被控端 shell
+                // 按控制端尺寸重排 → 镜像满屏渲染、零 letterbox。变化才重发。
+                if state.is_mirror_active() {
+                    let ppp = state.egui_ctx.pixels_per_point();
+                    let tr = shell_out.term_rect;
+                    let pw = (tr.width() * ppp).max(1.0) as u32;
+                    let ph = (tr.height() * ppp).max(1.0) as u32;
+                    let (rows, cols) = state.renderer.grid_size_for(pw, ph);
+                    if rows > 0 && cols > 0 {
+                        let dims = (rows as u16, cols as u16);
+                        if state.mirror_viewport_sent != Some(dims) {
+                            state.mirror_viewport_sent = Some(dims);
+                            state.remote_ws.send_viewport_resize(dims.0, dims.1);
+                        }
+                    }
+                } else {
+                    state.mirror_viewport_sent = None;
+                }
                 // 远程控制一次性通知 → toast（弹窗在 egui 帧后 push，需请求重绘）。
                 let remote_notices = state.remote_ws.take_notices();
                 if !remote_notices.is_empty() {
@@ -6753,10 +6793,16 @@ impl ApplicationHandler<PtyWake> for App {
                         };
                         #[cfg(not(feature = "input-editor"))]
                         let footer_px_for_resize: f32 = 0.0;
-                        let (rows, cols) =
-                            state
-                                .renderer
-                                .grid_size_for_with_footer(tw, th, footer_px_for_resize);
+                        // M5.3 SSH 式视口跟随：被控期间焦点窗格用控制端请求的远程
+                        // 视口尺寸（覆盖窗口矩形算出的尺寸），其余窗格/非被控按矩形。
+                        let (rows, cols) = match state.remote_viewport {
+                            Some(dims) if i == state.tabs[state.active_tab].focused => dims,
+                            _ => state.renderer.grid_size_for_with_footer(
+                                tw,
+                                th,
+                                footer_px_for_resize,
+                            ),
+                        };
                         // M4.1 批C 冒烟观测点：首帧可见 footer 占高生效。
                         // 日志示例：「footer 占高 32px，网格 {rows}x{cols}
                         //            （无 footer 时多 1-2 行）」

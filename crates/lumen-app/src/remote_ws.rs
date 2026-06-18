@@ -126,6 +126,9 @@ pub struct RemoteWs {
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
+    /// M5.3 被控端待应用的远程视口尺寸（控制端请求；SSH 式跟随）：main 取走后
+    /// 把焦点窗格 resize 到此 (rows, cols)。仅保留最新值。
+    pending_viewport: Option<(u16, u16)>,
     /// 待消费的一次性通知（main 取走弹 toast）。
     notices: Vec<Notice>,
     /// UI → 后台 出站命令发送端。
@@ -178,6 +181,7 @@ impl RemoteWs {
         self.session = None;
         self.mirror = None;
         self.pending_input.clear();
+        self.pending_viewport = None;
         self.notices.clear();
     }
 
@@ -239,6 +243,7 @@ impl RemoteWs {
         self.session = None;
         self.mirror = None;
         self.pending_input.clear();
+        self.pending_viewport = None;
     }
 
     /// 被控端：转发焦点窗格 PTY 输出字节给控制端（含会话起始的整屏快照重放）。
@@ -255,6 +260,16 @@ impl RemoteWs {
     /// 控制端：把用户输入的 VT 字节转发给被控端（part4）。
     pub fn send_input(&self, bytes: &[u8]) {
         self.send_frame(&RemoteFrame::Input(bytes.to_vec()));
+    }
+
+    /// 控制端：请求被控端焦点窗格 resize 到控制端视图尺寸（SSH 式跟随）。
+    pub fn send_viewport_resize(&self, rows: u16, cols: u16) {
+        self.send_frame(&RemoteFrame::ViewportResize { rows, cols });
+    }
+
+    /// 被控端：取走待应用的远程视口尺寸（main 把焦点窗格 resize 到它）。
+    pub fn take_viewport(&mut self) -> Option<(u16, u16)> {
+        self.pending_viewport.take()
     }
 
     /// 是否为控制端（控制中）：true 时本端键盘输入应转发而非本地执行。
@@ -325,6 +340,12 @@ impl RemoteWs {
                     self.pending_input.push(bytes);
                 }
             }
+            RemoteFrame::ViewportResize { rows, cols } => {
+                // 仅被控端接受：保留最新视口请求，main 把焦点窗格 resize 到它。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_viewport = Some((rows, cols));
+                }
+            }
             RemoteFrame::Echo(_) => {}
         }
     }
@@ -340,6 +361,7 @@ impl RemoteWs {
                 self.incoming = None;
                 self.mirror = None;
                 self.pending_input.clear();
+                self.pending_viewport = None;
                 if self.session.take().is_some() {
                     self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
                 }
@@ -410,6 +432,7 @@ impl RemoteWs {
                 self.session = None;
                 self.mirror = None;
                 self.pending_input.clear();
+                self.pending_viewport = None;
                 self.notices.push(Notice::SessionEnded(reason));
             }
             // 数据面：part3a 镜像字节流 / part4 远程输入，按角色路由。
