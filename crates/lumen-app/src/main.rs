@@ -108,6 +108,10 @@ struct PtyWake;
 /// 转发来的远程输入（本地输入优先，海风哥拍板）。
 const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// M5.3 part3b 控制端镜像的离屏纹理保留 id（避开自增的会话 id，取 `u64::MAX`）。
+/// 镜像 `Terminal` 复用窗格同款 wgpu 渲染器画进此 id 的离屏纹理（上色/属性/光标）。
+const MIRROR_OFFSCREEN_ID: session::SessionId = u64::MAX;
+
 /// 从 PNG 字节流解码并构造 winit 窗口图标。
 ///
 /// 解码失败（格式损坏、尺寸越界）时返回 `None` 并打印 warn，
@@ -604,6 +608,9 @@ struct AppState {
     remote_viewport: Option<(usize, usize)>,
     /// M5.3 控制端上次发给被控端的视口尺寸 `(行, 列)`：变化才重发，避免每帧刷。
     mirror_viewport_sent: Option<(u16, u16)>,
+    /// M5.3 part3b 控制端镜像离屏纹理的 egui 句柄（`MIRROR_OFFSCREEN_ID`，首次控制时
+    /// 注册、后续复用）。控制中每帧把镜像 Terminal 渲染进它，shell 以 Image 铺满终端区。
+    mirror_texture: Option<egui::TextureId>,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -3311,6 +3318,7 @@ impl App {
             mirror_src: None,
             remote_viewport: None,
             mirror_viewport_sent: None,
+            mirror_texture: None,
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -5239,11 +5247,34 @@ impl ApplicationHandler<PtyWake> for App {
                 // 远程 WS 的 poll / 被控端输入应用 / 整屏快照转发已移到 user_event
                 // （App::pump_remote），失焦也能及时处理（否则配对/输入/镜像会卡到
                 // 焦点回来）；此处只读镜像态供渲染。
-                // M5.3 part3a 控制端 + bug3：仅「远程」视图才把镜像画进终端工作区，
-                // 切回「本地」视图显示本地终端（mirror() 仅控制中会话期间 Some）。
-                let remote_mirror_view = if state.settings.layout.view_mode {
-                    state.remote_ws.mirror().map(remote_mirror::mirror_view)
+                // M5.3 part3b 控制端镜像纹理：仅「远程」视图 + 控制中（is_mirror_active）
+                // 才确保镜像离屏纹理已注册（保留 id，首次注册后复用），取其 egui 句柄供
+                // shell 以 Image 铺满终端区；镜像内容在下方窗格渲染段画进该纹理（wgpu
+                // 上色，复用窗格渲染器、控制端主题就地解析颜色）。bug3：本地视图不画。
+                // 内容由下方窗格渲染段后的镜像渲染块（搜索 MIRROR_OFFSCREEN_ID 的
+                // renderer.render）每帧画入；尺寸变化时该块重绑 egui 纹理。退出控制/远程
+                // 视图时在 else 分支释放（仿 release_pane_resources，延后注销），再次控制
+                // 必重新注册全新纹理，杜绝悬挂句柄。
+                let remote_mirror_tex = if state.is_mirror_active() {
+                    if state.mirror_texture.is_none() {
+                        state.renderer.ensure_offscreen(MIRROR_OFFSCREEN_ID, 1, 1);
+                        if let Some(view) = state.renderer.offscreen_view(MIRROR_OFFSCREEN_ID) {
+                            let tex = state.egui_renderer.register_native_texture(
+                                state.renderer.device(),
+                                view,
+                                wgpu::FilterMode::Nearest,
+                            );
+                            state.mirror_texture = Some(tex);
+                        }
+                    }
+                    state.mirror_texture
                 } else {
+                    // 退出控制/远程视图：释放镜像离屏 + egui 纹理（延后注销，本帧 shape
+                    // 不再引用它，因 remote_mirror_tex=None）。
+                    if let Some(tex) = state.mirror_texture.take() {
+                        state.renderer.drop_offscreen(MIRROR_OFFSCREEN_ID);
+                        state.pending_tex_free.push(tex);
+                    }
                     None
                 };
                 let shell_input = shell::ShellInput {
@@ -5280,7 +5311,7 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_pairing: state.remote_ws.pairing.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
-                    remote_mirror: remote_mirror_view.as_ref(),
+                    remote_mirror_tex,
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -6969,6 +7000,38 @@ impl ApplicationHandler<PtyWake> for App {
                 if rendered > 0 {
                     // ESU 直渲限频基准（整帧粒度，多窗格共享）。
                     state.last_term_render_at = Some(render_t0);
+                }
+
+                // —— M5.3 part3b 控制端镜像渲染：把镜像 Terminal 画进保留 id 的离屏
+                // 纹理（wgpu 上色，复用窗格渲染器；控制端主题就地解析颜色）。离屏尺寸
+                // 跟镜像网格×cell，shell 以 Image 铺满终端区（SSH 视口下网格≈终端区）。
+                if state.is_mirror_active() {
+                    if let Some(mirror) = state.remote_ws.mirror() {
+                        let (cell_w, cell_h) = state.renderer.cell_size();
+                        let g = mirror.grid();
+                        let cur = (g.cursor.row, g.cursor.col, true);
+                        let w = ((g.cols() as f32 * cell_w).ceil() as u32).max(1);
+                        let h = ((g.rows() as f32 * cell_h).ceil() as u32).max(1);
+                        // 尺寸变化时重建离屏并重绑 egui 纹理（句柄不变）。
+                        if state.renderer.ensure_offscreen(MIRROR_OFFSCREEN_ID, w, h) {
+                            if let (Some(view), Some(tex)) = (
+                                state.renderer.offscreen_view(MIRROR_OFFSCREEN_ID),
+                                state.mirror_texture,
+                            ) {
+                                state.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    state.renderer.device(),
+                                    view,
+                                    wgpu::FilterMode::Nearest,
+                                    tex,
+                                );
+                            }
+                        }
+                        if let Err(e) =
+                            state.renderer.render(MIRROR_OFFSCREEN_ID, mirror, None, cur, None, None)
+                        {
+                            error!("镜像渲染失败: {e:#}");
+                        }
+                    }
                 }
 
                 // —— egui 平台输出 + IME 强制复位（IME 最大坑对策）——

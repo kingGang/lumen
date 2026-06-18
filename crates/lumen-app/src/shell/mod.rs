@@ -165,8 +165,9 @@ pub struct ShellInput<'a> {
     pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
     /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
     pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
-    /// M5.3 part3a：控制端远程镜像视图（Some = 控制中，终端工作区改画远端镜像）。
-    pub remote_mirror: Option<&'a crate::remote_mirror::MirrorView>,
+    /// M5.3 part3b：控制端远程镜像离屏纹理（Some = 控制中+远程视图，终端工作区改画
+    /// 远端镜像；wgpu 上色，复用窗格渲染器）。
+    pub remote_mirror_tex: Option<egui::TextureId>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -810,10 +811,20 @@ pub fn show(
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
 
-            // M5.3 part3a：控制端镜像——终端工作区改画远端镜像（Middle 层叠在本地
-            // 窗格之上）。本地窗格仍在下方渲染（part3a 不省，被遮盖即可）。
-            if let Some(view) = input.remote_mirror {
-                remote_ui::paint_mirror(ui, area, view, pal);
+            // M5.3 part3b：控制端镜像——终端工作区改画远端镜像纹理（Middle 层叠在本地
+            // 窗格之上，铺满 area）。本地窗格仍在下方渲染，被遮盖即可。纹理内容由 main
+            // 的窗格渲染段画好（wgpu 上色）；纹理已是终端尺寸，按 area 铺满。
+            if let Some(tex) = input.remote_mirror_tex {
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("lumen_remote_mirror"),
+                ));
+                painter.image(
+                    tex,
+                    area,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
             }
 
             // 背景图（P13）：在终端工作区整体底部绘制，绘制发生在任何

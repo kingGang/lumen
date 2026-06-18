@@ -114,48 +114,27 @@ fn push_color(s: &mut String, color: Color, fg: bool) {
     }
 }
 
-/// 控制端镜像可见区的纯文本视图（part3a 渲染用；part3b 升级为带色 wgpu 渲染）。
-pub struct MirrorView {
-    /// 每个可见行的文本（已 trim 行尾空白；宽字符占位格已跳过）。
-    pub lines: Vec<String>,
-    /// 光标 (行, 列)（可见区内 0-based）。
-    pub cursor: (usize, usize),
-    /// 被控端终端列数（控制端按此等比缩放铺满显示区）。
-    pub cols: usize,
-    /// 被控端终端行数。
-    pub rows: usize,
-}
-
-/// 从镜像 [`Terminal`] 提取可见区文本视图。
-#[must_use]
-pub fn mirror_view(term: &Terminal) -> MirrorView {
-    let grid = term.grid();
-    let cols = grid.cols();
-    let rows = grid.rows();
-    let lines = grid
-        .visible_rows()
-        .map(|row| {
-            let mut s = String::with_capacity(cols);
-            for cell in row.cells().iter().take(cols) {
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-                s.push(cell.ch);
-            }
-            s.trim_end().to_string()
-        })
-        .collect();
-    MirrorView {
-        lines,
-        cursor: (grid.cursor.row, grid.cursor.col),
-        cols,
-        rows,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 提取终端可见区文本（每行 trim 行尾、跳过宽字符占位格）——校验快照往返用。
+    fn visible_text(term: &Terminal) -> Vec<String> {
+        let grid = term.grid();
+        let cols = grid.cols();
+        grid.visible_rows()
+            .map(|row| {
+                let mut s = String::with_capacity(cols);
+                for cell in row.cells().iter().take(cols) {
+                    if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                        continue;
+                    }
+                    s.push(cell.ch);
+                }
+                s.trim_end().to_string()
+            })
+            .collect()
+    }
 
     /// 快照往返：源终端打一屏内容 → 快照 → 喂入全新终端 → 两边可见文本一致。
     #[test]
@@ -169,12 +148,10 @@ mod tests {
         let mut dst = Terminal::new(6, 20, 100);
         dst.advance(&snap);
 
-        let src_lines = mirror_view(&src).lines;
-        let dst_lines = mirror_view(&dst).lines;
-        assert_eq!(src_lines, dst_lines, "镜像可见文本应与源一致");
-        // 光标列应落在 "prompt> " 之后（第 3 行）。
-        let dv = mirror_view(&dst);
-        assert_eq!(dv.cursor, (2, 8));
+        assert_eq!(visible_text(&src), visible_text(&dst), "镜像可见文本应与源一致");
+        // 光标列应落在 "prompt> " 之后（第 3 行，列 8）。
+        let cur = &dst.grid().cursor;
+        assert_eq!((cur.row, cur.col), (2, 8));
     }
 
     #[test]
@@ -183,6 +160,6 @@ mod tests {
         let snap = screen_snapshot_vt(&src);
         let mut dst = Terminal::new(4, 10, 50);
         dst.advance(&snap);
-        assert!(mirror_view(&dst).lines.iter().all(String::is_empty));
+        assert!(visible_text(&dst).iter().all(String::is_empty));
     }
 }
