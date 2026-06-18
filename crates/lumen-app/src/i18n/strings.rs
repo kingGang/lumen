@@ -176,6 +176,22 @@ pub struct Strings {
     pub login_password_hint: &'static str,
     /// 登录按钮
     pub login_btn: &'static str,
+    /// 注册按钮文案（注册模式）
+    pub login_register_btn: &'static str,
+    /// 确认密码输入框 hint（注册模式）
+    pub login_password_confirm_hint: &'static str,
+    /// 切到注册的链接（登录模式底部）
+    pub login_to_register: &'static str,
+    /// 切到登录的链接（注册模式底部）
+    pub login_to_login: &'static str,
+    /// 两次密码不一致（注册本地校验）
+    pub login_err_password_mismatch: &'static str,
+    /// 账号不存在（登录，提示去注册）
+    pub login_err_user_not_found: &'static str,
+    /// 邮箱已注册（注册，提示去登录）
+    pub login_err_email_taken: &'static str,
+    /// 邮箱或密码错误（登录）
+    pub login_err_bad_credentials: &'static str,
 
     // ── 文件树 UI ────────────────────────────────────────────────────
     /// 刷新 tooltip
