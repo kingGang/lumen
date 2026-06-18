@@ -165,6 +165,8 @@ pub struct ShellInput<'a> {
     pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
     /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
     pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
+    /// M5.3 part3a：控制端远程镜像视图（Some = 控制中，终端工作区改画远端镜像）。
+    pub remote_mirror: Option<&'a crate::remote_mirror::MirrorView>,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -807,6 +809,12 @@ pub fn show(
             let ppp = ui.pixels_per_point();
             let area = ui.available_rect_before_wrap().round_to_pixels(ppp);
             out.term_rect = area;
+
+            // M5.3 part3a：控制端镜像——终端工作区改画远端镜像（Middle 层叠在本地
+            // 窗格之上）。本地窗格仍在下方渲染（part3a 不省，被遮盖即可）。
+            if let Some(view) = input.remote_mirror {
+                remote_ui::paint_mirror(ui, area, view, pal);
+            }
 
             // 背景图（P13）：在终端工作区整体底部绘制，绘制发生在任何
             // 窗格内容之前（窗格标题栏/分隔线在循环内稍后盖住背景图）。

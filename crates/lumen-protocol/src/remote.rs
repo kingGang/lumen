@@ -89,13 +89,26 @@ pub enum EndReason {
 
 /// 数据面帧（控制端↔被控端，经服务端**盲转**；服务端不解释内容）。
 ///
-/// part1 仅含 [`RemoteFrame::Echo`] 占位用于联调中继通路；part2/3 在此追加
-/// 状态增量（grid delta / block 事件 / 布局变更）与操作指令（Action）变体，
-/// **无需改动服务端中继逻辑**（详见模块级文档「控制面 vs 数据面」）。
+/// part1 仅含 [`RemoteFrame::Echo`] 占位；**part3a 终端镜像**采用「VT 字节流转发」
+/// 方案：被控端把焦点窗格 PTY 输出（含初始整屏快照重放）转发给控制端，控制端喂入
+/// 一个无 PTY 的镜像 `Terminal::advance` 复现整状态（颜色/光标/标题/cwd/命令块全在
+/// 字节流的 SGR/OSC 里，自动还原）。故数据面**只传字节**，无需把结构化 Cell 上线，
+/// `lumen-protocol` 保持零依赖。后续 part3c（多窗格/布局）再加变体，**服务端中继零改**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteFrame {
     /// 回环测试帧：原样转发给对端，用于 part1 验证中继通路连通。
     Echo(String),
+    /// 被控端 → 控制端：焦点窗格 PTY 输出字节（会话起始的整屏快照重放 + 实时增量，
+    /// 同一通道）。控制端逐帧 `mirror.advance(&bytes)`。
+    Output(Vec<u8>),
+    /// 被控端 → 控制端：镜像终端尺寸（行/列）。会话起始与被控端窗格 resize 时发；
+    /// 控制端据此 `mirror.resize(rows, cols)`，**必须在该尺寸的 `Output` 之前到达**。
+    Resize {
+        /// 行数。
+        rows: u16,
+        /// 列数。
+        cols: u16,
+    },
 }
 
 impl RemoteFrame {
@@ -251,6 +264,18 @@ mod tests {
         };
         let back = RemoteFrame::from_value(&relayed).expect("还原");
         assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn 镜像帧经value往返() {
+        for frame in [
+            RemoteFrame::Output(vec![0x1b, b'[', b'2', b'J']),
+            RemoteFrame::Resize { rows: 40, cols: 120 },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
     }
 
     #[test]

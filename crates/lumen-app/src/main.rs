@@ -10,6 +10,7 @@ mod background;
 mod cloud;
 // M5.2 远程设备状态（心跳 + 设备列表后台线程）。
 mod remote;
+mod remote_mirror;
 mod remote_ws;
 /// 文件路径补全逻辑引擎（M4.4 批1）：token 提取 + 路径枚举，纯逻辑无 egui 依赖。
 #[cfg(feature = "input-editor")]
@@ -591,6 +592,9 @@ struct AppState {
     remote: remote::RemoteState,
     /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
     remote_ws: remote_ws::RemoteWs,
+    /// M5.3 part3a 被控端镜像源标识 `(焦点窗格 id, 行, 列)`：变化（会话起始 / resize /
+    /// 切焦点 / 切 tab）即重发尺寸 + 整屏快照。被控期间外为 None。
+    mirror_src: Option<(session::SessionId, usize, usize)>,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -3218,6 +3222,7 @@ impl App {
             egui_ctx,
             remote: remote::RemoteState::default(),
             remote_ws: remote_ws::RemoteWs::default(),
+            mirror_src: None,
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -3487,6 +3492,17 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         }
                         state.tabs[ti].panes[pi].term.advance(&bytes);
+                        // M5.3 part3a 被控端：被控期间转发**焦点窗格**的 PTY 输出给
+                        // 控制端（控制端喂入镜像 Terminal 复现）。整屏初始快照由
+                        // RedrawRequested 里的 mirror_src 变化触发，先于此实时增量。
+                        if matches!(
+                            state.remote_ws.session.as_ref().map(|s| s.role),
+                            Some(lumen_protocol::remote::Role::Controlled)
+                        ) && ti == state.active_tab
+                            && pi == state.tabs[ti].focused
+                        {
+                            state.remote_ws.send_output(&bytes);
+                        }
                         got_data[k] = true;
 
                         // —— 块闭合探针（M4.1 批D2）——
@@ -5102,6 +5118,31 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 let _ = state.remote.poll();
                 let _ = state.remote_ws.poll();
+                // M5.3 part3a 被控端：被控期间，焦点窗格的 (id,行,列) 一旦变化（会话
+                // 起始 / resize / 切焦点 / 切 tab）即重发尺寸 + 整屏 VT 快照（控制端
+                // advance 重放得起始整屏）；之后的实时增量由 PTY tee 处持续转发。
+                {
+                    let controlled = matches!(
+                        state.remote_ws.session.as_ref().map(|s| s.role),
+                        Some(lumen_protocol::remote::Role::Controlled)
+                    );
+                    if controlled {
+                        let pane = state.tabs[state.active_tab].focused_pane();
+                        let g = pane.term.grid();
+                        let key = (pane.id, g.rows(), g.cols());
+                        if state.mirror_src != Some(key) {
+                            let snap = remote_mirror::screen_snapshot_vt(&pane.term);
+                            state.mirror_src = Some(key);
+                            state.remote_ws.send_resize(key.1 as u16, key.2 as u16);
+                            state.remote_ws.send_output(&snap);
+                        }
+                    } else {
+                        state.mirror_src = None;
+                    }
+                }
+                // M5.3 part3a 控制端：控制中则从镜像 Terminal 提取文本视图供渲染
+                // （mirror() 仅 role==Controller 会话期间 Some）。
+                let remote_mirror_view = state.remote_ws.mirror().map(remote_mirror::mirror_view);
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -5136,6 +5177,7 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_pairing: state.remote_ws.pairing.as_ref(),
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
+                    remote_mirror: remote_mirror_view.as_ref(),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。

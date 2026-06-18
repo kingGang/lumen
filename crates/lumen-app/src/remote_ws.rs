@@ -25,12 +25,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteS2C, Role,
+    DenyReason, EndReason, PairingFailReason, RemoteC2S, RemoteFrame, RemoteS2C, Role,
 };
+use lumen_term::Terminal;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 
 use crate::cloud::server_url;
+
+/// 控制端镜像 Terminal 的 scrollback 上限（行）。被控端转发的实时输出滚出可见区后
+/// 进镜像的历史，控制端可上滚回看。
+const MIRROR_SCROLLBACK: usize = 5000;
+/// 镜像 Terminal 创建时的占位尺寸（首个 `Resize` 帧到达前；被控端会立即发实际尺寸）。
+const MIRROR_INIT_ROWS: usize = 24;
+/// 同上：占位列数。
+const MIRROR_INIT_COLS: usize = 80;
 
 /// 读超时：无消息时 `read` 返回，循环转去处理出站/保活/停止（兼顾响应与不空转）。
 const READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -109,6 +118,9 @@ pub struct RemoteWs {
     pub incoming: Option<IncomingControl>,
     /// 活跃会话态（part2b 渲染「控制中 / 正在被远程控制」横幅）。
     pub session: Option<ActiveSession>,
+    /// M5.3 part3a 控制端镜像：被控端整屏状态在本地用无 PTY 的 `Terminal` 复现
+    /// （`advance` 喂入被控端转发的 PTY 字节）。仅 `role==Controller` 会话期间存在。
+    mirror: Option<Terminal>,
     /// 待消费的一次性通知（main 取走弹 toast）。
     notices: Vec<Notice>,
     /// UI → 后台 出站命令发送端。
@@ -148,6 +160,7 @@ impl RemoteWs {
         self.pairing = None;
         self.incoming = None;
         self.session = None;
+        self.mirror = None;
         self.notices.clear();
     }
 
@@ -207,12 +220,60 @@ impl RemoteWs {
     pub fn end_session(&mut self) {
         self.send(RemoteC2S::EndSession);
         self.session = None;
+        self.mirror = None;
+    }
+
+    /// 被控端：转发焦点窗格 PTY 输出字节给控制端（含会话起始的整屏快照重放）。
+    pub fn send_output(&self, bytes: &[u8]) {
+        self.send_frame(&RemoteFrame::Output(bytes.to_vec()));
+    }
+
+    /// 被控端：告知控制端镜像终端尺寸（会话起始 + 窗格 resize 时发；须在对应
+    /// 尺寸的 `Output` 之前）。
+    pub fn send_resize(&self, rows: u16, cols: u16) {
+        self.send_frame(&RemoteFrame::Resize { rows, cols });
+    }
+
+    /// 控制端：当前镜像 Terminal（`role==Controller` 会话期间 Some），供渲染读取。
+    #[must_use]
+    pub fn mirror(&self) -> Option<&Terminal> {
+        self.mirror.as_ref()
+    }
+
+    /// 把数据面帧序列化为不透明 `Relay` 投递（序列化失败仅记日志、不断连）。
+    fn send_frame(&self, frame: &RemoteFrame) {
+        match frame.to_value() {
+            Ok(v) => self.send(RemoteC2S::Relay(v)),
+            Err(e) => log::error!("远程数据面帧序列化失败: {e}"),
+        }
     }
 
     /// 投递一条出站命令（未连接则静默丢弃）。
     fn send(&self, msg: RemoteC2S) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.send(msg);
+        }
+    }
+
+    /// 控制端：把收到的数据面帧作用到镜像 Terminal（仅控制会话期间）。
+    fn apply_mirror(&mut self, value: &serde_json::Value) {
+        let Some(mirror) = self.mirror.as_mut() else {
+            return; // 非控制端会话：无镜像，丢弃（part3 只单向被控端→控制端）。
+        };
+        let Ok(frame) = RemoteFrame::from_value(value) else {
+            log::debug!("镜像帧解析失败（可能是更高版本对端的未知变体），丢弃");
+            return;
+        };
+        match frame {
+            RemoteFrame::Resize { rows, cols } => {
+                mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+            }
+            RemoteFrame::Output(bytes) => {
+                mirror.advance(&bytes);
+                // 镜像无 PTY，不回写应答（DSR/DA 等）；排空避免无界增长。
+                let _ = mirror.take_responses();
+            }
+            RemoteFrame::Echo(_) => {}
         }
     }
 
@@ -225,6 +286,7 @@ impl RemoteWs {
                 // 断线即丢弃进行中的配对/会话态（服务端侧亦已拆除）。
                 self.pairing = None;
                 self.incoming = None;
+                self.mirror = None;
                 if self.session.take().is_some() {
                     self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
                 }
@@ -285,15 +347,19 @@ impl RemoteWs {
                 self.pairing = None;
                 self.incoming = None;
                 let peer = peer_name.clone();
+                // 控制端：起一个无 PTY 的镜像 Terminal（被控端会随即发 Resize+快照）。
+                self.mirror = (role == Role::Controller)
+                    .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
                 self.session = Some(ActiveSession { peer_name, role });
                 self.notices.push(Notice::SessionStarted { role, peer });
             }
             RemoteS2C::SessionEnded { reason } => {
                 self.session = None;
+                self.mirror = None;
                 self.notices.push(Notice::SessionEnded(reason));
             }
-            // 数据面（grid delta / Action 等）：part3 镜像/输入转发时消费。
-            RemoteS2C::Relay(_) => {}
+            // 数据面（part3a：被控端整屏状态字节流）→ 作用到镜像 Terminal。
+            RemoteS2C::Relay(value) => self.apply_mirror(&value),
         }
     }
 }

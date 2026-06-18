@@ -238,6 +238,64 @@ pub fn banner(
     out
 }
 
+/// 在终端工作区 `rect` 上绘制控制端**远程镜像**（part3a 纯文本视图：等宽行 +
+/// 光标块；part3b 升级为 wgpu 上色渲染）。用 Middle 层 painter 叠在本地窗格之上、
+/// 模态/toast 之下；display-only（输入捕获是 part4）。
+pub fn paint_mirror(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    view: &crate::remote_mirror::MirrorView,
+    pal: &Palette,
+) {
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("lumen_remote_mirror"),
+        ))
+        .with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, pal.bg_dark);
+
+    let font = egui::FontId::monospace(13.0);
+    // 量一个等宽字符的尺寸（避免 egui Fonts 的 &mut 取用限制）。
+    let sample = painter.layout_no_wrap("M".to_owned(), font.clone(), pal.fg);
+    let char_w = sample.size().x.max(1.0);
+    let line_h = sample.size().y.max(1.0);
+    let pad = 4.0;
+    // 显示区能容纳的行/列上限：被控端可能比控制端窗口宽/高，超出的不绘制
+    // （主动限制——否则 egui 仍会对整行布局再被 clip 裁掉，纯浪费 CPU）。
+    let max_rows = (((rect.height() - 2.0 * pad) / line_h).floor()).max(0.0) as usize;
+    let max_cols = (((rect.width() - 2.0 * pad) / char_w).floor()).max(0.0) as usize;
+
+    for (i, line) in view.lines.iter().take(max_rows).enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        // 按可见列数截断，避免把超宽整行丢给 painter 布局。
+        let shown: String = line.chars().take(max_cols).collect();
+        if shown.is_empty() {
+            continue;
+        }
+        let pos = egui::pos2(rect.left() + pad, rect.top() + pad + i as f32 * line_h);
+        painter.text(pos, egui::Align2::LEFT_TOP, shown, font.clone(), pal.fg);
+    }
+
+    // 光标块（半透明 accent）：行、列都在可见范围内才画。
+    let (cr, cc) = view.cursor;
+    if cr < max_rows && cc < max_cols {
+        let cx = rect.left() + pad + cc as f32 * char_w;
+        let cy = rect.top() + pad + cr as f32 * line_h;
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(cx, cy),
+                egui::vec2(char_w.max(2.0), line_h),
+            ),
+            0.0,
+            pal.accent.gamma_multiply(0.5),
+        );
+    }
+}
+
 /// 把 9 位配对码按「3 3 3」分组便于读出（如 `123456789` → `123 456 789`）。
 fn group_code(code: &str) -> String {
     code.chars()
