@@ -79,6 +79,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, user_id: String, 
                                 }
                                 let _ = tx.send(ToClient::Msg(Box::new(RemoteS2C::Pong)));
                             }
+                            // RequestControl / SubmitPairing 走专用方法（需 DB 配对信任）。
+                            Ok(RemoteC2S::RequestControl { target }) => {
+                                // 已配对（首次配对后）→ 跳过配对码直连（海风哥拍板）。
+                                let paired = is_paired(&state, &user_id, &device_id, &target).await;
+                                state.hub.request_control(&device_id, conn_id, &target, paired);
+                            }
+                            Ok(RemoteC2S::SubmitPairing { target, code }) => {
+                                // 配对成功 → 持久化这对设备信任，之后免重输（直到一端被删）。
+                                if let Some((a, b)) =
+                                    state.hub.submit_pairing(&device_id, conn_id, &target, &code)
+                                {
+                                    persist_pair(&state, &user_id, &a, &b).await;
+                                }
+                            }
                             Ok(msg) => state.hub.handle(&device_id, conn_id, msg),
                             Err(e) => {
                                 // 非法 JSON：不外泄消息体内容，仅记错误类型后继续读。
@@ -131,6 +145,51 @@ async fn lookup_device_name(state: &AppState, device_id: &str, user_id: &str) ->
         .await
         .ok()??;
     Some(row.get(0))
+}
+
+/// 把两个设备 id 排序成无序对（`dev_lo <= dev_hi`），用作 `device_pairs` 主键。
+fn ordered_pair<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// 查这对设备是否已持久化配对信任（首次配对后免重输）。失败/无记录均返回 false。
+async fn is_paired(state: &AppState, user_id: &str, a: &str, b: &str) -> bool {
+    let (lo, hi) = ordered_pair(a, b);
+    let Ok(client) = state.pool.get().await else {
+        return false;
+    };
+    client
+        .query_opt(
+            "SELECT 1 FROM device_pairs WHERE user_id=$1 AND dev_lo=$2 AND dev_hi=$3",
+            &[&user_id, &lo, &hi],
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// 持久化这对设备的配对信任（幂等）。失败仅记日志——下次连接退化为重输配对码。
+async fn persist_pair(state: &AppState, user_id: &str, a: &str, b: &str) {
+    let (lo, hi) = ordered_pair(a, b);
+    let now = auth::now_secs();
+    let Ok(client) = state.pool.get().await else {
+        return;
+    };
+    if let Err(e) = client
+        .execute(
+            "INSERT INTO device_pairs (user_id, dev_lo, dev_hi, created_at) VALUES ($1,$2,$3,$4) \
+             ON CONFLICT DO NOTHING",
+            &[&user_id, &lo, &hi, &now],
+        )
+        .await
+    {
+        tracing::warn!("持久化配对信任失败: {e}");
+    }
 }
 
 /// 刷新本设备 `last_seen`（与 M5.2 REST 心跳同一字段，保持 online 判定一致）。

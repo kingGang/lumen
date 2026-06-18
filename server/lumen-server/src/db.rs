@@ -60,6 +60,13 @@ pub async fn init_schema(pool: &Pool) -> anyhow::Result<()> {
                 PRIMARY KEY (user_id, text, ts)
             );
             CREATE INDEX IF NOT EXISTS history_user_ts_idx ON history_entries(user_id, ts);
+            CREATE TABLE IF NOT EXISTS device_pairs (
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                dev_lo     TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                dev_hi     TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (user_id, dev_lo, dev_hi)
+            );
             "#,
         )
         .await?;

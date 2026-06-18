@@ -169,25 +169,53 @@ impl Hub {
         cancel_pending_as_target(&mut st, device_id, DenyReason::Offline);
     }
 
-    /// 处理一条客户端消息（[`RemoteC2S::Ping`] 由 `ws.rs` 处理以同时刷 `last_seen`）。
+    /// 控制端发起控制（`RequestControl`）。`paired`=该对设备已持久化信任（由 `ws.rs`
+    /// 查 DB 得出）：为 true 则**跳过配对码直连**（首次配对后免重输，海风哥拍板）。
     ///
     /// `conn_id` 守卫：被驱逐的旧连接迟到消息一律忽略。
+    pub fn request_control(&self, from: &str, conn_id: u64, target: &str, paired: bool) {
+        let mut st = self.lock();
+        if !is_current(&st, from, conn_id) {
+            return;
+        }
+        request_control(&mut st, from, target, paired);
+    }
+
+    /// 控制端提交配对码（`SubmitPairing`）。校验成功并**新建**会话时返回
+    /// `Some((控制端, 被控端))`，供 `ws.rs` 持久化这对设备的信任（之后免重输）。
+    pub fn submit_pairing(
+        &self,
+        from: &str,
+        conn_id: u64,
+        target: &str,
+        code: &str,
+    ) -> Option<(String, String)> {
+        let mut st = self.lock();
+        if !is_current(&st, from, conn_id) {
+            return None;
+        }
+        submit_pairing(&mut st, from, target, code)
+    }
+
+    /// 处理其余客户端消息（拒绝 / 结束 / 中继 / 心跳）。`RequestControl` /
+    /// `SubmitPairing` 因需 DB（配对信任）走 [`Self::request_control`] /
+    /// [`Self::submit_pairing`]。`conn_id` 守卫：旧连接迟到消息忽略。
     pub fn handle(&self, device_id: &str, conn_id: u64, msg: RemoteC2S) {
         let mut st = self.lock();
         if !is_current(&st, device_id, conn_id) {
             return;
         }
         match msg {
-            RemoteC2S::RequestControl { target } => request_control(&mut st, device_id, &target),
-            RemoteC2S::SubmitPairing { target, code } => {
-                submit_pairing(&mut st, device_id, &target, &code);
-            }
             RemoteC2S::DeclineControl => decline_control(&mut st, device_id),
             RemoteC2S::EndSession => {
                 teardown_session(&mut st, device_id, EndReason::PeerLeft);
             }
             RemoteC2S::Relay(value) => relay(&st, device_id, value),
             RemoteC2S::Ping => send_msg(&st.peers, device_id, RemoteS2C::Pong),
+            // 这两类经专用方法（带 DB 配对信任），不应到此。
+            RemoteC2S::RequestControl { .. } | RemoteC2S::SubmitPairing { .. } => {
+                tracing::warn!("RequestControl/SubmitPairing 不应经 handle，已忽略");
+            }
         }
     }
 
@@ -299,7 +327,7 @@ fn purge_expired(st: &mut HubState) {
 
 /// 控制端发起控制请求：层层校验（自控 / 在线 / 同账户 / 控制端空闲 / 目标空闲 /
 /// 目标无配对中），通过则生成配对码、存 pending、通知双方。
-fn request_control(st: &mut HubState, controller_id: &str, target: &str) {
+fn request_control(st: &mut HubState, controller_id: &str, target: &str, paired: bool) {
     let deny = |st: &HubState, reason: DenyReason| {
         send_msg(
             &st.peers,
@@ -355,7 +383,12 @@ fn request_control(st: &mut HubState, controller_id: &str, target: &str) {
         deny(st, DenyReason::TargetPairing);
         return;
     }
-    // 通过：生成码、登记 pending、双向通知。
+    // 已配对信任（首次配对后）：跳过配对码，直接建会话（免重输，海风哥拍板）。
+    if paired {
+        establish_session(st, controller_id, target);
+        return;
+    }
+    // 首次：生成码、登记 pending、双向通知。
     let code = gen_pairing_code();
     let now = auth::now_secs();
     st.pending.insert(
@@ -389,110 +422,35 @@ fn request_control(st: &mut HubState, controller_id: &str, target: &str) {
     );
 }
 
-/// 控制端提交配对码：校验提交者身份 + 有效期 + 码值，成功原子建会话、双向
-/// [`RemoteS2C::SessionStarted`]；失败按原因回 [`RemoteS2C::PairingResult`]。
-fn submit_pairing(st: &mut HubState, controller_id: &str, target: &str, code: &str) {
-    let fail = |st: &HubState, reason: PairingFailReason, attempts_left: u32| {
-        send_msg(
-            &st.peers,
-            controller_id,
-            RemoteS2C::PairingResult {
-                reason,
-                attempts_left,
-            },
-        );
-    };
-
-    // 读出 pending 快照（释放借用后再改状态）。
-    let Some((p_code, p_created, p_owner, p_attempts)) = st.pending.get(target).map(|p| {
-        (
-            p.code.clone(),
-            p.created_at,
-            p.controller_device_id.clone(),
-            p.attempts_left,
-        )
-    }) else {
-        fail(st, PairingFailReason::NoPending, 0);
-        return;
-    };
-    // 提交者必须是当初发起请求的控制端（取自鉴权 device_id，杜绝抢答/跨用户）。
-    // 不命中按「无此配对」回复，避免向无关方泄漏配对存在与否。
-    if p_owner != controller_id {
-        fail(st, PairingFailReason::NoPending, 0);
-        return;
-    }
-    // 过期（>= TTL 即失效：配对码恰好有效 PAIRING_TTL_SECS 秒，elapsed∈[0,TTL)）。
-    if auth::now_secs() - p_created >= PAIRING_TTL_SECS {
-        st.pending.remove(target);
-        fail(st, PairingFailReason::Expired, 0);
-        send_msg(
-            &st.peers,
-            target,
-            RemoteS2C::PairingCancelled {
-                reason: DenyReason::Expired,
-            },
-        );
-        return;
-    }
-    // 码错：递减尝试，归零即作废。
-    if p_code != code {
-        let left = p_attempts.saturating_sub(1);
-        if left == 0 {
-            st.pending.remove(target);
-            fail(st, PairingFailReason::TooManyAttempts, 0);
-            send_msg(
-                &st.peers,
-                target,
-                RemoteS2C::PairingCancelled {
-                    reason: DenyReason::TooManyAttempts,
-                },
-            );
-        } else {
-            if let Some(p) = st.pending.get_mut(target) {
-                p.attempts_left = left;
-            }
-            fail(st, PairingFailReason::InvalidCode, left);
-        }
-        return;
-    }
-    // 码对：复检独占（配对期间可能被插队成为别人会话的一端），原子建会话。
-    st.pending.remove(target);
-    if st.sessions.contains_key(controller_id) {
+/// 原子建立会话：复检独占（配对/直连期间对端可能已被占用）+ 取双方名 → 双向插入
+/// [`SessionEntry`] 并发 [`RemoteS2C::SessionStarted`]。成功返回 `true`；失败发
+/// [`RemoteS2C::ControlDenied`] 给控制端并返回 `false`。被「配对码成功」与「已配对
+/// 直连」两条路径共用。
+fn establish_session(st: &mut HubState, controller_id: &str, target: &str) -> bool {
+    let deny = |st: &HubState, reason: DenyReason| {
         send_msg(
             &st.peers,
             controller_id,
             RemoteS2C::ControlDenied {
                 target_device_id: target.to_string(),
-                reason: DenyReason::ControllerBusy,
+                reason,
             },
         );
-        return;
+    };
+    if st.sessions.contains_key(controller_id) {
+        deny(st, DenyReason::ControllerBusy);
+        return false;
     }
     if st.sessions.contains_key(target) {
-        send_msg(
-            &st.peers,
-            controller_id,
-            RemoteS2C::ControlDenied {
-                target_device_id: target.to_string(),
-                reason: DenyReason::AlreadyControlled,
-            },
-        );
-        return;
+        deny(st, DenyReason::AlreadyControlled);
+        return false;
     }
     let controller_name = st.peers.get(controller_id).map(|p| p.name.clone());
     let target_name = st.peers.get(target).map(|p| p.name.clone());
-    // 目标在 pending 中即说明在线（断线会清其 pending）；控制端在线（handle 守卫）。
+    // 双方均须在线（断线会清 peers）。
     let (Some(controller_name), Some(target_name)) = (controller_name, target_name) else {
-        // 极端：目标恰在此刻断线。撤销，回告控制端。
-        send_msg(
-            &st.peers,
-            controller_id,
-            RemoteS2C::ControlDenied {
-                target_device_id: target.to_string(),
-                reason: DenyReason::Offline,
-            },
-        );
-        return;
+        deny(st, DenyReason::Offline);
+        return false;
     };
     st.sessions.insert(
         controller_id.to_string(),
@@ -524,6 +482,89 @@ fn submit_pairing(st: &mut HubState, controller_id: &str, target: &str, code: &s
             role: Role::Controlled,
         },
     );
+    true
+}
+
+/// 控制端提交配对码：校验提交者身份 + 有效期 + 码值，成功经 [`establish_session`]
+/// 建会话并返回 `Some((控制端, 被控端))`（供 `ws.rs` 持久化信任）；失败按原因回
+/// [`RemoteS2C::PairingResult`] 并返回 `None`。
+fn submit_pairing(
+    st: &mut HubState,
+    controller_id: &str,
+    target: &str,
+    code: &str,
+) -> Option<(String, String)> {
+    let fail = |st: &HubState, reason: PairingFailReason, attempts_left: u32| {
+        send_msg(
+            &st.peers,
+            controller_id,
+            RemoteS2C::PairingResult {
+                reason,
+                attempts_left,
+            },
+        );
+    };
+
+    // 读出 pending 快照（释放借用后再改状态）。
+    let Some((p_code, p_created, p_owner, p_attempts)) = st.pending.get(target).map(|p| {
+        (
+            p.code.clone(),
+            p.created_at,
+            p.controller_device_id.clone(),
+            p.attempts_left,
+        )
+    }) else {
+        fail(st, PairingFailReason::NoPending, 0);
+        return None;
+    };
+    // 提交者必须是当初发起请求的控制端（取自鉴权 device_id，杜绝抢答/跨用户）。
+    // 不命中按「无此配对」回复，避免向无关方泄漏配对存在与否。
+    if p_owner != controller_id {
+        fail(st, PairingFailReason::NoPending, 0);
+        return None;
+    }
+    // 过期（>= TTL 即失效：配对码恰好有效 PAIRING_TTL_SECS 秒，elapsed∈[0,TTL)）。
+    if auth::now_secs() - p_created >= PAIRING_TTL_SECS {
+        st.pending.remove(target);
+        fail(st, PairingFailReason::Expired, 0);
+        send_msg(
+            &st.peers,
+            target,
+            RemoteS2C::PairingCancelled {
+                reason: DenyReason::Expired,
+            },
+        );
+        return None;
+    }
+    // 码错：递减尝试，归零即作废。
+    if p_code != code {
+        let left = p_attempts.saturating_sub(1);
+        if left == 0 {
+            st.pending.remove(target);
+            fail(st, PairingFailReason::TooManyAttempts, 0);
+            send_msg(
+                &st.peers,
+                target,
+                RemoteS2C::PairingCancelled {
+                    reason: DenyReason::TooManyAttempts,
+                },
+            );
+        } else {
+            if let Some(p) = st.pending.get_mut(target) {
+                p.attempts_left = left;
+            }
+            fail(st, PairingFailReason::InvalidCode, left);
+        }
+        return None;
+    }
+    // 码对：原子建会话（establish_session 内复检独占 + 取名 + 发 SessionStarted）。
+    // 成功返回这对设备 → ws.rs 持久化信任，之后免重输（直到一端被删）。
+    st.pending.remove(target);
+    if establish_session(st, controller_id, target) {
+        Some((controller_id.to_string(), target.to_string()))
+    } else {
+        None
+    }
 }
 
 /// 被控端拒绝当前未决配对（key = 被控端自身 device_id）：清 pending、通知控制端。
@@ -592,7 +633,7 @@ mod tests {
         c_rx: &mut UnboundedReceiver<ToClient>,
         t_rx: &mut UnboundedReceiver<ToClient>,
     ) {
-        hub.handle(c_id, c_cid, RemoteC2S::RequestControl { target: t_id.into() });
+        hub.request_control(c_id, c_cid, t_id, false);
         // 被控端收到 ControlRequested（含配对码）。
         let code = match next_msg(t_rx) {
             RemoteS2C::ControlRequested { pairing_code, .. } => pairing_code,
@@ -600,7 +641,7 @@ mod tests {
         };
         // 控制端收到 PairingNeeded。
         assert!(matches!(next_msg(c_rx), RemoteS2C::PairingNeeded { .. }));
-        hub.handle(c_id, c_cid, RemoteC2S::SubmitPairing { target: t_id.into(), code });
+        let _ = hub.submit_pairing(c_id, c_cid, t_id, &code);
         // 双方收到 SessionStarted。
         assert!(matches!(
             next_msg(c_rx),
@@ -636,13 +677,13 @@ mod tests {
         let hub = Hub::new();
         let (c_cid, mut c_rx) = join(&hub, "ctrl", "u", "c");
         let (_t, mut t_rx) = join(&hub, "tgt", "u", "t");
-        hub.handle("ctrl", c_cid, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl", c_cid, "tgt", false);
         let _code = match next_msg(&mut t_rx) {
             RemoteS2C::ControlRequested { pairing_code, .. } => pairing_code,
             o => panic!("{o:?}"),
         };
         let _ = next_msg(&mut c_rx); // PairingNeeded
-        hub.handle("ctrl", c_cid, RemoteC2S::SubmitPairing { target: "tgt".into(), code: "000000000".into() });
+        let _ = hub.submit_pairing("ctrl", c_cid, "tgt", "000000000");
         match next_msg(&mut c_rx) {
             RemoteS2C::PairingResult { reason: PairingFailReason::InvalidCode, attempts_left } => {
                 assert_eq!(attempts_left, PAIRING_MAX_ATTEMPTS - 1);
@@ -656,7 +697,7 @@ mod tests {
         let hub = Hub::new();
         let (c_cid, mut c_rx) = join(&hub, "ctrl", "u", "c");
         let (_t, mut t_rx) = join(&hub, "tgt", "u", "t");
-        hub.handle("ctrl", c_cid, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl", c_cid, "tgt", false);
         let real = match next_msg(&mut t_rx) {
             RemoteS2C::ControlRequested { pairing_code, .. } => pairing_code,
             o => panic!("{o:?}"),
@@ -665,7 +706,7 @@ mod tests {
         // 用一个保证错误的码（与真码不同）。
         let wrong = if real == "111111111" { "222222222" } else { "111111111" };
         for _ in 0..PAIRING_MAX_ATTEMPTS {
-            hub.handle("ctrl", c_cid, RemoteC2S::SubmitPairing { target: "tgt".into(), code: wrong.into() });
+            let _ = hub.submit_pairing("ctrl", c_cid, "tgt", wrong);
         }
         let msgs = drain(&mut c_rx);
         assert!(msgs.iter().any(|m| matches!(
@@ -680,11 +721,30 @@ mod tests {
     }
 
     #[test]
+    fn 已配对免码直连() {
+        // paired=true：跳过配对码，双方直接 SessionStarted（无 ControlRequested/PairingNeeded）。
+        let hub = Hub::new();
+        let (c, mut crx) = join(&hub, "ctrl", "u", "c");
+        let (_t, mut trx) = join(&hub, "tgt", "u", "t");
+        hub.request_control("ctrl", c, "tgt", true);
+        assert!(matches!(
+            next_msg(&mut crx),
+            RemoteS2C::SessionStarted { role: Role::Controller, .. }
+        ));
+        assert!(matches!(
+            next_msg(&mut trx),
+            RemoteS2C::SessionStarted { role: Role::Controlled, .. }
+        ));
+        // 不应有配对码相关消息。
+        assert!(drain(&mut trx).is_empty());
+    }
+
+    #[test]
     fn 跨账户控制被拒() {
         let hub = Hub::new();
         let (c_cid, mut c_rx) = join(&hub, "ctrl", "user-A", "c");
         let (_t, _t_rx) = join(&hub, "tgt", "user-B", "t");
-        hub.handle("ctrl", c_cid, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl", c_cid, "tgt", false);
         assert!(matches!(
             next_msg(&mut c_rx),
             RemoteS2C::ControlDenied { reason: DenyReason::CrossUser, .. }
@@ -695,7 +755,7 @@ mod tests {
     fn 自控被拒() {
         let hub = Hub::new();
         let (c_cid, mut c_rx) = join(&hub, "ctrl", "u", "c");
-        hub.handle("ctrl", c_cid, RemoteC2S::RequestControl { target: "ctrl".into() });
+        hub.request_control("ctrl", c_cid, "ctrl", false);
         assert!(matches!(
             next_msg(&mut c_rx),
             RemoteS2C::ControlDenied { reason: DenyReason::SelfControl, .. }
@@ -706,7 +766,7 @@ mod tests {
     fn 离线目标被拒() {
         let hub = Hub::new();
         let (c_cid, mut c_rx) = join(&hub, "ctrl", "u", "c");
-        hub.handle("ctrl", c_cid, RemoteC2S::RequestControl { target: "ghost".into() });
+        hub.request_control("ctrl", c_cid, "ghost", false);
         assert!(matches!(
             next_msg(&mut c_rx),
             RemoteS2C::ControlDenied { reason: DenyReason::Offline, .. }
@@ -720,7 +780,7 @@ mod tests {
         let (_t, mut trx) = join(&hub, "tgt", "u", "t");
         pair_ok(&hub, "ctrl1", c1, "tgt", &mut c1rx, &mut trx);
         let (c2, mut c2rx) = join(&hub, "ctrl2", "u", "c2");
-        hub.handle("ctrl2", c2, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl2", c2, "tgt", false);
         assert!(matches!(
             next_msg(&mut c2rx),
             RemoteS2C::ControlDenied { reason: DenyReason::AlreadyControlled, .. }
@@ -732,7 +792,7 @@ mod tests {
         let hub = Hub::new();
         let (c1, mut c1rx) = join(&hub, "ctrl1", "u", "c1");
         let (_t, mut trx) = join(&hub, "tgt", "u", "t");
-        hub.handle("ctrl1", c1, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl1", c1, "tgt", false);
         let code = match next_msg(&mut trx) {
             RemoteS2C::ControlRequested { pairing_code, .. } => pairing_code,
             o => panic!("{o:?}"),
@@ -740,7 +800,7 @@ mod tests {
         let _ = drain(&mut c1rx);
         // ctrl2 不是发起者，即便知道真码也应被拒（NoPending，不泄漏）。
         let (c2, mut c2rx) = join(&hub, "ctrl2", "u", "c2");
-        hub.handle("ctrl2", c2, RemoteC2S::SubmitPairing { target: "tgt".into(), code });
+        let _ = hub.submit_pairing("ctrl2", c2, "tgt", &code);
         assert!(matches!(
             next_msg(&mut c2rx),
             RemoteS2C::PairingResult { reason: PairingFailReason::NoPending, .. }
@@ -754,7 +814,7 @@ mod tests {
         let hub = Hub::new();
         let (c, mut crx) = join(&hub, "ctrl", "u", "c");
         let (t, mut trx) = join(&hub, "tgt", "u", "t");
-        hub.handle("ctrl", c, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("ctrl", c, "tgt", false);
         let _ = next_msg(&mut trx); // ControlRequested
         let _ = next_msg(&mut crx); // PairingNeeded
         hub.handle("tgt", t, RemoteC2S::DeclineControl);
@@ -806,7 +866,7 @@ mod tests {
         let (_c2, _c2rx) = join(&hub, "dev", "u", "d"); // 驱逐 c1
         let (_t, mut trx) = join(&hub, "tgt", "u", "t");
         // 用旧 conn_id 发消息：应被 is_current 守卫忽略，目标收不到请求。
-        hub.handle("dev", c1, RemoteC2S::RequestControl { target: "tgt".into() });
+        hub.request_control("dev", c1, "tgt", false);
         assert!(drain(&mut trx).is_empty());
     }
 
@@ -817,7 +877,7 @@ mod tests {
         let (_t1, mut t1rx) = join(&hub, "t1", "u", "t1");
         pair_ok(&hub, "ctrl", c, "t1", &mut crx, &mut t1rx);
         let (_t2, _t2rx) = join(&hub, "t2", "u", "t2");
-        hub.handle("ctrl", c, RemoteC2S::RequestControl { target: "t2".into() });
+        hub.request_control("ctrl", c, "t2", false);
         assert!(matches!(
             next_msg(&mut crx),
             RemoteS2C::ControlDenied { reason: DenyReason::ControllerBusy, .. }

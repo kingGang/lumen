@@ -274,6 +274,16 @@ impl RemoteWs {
         self.mirror.as_ref()
     }
 
+    /// 控制端：滚动镜像显示（滚轮回看被控端历史；镜像有 scrollback）。返回是否滚动了。
+    pub fn scroll_mirror(&mut self, lines: isize) -> bool {
+        if let Some(m) = self.mirror.as_mut() {
+            m.grid_mut().scroll_display(lines);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 把数据面帧序列化为不透明 `Relay` 投递（序列化失败仅记日志、不断连）。
     fn send_frame(&self, frame: &RemoteFrame) {
         match frame.to_value() {

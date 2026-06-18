@@ -4851,11 +4851,16 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 };
                 if lines != 0 {
-                    state
-                        .focused_pane_mut()
-                        .term
-                        .grid_mut()
-                        .scroll_display(lines);
+                    // M5.3 镜像：控制中（远程视图）滚轮滚镜像历史，否则滚本地焦点窗格。
+                    if state.is_mirror_active() {
+                        state.remote_ws.scroll_mirror(lines);
+                    } else {
+                        state
+                            .focused_pane_mut()
+                            .term
+                            .grid_mut()
+                            .scroll_display(lines);
+                    }
                     state.window.request_redraw();
                 }
             }
