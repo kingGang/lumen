@@ -1719,15 +1719,19 @@ fn remote_device_list_ui(
     }
     ui.add_space(2.0);
 
+    // 过滤掉本机（本机会话已在「本地」tab 显示，远程列表只列其他设备）；
     // 排序：在线置顶、离线置底（各组内保持服务端 last_seen 倒序）。
-    let mut order: Vec<usize> = (0..devices.len()).collect();
+    let mut order: Vec<usize> = (0..devices.len())
+        .filter(|&i| !devices[i].is_self)
+        .collect();
     order.sort_by_key(|&i| !devices[i].online);
 
     egui::ScrollArea::vertical()
         .id_salt("remote_device_scroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            if devices.is_empty() {
+            // 用 order（已过滤本机）判空：仅有本机时也显示「暂无设备」。
+            if order.is_empty() {
                 ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new(s.remote_empty)
