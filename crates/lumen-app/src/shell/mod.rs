@@ -174,6 +174,22 @@ pub struct ShellInput<'a> {
     /// 文件树栏一律画被控端只读树（快照未到则空树+「等待 cwd」占位），**不回落本地树**
     /// ——否则会把本机目录树画进远程栏、且点击 cd/打开误作用于控制端本机（本地/远程串扰）。
     pub remote_view_active: bool,
+    /// M5.3 part3c-2 #7：文件剪贴板来源侧（None=空）。本地树据此决定是否显示「粘贴到此目录」
+    /// （= 剪贴板为 Remote，下载目标）；远程树据此（= 剪贴板为 Local，上传目标）。
+    pub file_clipboard_side: Option<crate::remote_ws::ClipSide>,
+    /// M5.3 part3c-2 #7：覆盖弹窗待决的冲突项数（Some = 渲染覆盖确认模态）。
+    pub overwrite_conflict_count: Option<usize>,
+}
+
+/// part3c-2 #7 覆盖确认模态的用户选择。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OverwriteChoice {
+    /// 覆盖全部已存在项。
+    Overwrite,
+    /// 跳过已存在项（只传不冲突的）。
+    Skip,
+    /// 取消整次粘贴。
+    Cancel,
 }
 
 /// 一帧外壳 UI 的产出。
@@ -298,6 +314,12 @@ pub struct ShellOutput {
     pub remote_toggle_hidden: Option<bool>,
     /// 控制端远程树：双击文件的被控端路径（main 起 Fetch → 传到本地默认程序打开，#5）。
     pub remote_fetch_open: Option<String>,
+    /// part3c-2 #7：复制文件 / 文件夹到剪贴板 (来源侧, path, name, is_dir)。
+    pub file_copy: Option<(crate::remote_ws::ClipSide, String, String, bool)>,
+    /// part3c-2 #7：粘贴到某目录 (目标侧, 目录 path)（main 据剪贴板侧 × 目标侧定方向）。
+    pub file_paste: Option<(crate::remote_ws::ClipSide, String)>,
+    /// part3c-2 #7：覆盖确认模态的本帧选择（main 据此续传 / 跳过 / 取消）。
+    pub overwrite_choice: Option<OverwriteChoice>,
     /// 文件树：节点拖放到某窗格，把路径文本插入该窗格命令行（不带
     /// 回车，转义见 filetree::path_insert_text）。元组为 (落点所在
     /// 窗格下标, 路径)；落点不在任何窗格（间隙/区外）时整体为 None。
@@ -423,6 +445,9 @@ pub fn show(
         remote_dir_clicks: Vec::new(),
         remote_toggle_hidden: None,
         remote_fetch_open: None,
+        file_copy: None,
+        file_paste: None,
+        overwrite_choice: None,
         insert_path: None,
         copy_text: None,
         filetree_dialog_closed: false,
@@ -724,23 +749,33 @@ pub fn show(
     // M5.3 part3c-2：控制中+远程视图时改画**被控端 Option B 浏览树**（复用同一栏位/开合/宽度）；
     // 否则画本地树。`panel_width/rect` 两路同构，下方描边/拖宽手柄逻辑无需分支。
     // 片1 为占位桩（仅按 RootChanged 的 cwd 画占位）；片2 换成交互式浏览树。
+    use crate::remote_ws::ClipSide;
     let (ft_panel_width, ft_panel_rect, ft_external_drop) = if input.remote_view_active {
         // 远程视图：一律画被控端 Option B 浏览树（只读渲染）。cwd 未到时画占位，绝不回落
-        // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏）收集到 rout，
-        // 由 main 闭包后以 &mut state.remote_ws 施加。
+        // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏 / 复制粘贴）收集到
+        // rout，由 main 闭包后以 &mut state.remote_ws 施加。远程树可粘贴 = 本地侧剪贴板有项（上传）。
+        let can_paste = input.file_clipboard_side == Some(ClipSide::Local);
         let rout = filetree::show_remote(
             root,
             input.remote_filetree,
             st.filetree.visible,
             pal,
             app_settings.layout.filetree_width,
+            can_paste,
         );
         out.filetree_width = rout.panel_width;
         out.remote_dir_clicks = rout.dir_clicks;
         out.remote_toggle_hidden = rout.toggle_hidden;
         out.remote_fetch_open = rout.fetch_open;
+        // 复制远程项 → 剪贴板 Remote 侧（下载源）；粘贴到远程目录 → Remote 目标（上传，片5）。
+        out.file_copy = rout
+            .copy_files
+            .map(|(path, name, is_dir)| (ClipSide::Remote, path, name, is_dir));
+        out.file_paste = rout.paste_into.map(|dir| (ClipSide::Remote, dir));
         (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
+        // 本地树可粘贴 = 远程侧剪贴板有项（下载目标）。
+        let can_paste = input.file_clipboard_side == Some(ClipSide::Remote);
         let ft = filetree::show(
             root,
             &mut st.filetree,
@@ -748,12 +783,23 @@ pub fn show(
             input.shell_idle,
             pal,
             app_settings.layout.filetree_width,
+            can_paste,
         );
         out.filetree_width = ft.panel_width;
         out.cd_dir = ft.cd_dir;
         out.open_file = ft.open_file;
         out.copy_text = ft.copy_text;
         out.filetree_dialog_closed = ft.dialog_closed;
+        // 复制本地项 → 剪贴板 Local 侧（上传源，片5）；粘贴到本地目录 → Local 目标（下载）。
+        out.file_copy = ft.file_copy.map(|(path, is_dir)| {
+            let name = path
+                .file_name()
+                .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+            (ClipSide::Local, path.display().to_string(), name, is_dir)
+        });
+        out.file_paste = ft
+            .file_paste_dir
+            .map(|dir| (ClipSide::Local, dir.display().to_string()));
         if ft.busy_hint {
             st.toast
                 .push(toast::ToastKind::Warn, crate::i18n::strings().shell_busy_cd);
@@ -763,6 +809,10 @@ pub fn show(
         }
         (ft.panel_width, ft.panel_rect, ft.external_drop)
     };
+    // part3c-2 #7：覆盖确认模态（粘贴检测到同名时，main 设 overwrite_conflict_count）。
+    if let Some(count) = input.overwrite_conflict_count {
+        out.overwrite_choice = overwrite_modal(root.ctx(), count, pal);
+    }
     // P16b：文件树栏轮廓描边——只画右/上/下三边，省略左边。
     // 左边是与侧栏的共享边（侧栏右边 = 文件树左边），双画叠 2px；
     // 文件树可折叠为窄条、可拖宽，相邻关系动态变化时也始终不叠边。
@@ -1525,6 +1575,53 @@ pub fn show(
     // —— 系统提示浮层（最后绘制 = 叠在一切覆盖层之上）——
     toast::show(root.ctx(), &mut st.toast, pal);
     out
+}
+
+/// part3c-2 #7 覆盖确认模态：粘贴检测到同名时弹（仿 `dialog_ui` 删除确认）。返回用户选择
+/// （`None` = 仍在等待）；点背景 / Esc 视为取消。
+fn overwrite_modal(
+    ctx: &egui::Context,
+    conflict_count: usize,
+    pal: &theme::Palette,
+) -> Option<OverwriteChoice> {
+    let s = crate::i18n::strings();
+    let mut choice = None;
+    let frame = egui::Frame::new()
+        .fill(pal.bg_panel)
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(16));
+    let modal = egui::Modal::new(egui::Id::new("lumen_overwrite_modal"))
+        .backdrop_color(egui::Color32::from_black_alpha(120))
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.set_width(300.0);
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt1(s.remote_overwrite_prompt_fmt, conflict_count))
+                    .size(13.0)
+                    .color(pal.fg),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                // 覆盖 = 危险操作：语义红实底 + 反相文字（同删除确认按钮范式）。
+                let ow = egui::Button::new(
+                    egui::RichText::new(s.remote_overwrite_overwrite).color(pal.accent_fg),
+                )
+                .fill(pal.error);
+                if ui.add(ow).clicked() {
+                    choice = Some(OverwriteChoice::Overwrite);
+                }
+                if ui.button(s.remote_overwrite_skip).clicked() {
+                    choice = Some(OverwriteChoice::Skip);
+                }
+                if ui.button(s.filetree_cancel_btn).clicked() {
+                    choice = Some(OverwriteChoice::Cancel);
+                }
+            });
+        });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(OverwriteChoice::Cancel); // 点背景 / Esc = 取消。
+    }
+    choice
 }
 
 /// 标题栏拖动换位的落点判定（F7②）：指针落在哪个窗格（`rects` =

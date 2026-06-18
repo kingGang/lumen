@@ -17,9 +17,10 @@
 //! 事件并推进 UI 态，登出 [`RemoteWs::stop`]。本模块（part2a）只做**引擎 + 状态
 //! 机**；配对弹窗 / 被控横幅 / 设备「连接」入口等 UI 在 part2b 消费这里暴露的态。
 //!
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -62,6 +63,12 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// part3c-2 控制端在途 Fetch 的停滞超时：超过这么久没收到新块即判传输中断、清临时文件
 /// （正常传输每收一块刷新计时；仅防对端静默卡死，非总时长上限）。
 const FETCH_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// part3c-2 #7 下载并发文件数上限（递归下载时同时在途的文件 Fetch 数；防一次性起几百个）。
+const DOWNLOAD_MAX_FILES: usize = 4;
+/// part3c-2 #7 下载并发目录列举上限（同时在途的 ListDir 数；防深 / 宽树洪泛被控端线程）。
+const DOWNLOAD_MAX_LISTDIR: usize = 6;
+/// part3c-2 #7/上传 递归深度上限（防 junction / symlink 成环；超深的子树跳过）。
+const TRANSFER_MAX_DEPTH: usize = 64;
 
 /// 控制端待配对态：已发起请求、正等用户输入被控端展示的配对码。
 #[derive(Debug, Clone)]
@@ -116,6 +123,17 @@ pub enum Notice {
     FetchStarted,
     /// part3c-2：获取文件失败（读失败 / 过大 / 传输中断）。
     FetchFailed(FsErr),
+    /// part3c-2 #7：开始下载（复制远程项粘贴到本地，传输中）。
+    DownloadStarted,
+    /// part3c-2 #7：下载结束汇总（完成 / 跳过 / 出错文件数）。
+    DownloadDone {
+        /// 成功落地文件数。
+        done: usize,
+        /// 因撞名跳过数。
+        skipped: usize,
+        /// 出错数。
+        errors: usize,
+    },
 }
 
 /// 后台线程 → 主线程事件。
@@ -177,11 +195,15 @@ pub struct RemoteWs {
     svc_tx: Option<Sender<SvcReply>>,
     /// 被控端：文件服务回包接收端（main 在 `pump_remote` 经 [`Self::drain_service`] 排空发回）。
     svc_rx: Option<Receiver<SvcReply>>,
-    /// 控制端：在途 Fetch（接收方）：req_id → 落临时文件的任务（#5 打开 / 片4 下载）。
+    /// 控制端：在途 Fetch（接收方）：req_id → 落本地文件的任务（#5 打开 / #7 下载）。
     inflight_fetch: HashMap<u64, FetchJob>,
     /// 被控端：在途 Fetch 源（发送方）：req_id → 给 worker 发「可再发一块」许可的句柄
     /// （每收一个 [`RemoteFrame::FileChunkAck`] +1，滑动窗口背压）。
     inflight_fetch_src: HashMap<u64, FetchSrcJob>,
+    /// 跨本地 / 远程的文件剪贴板（复制记引用、粘贴触发传输）。会话结束清 `Remote` 侧。
+    file_clipboard: Option<FileClipboard>,
+    /// 控制端：进行中的 #7 下载编排（远程 → 本地递归传输）；同一时刻一个。
+    download: Option<DownloadWalk>,
     /// M5.3 part4 被控端待执行的远程输入字节（控制端转发来）：main 每帧取走、经
     /// 「本地输入优先」仲裁后写入焦点窗格 PTY。
     pending_input: Vec<Vec<u8>>,
@@ -511,16 +533,27 @@ enum SvcReply {
     FetchSrcDone { req_id: u64 },
 }
 
-/// 控制端在途 Fetch 任务（接收方）：把被控端分块传来的文件字节顺序写入临时文件，
-/// 收完用本地默认程序打开（#5）。
+/// 控制端在途 Fetch 的用途：决定落地位置与收完动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchKind {
+    /// #5 双击打开：落临时文件，`FileEnd` 后用本地默认程序打开。
+    Open,
+    /// #7 下载：落到目标本地路径，`FileEnd` 后只关句柄（不打开），并推进下载编排。
+    Download,
+}
+
+/// 控制端在途 Fetch 任务（接收方）：把被控端分块传来的文件字节顺序写入本地文件
+/// （Open=临时文件 / Download=目标路径），ACK 背压。
 struct FetchJob {
-    /// 被控端源文件不透明路径（双击去重键：同文件已在途则跳过）。
+    /// 用途（打开 vs 下载）。
+    kind: FetchKind,
+    /// 被控端源文件不透明路径（打开去重键 / 日志）。
     src_path: String,
-    /// 临时文件用的安全 basename（被控端 `DirEntry.name` 清洗，保留扩展名）。
+    /// 临时文件用的安全 basename（仅 `Open`：被控端 `DirEntry.name` 清洗，保留扩展名）。
     name: String,
-    /// 落地临时文件路径（[`RemoteFrame::FileBegin`] 时确定并创建）。
-    tmp_path: Option<std::path::PathBuf>,
-    /// 已打开的临时文件句柄（`FileBegin` 后 `Some`）。
+    /// 正在写入的本地文件路径（`Open`=临时文件、`Download`=目标路径；`FileBegin` 时确定）。
+    dest: Option<std::path::PathBuf>,
+    /// 已打开的写入句柄（`FileBegin` 后 `Some`）。
     file: Option<std::fs::File>,
     /// 下一个期望块序号（连续性校验）。
     next_seq: u32,
@@ -528,6 +561,56 @@ struct FetchJob {
     written: u64,
     /// 上次收到块的时刻（停滞超时清理；`FileBegin` 与每块刷新）。
     last_at: Instant,
+}
+
+/// 跨「本地 / 远程」两侧的文件剪贴板（复制只记引用、零传输；粘贴才触发字节流）。
+pub struct FileClipboard {
+    /// 复制来源侧。
+    pub side: ClipSide,
+    /// 复制的项（path 不透明、name 显示名、is_dir 决定递归）。
+    pub items: Vec<ClipItem>,
+}
+
+/// 剪贴板来源 / 粘贴目标侧。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClipSide {
+    /// 控制端本机（本地文件树）。
+    Local,
+    /// 被控端（远程文件树）。
+    Remote,
+}
+
+/// 剪贴板一项。
+#[derive(Clone)]
+pub struct ClipItem {
+    /// 不透明路径（远程=被控端路径 / 本地=控制端路径）。
+    pub path: String,
+    /// 显示名（落地时的 basename）。
+    pub name: String,
+    /// 是否目录（决定递归 vs 单文件）。
+    pub is_dir: bool,
+}
+
+/// #7 下载编排（远程 → 本地）：控制端用 ListDir 递归走被控端目录树、Fetch 拉文件落到本地
+/// 对应路径。复用 `inflight_fetch`（`kind=Download`）做文件传输，本结构跟踪目录遍历 + 队列。
+struct DownloadWalk {
+    /// 撞名策略：`true`=覆盖已存在、`false`=跳过已存在（粘贴时一次性决策，套用整次递归）。
+    overwrite: bool,
+    /// 在途目录列举：req_id → (该远程目录的子项要落入的本地目录, 深度)。
+    dir_listdir: HashMap<u64, (std::path::PathBuf, usize)>,
+    /// 待列举目录队列 (远程目录 path, 本地落地目录, 深度)（受 [`DOWNLOAD_MAX_LISTDIR`] 节流，
+    /// 防深 / 宽树一次性向被控端洪泛 ListDir）。
+    dir_queue: std::collections::VecDeque<(String, std::path::PathBuf, usize)>,
+    /// 待拉取文件队列 (远程文件 path, 本地落地 path)（受并发上限节流）。
+    file_queue: std::collections::VecDeque<(String, std::path::PathBuf)>,
+    /// 正在 Fetch 的文件数（并发上限 [`DOWNLOAD_MAX_FILES`]）。
+    active_files: usize,
+    /// 已访问远程目录路径（防 junction / symlink 成环）。
+    visited: HashSet<String>,
+    /// 统计：完成 / 跳过 / 出错文件数（结束 toast 汇总）。
+    done: usize,
+    skipped: usize,
+    errors: usize,
 }
 
 /// 被控端在途 Fetch 源（发送方）：仅持给 worker 发许可的句柄，worker 经 `cmd_tx` 直发帧。
@@ -562,6 +645,15 @@ fn sanitize_basename(name: &str) -> String {
     } else {
         s
     }
+}
+
+/// 名字是否是安全的单层子项名（恰一个普通组件）：拒 `..` / 绝对路径 / 盘符 / 路径分隔符 /
+/// 空 / `.`。用于下载落地与上传写入，防对端给的 `name` 驱动路径穿越（H1 安全）。保留 Unicode
+/// （不像 `sanitize_basename` 把 CJK 改写成 `_`）。
+fn is_safe_child_name(name: &str) -> bool {
+    use std::path::Component;
+    let mut comps = std::path::Path::new(name).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
 }
 
 /// `io::Error` → 机器可读 [`FsErr`]（控制端本地化提示用）。
@@ -1032,7 +1124,12 @@ impl RemoteWs {
     /// 控制端：双击远程文件 → 起一个 Fetch，传完用本地默认程序打开（#5）。同一文件已在途
     /// 则跳过（防连点起多份临时文件 + 多次拉起本地程序）。
     pub fn start_fetch_open(&mut self, path: String) {
-        if self.inflight_fetch.values().any(|j| j.src_path == path) {
+        // 去重仅看「打开」用途的在途 Fetch（同文件正下载时仍允许双击打开）。
+        if self
+            .inflight_fetch
+            .values()
+            .any(|j| matches!(j.kind, FetchKind::Open) && j.src_path == path)
+        {
             return;
         }
         let req_id = self.next_req_id();
@@ -1040,9 +1137,10 @@ impl RemoteWs {
         self.inflight_fetch.insert(
             req_id,
             FetchJob {
+                kind: FetchKind::Open,
                 src_path: path.clone(),
                 name,
-                tmp_path: None,
+                dest: None,
                 file: None,
                 next_seq: 0,
                 written: 0,
@@ -1053,28 +1151,46 @@ impl RemoteWs {
         self.send_frame(&RemoteFrame::FetchReq { req_id, path });
     }
 
-    /// 控制端：收 `FileBegin` → 在临时目录建落地文件（名字加 `req_id` 前缀防多文件撞名）。
+    /// 控制端：收 `FileBegin` → 建落地文件（Open=临时目录 `{req_id}-名`；Download=目标路径，
+    /// 先 `create_dir_all` 父目录）。
     fn fetch_begin(&mut self, req_id: u64) {
-        let Some(name) = self.inflight_fetch.get(&req_id).map(|j| j.name.clone()) else {
-            return;
+        let (kind, name, dest_opt) = {
+            let Some(job) = self.inflight_fetch.get(&req_id) else {
+                return;
+            };
+            (job.kind, job.name.clone(), job.dest.clone())
         };
-        let dir = std::env::temp_dir().join("lumen_remote_open");
-        let _ = std::fs::create_dir_all(&dir);
-        let tmp = dir.join(format!("{req_id}-{}", sanitize_basename(&name)));
-        match std::fs::File::create(&tmp) {
+        let target = match kind {
+            FetchKind::Open => {
+                let dir = std::env::temp_dir().join("lumen_remote_open");
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join(format!("{req_id}-{}", sanitize_basename(&name)))
+            }
+            FetchKind::Download => {
+                let Some(d) = dest_opt else {
+                    self.fetch_abort(req_id, FsErr::Io);
+                    return;
+                };
+                if let Some(parent) = d.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                d
+            }
+        };
+        match std::fs::File::create(&target) {
             Ok(f) => {
                 if let Some(job) = self.inflight_fetch.get_mut(&req_id) {
                     job.file = Some(f);
-                    job.tmp_path = Some(tmp);
+                    job.dest = Some(target);
                     job.next_seq = 0; // 重置连续性计数（防异常重发 FileBegin 后误判乱序）。
                     job.written = 0;
                     job.last_at = Instant::now();
                 }
             }
             Err(e) => {
-                log::error!("创建临时文件失败 {}: {e}", tmp.display());
-                // 经 fetch_abort 统一收口：移除在途 + 弹失败 + 发 FetchCancel 让被控端回收源 worker。
-                self.fetch_abort(req_id, FsErr::Io);
+                log::error!("创建落地文件失败 {}: {e}", target.display());
+                // 经 fetch_abort 统一收口：移除在途 + 发 FetchCancel + 打开失败弹提示 / 下载计错。
+                self.fetch_abort(req_id, io_err_to_fs(&e));
             }
         }
     }
@@ -1116,37 +1232,54 @@ impl RemoteWs {
         }
     }
 
-    /// 控制端：收 `FileEnd` → flush + 关句柄 + 用系统默认程序打开（#5）。
+    /// 控制端：收 `FileEnd` → flush + 关句柄。Open → 用系统默认程序打开（#5）；
+    /// Download → 计完成 + 推进下载队列（#7）。
     fn fetch_end(&mut self, req_id: u64) {
         let Some(mut job) = self.inflight_fetch.remove(&req_id) else {
             return;
         };
-        let Some(mut file) = job.file.take() else {
-            // FileBegin 未成功就 End：清理半成品。
-            if let Some(tmp) = job.tmp_path.take() {
-                let _ = std::fs::remove_file(tmp);
+        let kind = job.kind;
+        let dest = job.dest.take();
+        if let Some(mut file) = job.file.take() {
+            let _ = file.flush();
+            drop(file); // 关句柄后再交系统程序（Windows 打开前须释放写锁）。
+            match kind {
+                FetchKind::Open => {
+                    if let Some(d) = dest {
+                        crate::shell::filetree::open_with_default(&d);
+                    }
+                }
+                FetchKind::Download => self.download_file_done(false),
             }
-            return;
-        };
-        let _ = file.flush();
-        drop(file); // 关句柄后再交系统程序（Windows 打开前须释放写锁）。
-        if let Some(tmp) = job.tmp_path {
-            crate::shell::filetree::open_with_default(&tmp);
+        } else {
+            // FileBegin 未成功就 End（异常）：清理半成品 / 下载计错。
+            if let Some(d) = dest {
+                let _ = std::fs::remove_file(d);
+            }
+            if matches!(kind, FetchKind::Download) {
+                self.download_file_done(true);
+            }
         }
     }
 
-    /// 控制端：中止一个在途 Fetch（乱序 / 写失败 / 超上限 / 对端 `FileErr` / 停滞超时 / 建临时
-    /// 文件失败）：关句柄、删半成品临时文件、弹失败提示，并发 `FetchCancel` 让被控端即时回收
-    /// 源 worker（不滞留到会话结束）。
+    /// 控制端：中止一个在途 Fetch（乱序 / 写失败 / 超上限 / 对端 `FileErr` / 停滞超时 / 建文件
+    /// 失败）：关句柄、删半成品文件，发 `FetchCancel` 让被控端即时回收源 worker。Open 弹失败
+    /// 提示；Download 计错 + 推进队列（不逐文件弹 toast，结束汇总）。
     fn fetch_abort(&mut self, req_id: u64, err: FsErr) {
+        let mut was_download = false;
         if let Some(mut job) = self.inflight_fetch.remove(&req_id) {
+            was_download = matches!(job.kind, FetchKind::Download);
             job.file = None; // 关句柄（Windows 删前须释放）。
-            if let Some(tmp) = job.tmp_path.take() {
-                let _ = std::fs::remove_file(&tmp);
+            if let Some(d) = job.dest.take() {
+                let _ = std::fs::remove_file(&d);
             }
         }
         self.send_frame(&RemoteFrame::FetchCancel { req_id });
-        self.notices.push(Notice::FetchFailed(err));
+        if was_download {
+            self.download_file_done(true);
+        } else {
+            self.notices.push(Notice::FetchFailed(err));
+        }
     }
 
     /// 控制端：清理停滞（超 [`FETCH_STALL_TIMEOUT`] 没收到新块）的在途 Fetch。
@@ -1160,6 +1293,224 @@ impl RemoteWs {
         for id in stalled {
             log::warn!("Fetch req={id} 停滞超时，中止清理");
             self.fetch_abort(id, FsErr::Io);
+        }
+    }
+
+    // ── part3c-2 #7 下载编排（远程 → 本地，复制粘贴递归）────────────────────
+
+    /// 设置文件剪贴板（复制：记引用，零传输）。空项忽略。
+    pub fn set_file_clipboard(&mut self, side: ClipSide, items: Vec<ClipItem>) {
+        if items.is_empty() {
+            return;
+        }
+        self.file_clipboard = Some(FileClipboard { side, items });
+    }
+
+    /// 当前文件剪贴板（粘贴时按来源 / 目标侧决定方向）。
+    #[must_use]
+    pub fn file_clipboard(&self) -> Option<&FileClipboard> {
+        self.file_clipboard.as_ref()
+    }
+
+    /// 控制端：开始把剪贴板里的远程项下载到本地 `dest_dir`（递归）。`overwrite`：撞名覆盖
+    /// （否则跳过已存在），由粘贴时的覆盖弹窗一次性决定、套用整次递归。
+    ///
+    /// 守卫：非控制中（会话已结束）不起（防 H2 死会话复活下载态）；已有下载在途则忽略
+    /// （防 M1 并发粘贴污染状态机——同一时刻仅一个下载）。
+    pub fn start_download(&mut self, items: Vec<ClipItem>, dest_dir: String, overwrite: bool) {
+        if items.is_empty() || !self.is_controlling() {
+            return;
+        }
+        if self.download.is_some() {
+            log::debug!("下载进行中，忽略新的粘贴下载请求");
+            return;
+        }
+        self.download = Some(DownloadWalk {
+            overwrite,
+            dir_listdir: HashMap::new(),
+            dir_queue: VecDeque::new(),
+            file_queue: VecDeque::new(),
+            active_files: 0,
+            visited: HashSet::new(),
+            done: 0,
+            skipped: 0,
+            errors: 0,
+        });
+        self.notices.push(Notice::DownloadStarted);
+        let dest_root = PathBuf::from(&dest_dir);
+        for item in items {
+            // H1 安全：落地名必须是单个普通组件（拒 `..` / 绝对 / 分隔符 → 防对端驱动路径穿越）。
+            self.download_enqueue_named(&dest_root, &item.name, item.path, item.is_dir, 0);
+        }
+        self.pump_download();
+    }
+
+    /// 下载编排：校验对端给的落地名安全后入队（目录 / 文件）。名字非法（穿越）→ 计错跳过。
+    fn download_enqueue_named(
+        &mut self,
+        parent_dest: &std::path::Path,
+        name: &str,
+        src: String,
+        is_dir: bool,
+        depth: usize,
+    ) {
+        if !is_safe_child_name(name) {
+            log::warn!("下载落地名非法（拒绝穿越）: {name:?}");
+            if let Some(d) = self.download.as_mut() {
+                d.errors += 1;
+            }
+            return;
+        }
+        let dest = parent_dest.join(name);
+        if is_dir {
+            self.download_enqueue_dir(src, dest, depth);
+        } else {
+            self.download_enqueue_file(src, dest);
+        }
+    }
+
+    /// 下载编排：把一个远程目录入队（受 [`DOWNLOAD_MAX_LISTDIR`] 节流；pump 时才建目录 + 发
+    /// ListDir）。环 / 超深跳过。
+    fn download_enqueue_dir(&mut self, src: String, dest: PathBuf, depth: usize) {
+        if depth > TRANSFER_MAX_DEPTH {
+            return;
+        }
+        let Some(d) = self.download.as_mut() else {
+            return;
+        };
+        if !d.visited.insert(src.clone()) {
+            return; // 已访问 → 防 junction / symlink 成环。
+        }
+        d.dir_queue.push_back((src, dest, depth));
+    }
+
+    /// 下载编排：把一个远程文件入队（撞名按策略跳过 / 排队拉取）。
+    fn download_enqueue_file(&mut self, src: String, dest: PathBuf) {
+        let Some(d) = self.download.as_mut() else {
+            return;
+        };
+        if !d.overwrite && dest.exists() {
+            d.skipped += 1;
+            return;
+        }
+        d.file_queue.push_back((src, dest));
+    }
+
+    /// 下载编排：收 ListDir 结果（属于下载遍历的 req_id）→ 子目录递归、文件入队。
+    fn download_dir_result(&mut self, req_id: u64, entries: Vec<DirEntry>, err: Option<FsErr>) {
+        let Some((dest, depth)) = self
+            .download
+            .as_mut()
+            .and_then(|d| d.dir_listdir.remove(&req_id))
+        else {
+            return;
+        };
+        if err.is_some() {
+            if let Some(d) = self.download.as_mut() {
+                d.errors += 1;
+            }
+        } else {
+            for e in entries {
+                // H1 安全：子项名同样校验（被控端给的 name 不可信）。
+                self.download_enqueue_named(&dest, &e.name, e.path, e.is_dir, depth + 1);
+            }
+        }
+        self.pump_download();
+    }
+
+    /// 下载编排：在并发上限内从队列起目录列举 + 文件 Fetch；全队列空 + 无在途 → 结束汇总。
+    fn pump_download(&mut self) {
+        // 先在 ListDir 并发上限内出队目录：建本地目录 + 发 ListDir（dir_listdir 即在途计数）。
+        loop {
+            let next = {
+                let Some(d) = self.download.as_mut() else {
+                    return;
+                };
+                if d.dir_listdir.len() >= DOWNLOAD_MAX_LISTDIR {
+                    break;
+                }
+                d.dir_queue.pop_front()
+            };
+            let Some((src, dest, depth)) = next else {
+                break;
+            };
+            let _ = std::fs::create_dir_all(&dest);
+            let req_id = self.next_req_id();
+            if let Some(d) = self.download.as_mut() {
+                d.dir_listdir.insert(req_id, (dest, depth));
+            }
+            // 下载列举含隐藏项（完整镜像子树）。
+            self.send_frame(&RemoteFrame::ListDir {
+                req_id,
+                path: src,
+                show_hidden: true,
+            });
+        }
+        // 再在文件并发上限内出队文件 Fetch。
+        loop {
+            let next = {
+                let Some(d) = self.download.as_mut() else {
+                    return;
+                };
+                if d.active_files >= DOWNLOAD_MAX_FILES {
+                    break;
+                }
+                d.file_queue.pop_front()
+            };
+            let Some((src, dest)) = next else {
+                break;
+            };
+            let req_id = self.next_req_id();
+            self.inflight_fetch.insert(
+                req_id,
+                FetchJob {
+                    kind: FetchKind::Download,
+                    src_path: src.clone(),
+                    name: String::new(),
+                    dest: Some(dest),
+                    file: None,
+                    next_seq: 0,
+                    written: 0,
+                    last_at: Instant::now(),
+                },
+            );
+            if let Some(d) = self.download.as_mut() {
+                d.active_files += 1;
+            }
+            self.send_frame(&RemoteFrame::FetchReq { req_id, path: src });
+        }
+        self.download_check_complete();
+    }
+
+    /// 下载编排：一个文件传输结束（成功 / 失败）→ 减并发计数 + 续推队列。
+    fn download_file_done(&mut self, error: bool) {
+        if let Some(d) = self.download.as_mut() {
+            d.active_files = d.active_files.saturating_sub(1);
+            if error {
+                d.errors += 1;
+            } else {
+                d.done += 1;
+            }
+        }
+        self.pump_download();
+    }
+
+    /// 下载编排：全部完成（无在途文件 + 文件 / 目录队列空 + 无在列目录）→ 汇总 toast + 结束。
+    fn download_check_complete(&mut self) {
+        let complete = self.download.as_ref().is_some_and(|d| {
+            d.active_files == 0
+                && d.file_queue.is_empty()
+                && d.dir_queue.is_empty()
+                && d.dir_listdir.is_empty()
+        });
+        if complete {
+            if let Some(d) = self.download.take() {
+                self.notices.push(Notice::DownloadDone {
+                    done: d.done,
+                    skipped: d.skipped,
+                    errors: d.errors,
+                });
+            }
         }
     }
 
@@ -1197,15 +1548,24 @@ impl RemoteWs {
         self.remote_filetree = None;
         self.remote_root_sent = None;
         self.pending_listdir.clear();
-        // 控制端在途 Fetch：关句柄 + 删半成品临时文件。
+        // 控制端在途 Fetch：关句柄 + 删半成品文件（临时 / 下载半成品）。
         for (_, mut job) in self.inflight_fetch.drain() {
             job.file = None;
-            if let Some(tmp) = job.tmp_path.take() {
-                let _ = std::fs::remove_file(tmp);
+            if let Some(d) = job.dest.take() {
+                let _ = std::fs::remove_file(d);
             }
         }
         // 被控端在途 Fetch 源：drop permit_tx → worker 领许可失败自行退出。
         self.inflight_fetch_src.clear();
+        // #7 下载编排终止（在途文件的部分落地文件已由上面 inflight_fetch.drain 删除）。
+        self.download = None;
+        // 远程侧剪贴板失效（被控端不可达，防粘贴野路径）；本地侧保留（仍指向控制端本机）。
+        if matches!(
+            self.file_clipboard.as_ref().map(|c| c.side),
+            Some(ClipSide::Remote)
+        ) {
+            self.file_clipboard = None;
+        }
         // svc_rx 里可能残留旧会话回包：排空丢弃（新会话 req_id 体系不同、且态已清）。
         if let Some(rx) = self.svc_rx.as_ref() {
             while rx.try_recv().is_ok() {}
@@ -1639,9 +1999,15 @@ impl RemoteWs {
                 overflow,
                 err,
             } => {
-                // 仅控制端：双键校验后填进对应目录的 listing（陈旧 / 乱序丢弃）。
+                // 仅控制端：先看是否属于 #7 下载遍历的 req_id（路由到下载编排），否则填浏览树。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
-                    if let Some(ft) = self.remote_filetree.as_mut() {
+                    let is_download = self
+                        .download
+                        .as_ref()
+                        .is_some_and(|d| d.dir_listdir.contains_key(&req_id));
+                    if is_download {
+                        self.download_dir_result(req_id, entries, err);
+                    } else if let Some(ft) = self.remote_filetree.as_mut() {
                         ft.apply_dir_entries(req_id, &path, entries, overflow, err);
                     }
                 }
@@ -2110,7 +2476,7 @@ mod tests {
         let tmp = ws
             .inflight_fetch
             .get(&req)
-            .and_then(|j| j.tmp_path.clone())
+            .and_then(|j| j.dest.clone())
             .expect("FileBegin 建了临时文件");
         assert!(tmp.exists(), "临时文件已创建");
         // 按序两块顺序写入。
@@ -2127,6 +2493,105 @@ mod tests {
                 .any(|n| matches!(n, Notice::FetchFailed(_))),
             "应弹 FetchFailed"
         );
+    }
+
+    #[test]
+    fn 下载_单文件_落地与完成汇总() {
+        let mut ws = RemoteWs::default();
+        // start_download 守卫 is_controlling：测试需置控制中会话。
+        ws.session = Some(ActiveSession {
+            peer_name: "peer".into(),
+            role: Role::Controller,
+        });
+        let base = std::env::temp_dir().join(format!("lumen_dl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("建测试目录");
+        // 下载一个不冲突的文件（覆盖模式）：入队 + pump 起一个 Download fetch。
+        ws.start_download(
+            vec![ClipItem {
+                path: "/remote/a.txt".into(),
+                name: "a.txt".into(),
+                is_dir: false,
+            }],
+            base.display().to_string(),
+            true,
+        );
+        let req = *ws.inflight_fetch.keys().next().expect("有下载 fetch");
+        // 模拟传输：begin（建目标文件）→ chunk → end（落地 + 计完成）。
+        ws.fetch_begin(req);
+        ws.fetch_chunk(req, 0, b"hello");
+        ws.fetch_end(req);
+        let target = base.join("a.txt");
+        let content = std::fs::read(&target).expect("目标文件应落地");
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(content, b"hello", "下载内容正确");
+        assert!(ws.download.is_none(), "完成后清空 download");
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::DownloadDone { done: 1, errors: 0, .. })),
+            "应弹 DownloadDone(done=1)"
+        );
+    }
+
+    #[test]
+    fn 下载_不覆盖时跳过已存在() {
+        let mut ws = RemoteWs::default();
+        ws.session = Some(ActiveSession {
+            peer_name: "peer".into(),
+            role: Role::Controller,
+        });
+        let base = std::env::temp_dir().join(format!("lumen_dlskip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("建测试目录");
+        std::fs::write(base.join("exist.txt"), b"old").expect("写已存在文件");
+        // 不覆盖 + 目标已存在 → 跳过，不起 fetch，立即完成。
+        ws.start_download(
+            vec![ClipItem {
+                path: "/remote/exist.txt".into(),
+                name: "exist.txt".into(),
+                is_dir: false,
+            }],
+            base.display().to_string(),
+            false,
+        );
+        assert!(ws.inflight_fetch.is_empty(), "跳过不起 fetch");
+        assert!(ws.download.is_none(), "立即完成");
+        let kept = std::fs::read(base.join("exist.txt")).expect("旧文件仍在");
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(kept, b"old", "跳过未动旧文件");
+        assert!(
+            ws.take_notices()
+                .iter()
+                .any(|n| matches!(n, Notice::DownloadDone { skipped: 1, .. })),
+            "应弹 DownloadDone(skipped=1)"
+        );
+    }
+
+    #[test]
+    fn 剪贴板_远程侧会话结束清空_本地侧保留() {
+        let mut ws = RemoteWs::default();
+        ws.set_file_clipboard(
+            ClipSide::Remote,
+            vec![ClipItem {
+                path: "/r/x".into(),
+                name: "x".into(),
+                is_dir: false,
+            }],
+        );
+        assert!(ws.file_clipboard().is_some());
+        ws.clear_remote_filetree();
+        assert!(ws.file_clipboard().is_none(), "Remote 侧会话结束清空");
+        ws.set_file_clipboard(
+            ClipSide::Local,
+            vec![ClipItem {
+                path: "/l/y".into(),
+                name: "y".into(),
+                is_dir: false,
+            }],
+        );
+        ws.clear_remote_filetree();
+        assert!(ws.file_clipboard().is_some(), "Local 侧保留");
     }
 
     #[test]

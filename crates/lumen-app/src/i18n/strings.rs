@@ -234,6 +234,22 @@ pub struct Strings {
     pub remote_fetch_failed: &'static str,
     /// part3c-2 #5：文件过大无法获取 toast
     pub remote_fetch_too_large: &'static str,
+    /// part3c-2 #7：开始下载 toast
+    pub remote_download_started: &'static str,
+    /// part3c-2 #7：下载完成汇总 toast，三参 `{0}`完成 `{1}`跳过 `{2}`出错
+    pub remote_download_done_fmt: &'static str,
+    /// part3c-2 #7：复制项后右键「粘贴到此目录」菜单
+    pub remote_menu_paste: &'static str,
+    /// part3c-2 #7：远程/本地树右键「复制」菜单
+    pub remote_menu_copy: &'static str,
+    /// part3c-2 #7：覆盖弹窗标题 / 提示（单参 `{}` = 冲突项数）
+    pub remote_overwrite_prompt_fmt: &'static str,
+    /// part3c-2 #7：覆盖弹窗「覆盖全部」按钮
+    pub remote_overwrite_overwrite: &'static str,
+    /// part3c-2 #7：覆盖弹窗「跳过已存在」按钮
+    pub remote_overwrite_skip: &'static str,
+    /// part3c-2 #7：复制成功 toast（单参 `{}` = 项数）
+    pub remote_copied_fmt: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,

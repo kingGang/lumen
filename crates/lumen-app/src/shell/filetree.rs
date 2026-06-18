@@ -219,6 +219,10 @@ enum MenuAction {
     CopyAbs(PathBuf),
     /// 复制相对树根的路径。
     CopyRel(PathBuf),
+    /// part3c-2 #7/上传：复制文件 / 文件夹到文件剪贴板（上传源；区别于 CopyAbs/Rel 复制文本）。
+    CopyFiles { path: PathBuf, is_dir: bool },
+    /// part3c-2 #7：把剪贴板里的远程项粘贴（下载）到此本地目录。
+    PasteInto(PathBuf),
 }
 
 /// 文件树的跨帧状态。
@@ -614,6 +618,10 @@ pub struct FileTreeOutput {
     pub external_drop: Option<(PathBuf, egui::Pos2)>,
     /// 请求写剪贴板的文本（复制绝对/相对路径；arboard 在 main 持有）。
     pub copy_text: Option<String>,
+    /// part3c-2 #7/上传：复制文件 / 文件夹到文件剪贴板（本地侧；(路径, 是否目录)）。
+    pub file_copy: Option<(PathBuf, bool)>,
+    /// part3c-2 #7：把远程剪贴板项粘贴（下载）到此本地目录。
+    pub file_paste_dir: Option<PathBuf>,
     /// 要弹的系统提示（操作结果反馈；shell::show 转投 ToastState）。
     pub toasts: Vec<(ToastKind, String)>,
     /// 对话框本帧关闭（main 把键盘焦点交还终端）。
@@ -637,6 +645,8 @@ pub fn show(
     shell_idle: bool,
     pal: &theme::Palette,
     width: f32,
+    // part3c-2 #7：是否显示「粘贴到此目录」（= 文件剪贴板里有远程项，下载目标）。
+    can_paste: bool,
 ) -> FileTreeOutput {
     let mut out = FileTreeOutput::default();
     st.sync_root(cwd);
@@ -665,7 +675,7 @@ pub fn show(
                     .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
-            .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, &mut out));
+            .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, can_paste, &mut out));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
     }
@@ -695,6 +705,7 @@ fn panel_ui(
     st: &mut FileTreeState,
     shell_idle: bool,
     pal: &theme::Palette,
+    can_paste: bool,
     out: &mut FileTreeOutput,
 ) {
     // —— 工具条：根目录名（悬停看全路径）+ 搜索/刷新 ——
@@ -919,7 +930,7 @@ fn panel_ui(
     if searching {
         search_results_ui(ui, st, shell_idle, pal, out);
     } else {
-        tree_ui(ui, st, shell_idle, pal, out);
+        tree_ui(ui, st, shell_idle, pal, can_paste, out);
     }
 }
 
@@ -929,6 +940,7 @@ fn tree_ui(
     st: &mut FileTreeState,
     shell_idle: bool,
     pal: &theme::Palette,
+    can_paste: bool,
     out: &mut FileTreeOutput,
 ) {
     // 右键菜单点选的动作：菜单闭包（在 ltreeview 内部被调用）只持
@@ -955,6 +967,7 @@ fn tree_ui(
                 load_seq,
                 epoch: *epoch,
                 tx: reply_tx,
+                can_paste,
             };
             let (resp, actions) = TreeView::new(ui.make_persistent_id("lumen_file_tree"))
                 .allow_multi_selection(false)
@@ -1082,6 +1095,12 @@ fn handle_menu_action(
                 .and_then(|r| path.strip_prefix(r).ok())
                 .map_or_else(|| path.display().to_string(), |p| p.display().to_string());
             out.copy_text = Some(rel);
+        }
+        MenuAction::CopyFiles { path, is_dir } => {
+            out.file_copy = Some((path, is_dir));
+        }
+        MenuAction::PasteInto(dir) => {
+            out.file_paste_dir = Some(dir);
         }
     }
 }
@@ -1350,6 +1369,8 @@ struct LoadCtx<'a> {
     load_seq: &'a mut u64,
     epoch: u64,
     tx: &'a mpsc::Sender<LoadReply>,
+    /// part3c-2 #7：是否在目录右键菜单显示「粘贴到此目录」（有远程剪贴板时）。
+    can_paste: bool,
 }
 
 /// 递归添加一个节点（目录展开时先懒加载子项再下钻）。
@@ -1414,6 +1435,7 @@ fn add_node(
             let path = load.nodes[id].path.clone();
             let name = display_name(&path);
             let is_root = id == 0;
+            let can_paste = load.can_paste;
             // activatable：双击/回车在目录上触发 cd（ltreeview 随之禁用
             // 双击开合，展开/折叠走左侧 closer 三角，与 Warp 一致）。
             // 根目录默认展开，其余默认收起（懒加载的前提）。
@@ -1432,7 +1454,9 @@ fn add_node(
                                 .truncate(),
                         );
                     })
-                    .context_menu(move |ui| dir_context_menu(ui, &path, is_root, menu)),
+                    .context_menu(move |ui| {
+                        dir_context_menu(ui, &path, is_root, can_paste, menu);
+                    }),
             );
             if open {
                 ensure_listing(load, id);
@@ -1457,6 +1481,7 @@ fn dir_context_menu(
     ui: &mut egui::Ui,
     path: &Path,
     is_root: bool,
+    can_paste: bool,
     menu: &RefCell<Option<MenuAction>>,
 ) {
     let s = crate::i18n::strings();
@@ -1465,6 +1490,19 @@ fn dir_context_menu(
     // ——shell 中途 cd 走了之后可借此回到树根目录。
     if ui.button(s.filetree_menu_enter_dir).clicked() {
         *menu.borrow_mut() = Some(MenuAction::EnterDir(path.to_path_buf()));
+        ui.close();
+    }
+    ui.separator();
+    // part3c-2 #7/上传：复制本目录到文件剪贴板（上传源）；远程剪贴板有项时可粘贴（下载到此）。
+    if ui.button(s.remote_menu_copy).clicked() {
+        *menu.borrow_mut() = Some(MenuAction::CopyFiles {
+            path: path.to_path_buf(),
+            is_dir: true,
+        });
+        ui.close();
+    }
+    if can_paste && ui.button(s.remote_menu_paste).clicked() {
+        *menu.borrow_mut() = Some(MenuAction::PasteInto(path.to_path_buf()));
         ui.close();
     }
     ui.separator();
@@ -1511,6 +1549,15 @@ fn dir_context_menu(
 fn file_context_menu(ui: &mut egui::Ui, path: &Path, menu: &RefCell<Option<MenuAction>>) {
     let s = crate::i18n::strings();
     ui.set_min_width(150.0);
+    // part3c-2 #7/上传：复制本文件到文件剪贴板（上传源）。
+    if ui.button(s.remote_menu_copy).clicked() {
+        *menu.borrow_mut() = Some(MenuAction::CopyFiles {
+            path: path.to_path_buf(),
+            is_dir: false,
+        });
+        ui.close();
+    }
+    ui.separator();
     // 文件必有父目录（位于树根之下），防御回退自身。
     let parent = path.parent().unwrap_or(path);
     if ui.button(s.filetree_menu_new_file).clicked() {
@@ -1769,6 +1816,10 @@ pub struct RemoteFileTreeOutput {
     pub toggle_hidden: Option<bool>,
     /// 本帧双击的文件的被控端路径（#5：main 起 Fetch → 传到控制端本地默认程序打开）。
     pub fetch_open: Option<String>,
+    /// 本帧右键「复制」的远程项 (path, name, is_dir)（#7 下载源 → 文件剪贴板 Remote 侧）。
+    pub copy_files: Option<(String, String, bool)>,
+    /// 本帧右键「粘贴到此目录」的远程目录 path（上传目标；片5 接入）。
+    pub paste_into: Option<String>,
 }
 
 /// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
@@ -1784,6 +1835,8 @@ pub fn show_remote(
     visible: bool,
     pal: &theme::Palette,
     width: f32,
+    // part3c-2 #7：是否显示远程目录右键「粘贴到此目录」（= 本地侧剪贴板有项，上传目标，片5）。
+    can_paste: bool,
 ) -> RemoteFileTreeOutput {
     let mut out = RemoteFileTreeOutput::default();
     if visible {
@@ -1797,7 +1850,7 @@ pub fn show_remote(
                     .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
-            .show_inside(root_ui, |ui| remote_panel_ui(ui, ft, pal, &mut out));
+            .show_inside(root_ui, |ui| remote_panel_ui(ui, ft, pal, can_paste, &mut out));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
     }
@@ -1805,11 +1858,12 @@ pub fn show_remote(
 }
 
 /// 远程树面板内容：根名工具条 + 「显示隐藏项」勾选 + 可见行（按 depth 缩进，三角由
-/// 控制端自有展开态驱动）。
+/// 控制端自有展开态驱动）。右键「复制」（下载源）/ 目录「粘贴到此目录」（上传目标）。
 fn remote_panel_ui(
     ui: &mut egui::Ui,
     ft: Option<&crate::remote_ws::RemoteFileTree>,
     pal: &theme::Palette,
+    can_paste: bool,
     out: &mut RemoteFileTreeOutput,
 ) {
     use crate::remote_ws::RemoteRowKind;
@@ -1864,6 +1918,19 @@ fn remote_panel_ui(
                                         .color(pal.fg),
                                 )
                                 .on_hover_text(&row.path);
+                            // 右键：复制（下载源）/ 粘贴到此目录（上传目标，can_paste 时）。
+                            resp.context_menu(|ui| {
+                                ui.set_min_width(150.0);
+                                if ui.button(s.remote_menu_copy).clicked() {
+                                    out.copy_files =
+                                        Some((row.path.clone(), row.name.clone(), true));
+                                    ui.close();
+                                }
+                                if can_paste && ui.button(s.remote_menu_paste).clicked() {
+                                    out.paste_into = Some(row.path.clone());
+                                    ui.close();
+                                }
+                            });
                             // 点击 → 翻转展开（main 施加；未缓存则发 ListDir）。修 #3/#4/#6。
                             if resp.clicked() {
                                 out.dir_clicks.push(row.id);
@@ -1877,6 +1944,15 @@ fn remote_panel_ui(
                                     egui::RichText::new(&row.name).color(pal.fg),
                                 )
                                 .on_hover_text(&row.path);
+                            // 右键：复制（下载源 → 文件剪贴板 Remote 侧）。
+                            resp.context_menu(|ui| {
+                                ui.set_min_width(150.0);
+                                if ui.button(s.remote_menu_copy).clicked() {
+                                    out.copy_files =
+                                        Some((row.path.clone(), row.name.clone(), false));
+                                    ui.close();
+                                }
+                            });
                             if resp.double_clicked() {
                                 out.fetch_open = Some(row.path.clone());
                             }

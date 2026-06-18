@@ -615,6 +615,8 @@ struct AppState {
     /// M5.3 part4b 控制端镜像区物理像素矩形 `(x, y, w, h)`：仅控制中+远程视图时为
     /// Some（每帧由终端区矩形换算），供鼠标命中→镜像选区的像素↔单元格换算。
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
+    /// M5.3 part3c-2 #7：粘贴检测到同名、等用户在覆盖模态拍板的待决下载（None = 无待决）。
+    pending_paste: Option<PendingPaste>,
     /// M5.3 part3b 控制端镜像离屏纹理的 egui 句柄（`MIRROR_OFFSCREEN_ID`，首次控制时
     /// 注册、后续复用）。控制中每帧把镜像 Terminal 渲染进它，shell 以 Image 铺满终端区。
     mirror_texture: Option<egui::TextureId>,
@@ -958,6 +960,10 @@ impl AppState {
         // 时运行（传输中 FileChunk 持续唤醒、足以及时清理）；对端彻底静默时退而依赖会话结束
         // (clear) 与下次启动 (start 清目录) 兜底，临时文件不会无界堆积。
         self.remote_ws.sweep_fetch_stalls();
+        // H2：会话结束（不再控制）→ 清待决覆盖粘贴，否则覆盖模态会在死会话上复活下载。
+        if !self.remote_ws.is_controlling() {
+            self.pending_paste = None;
+        }
         // 被控端：执行控制端转发来的远程输入（本地输入优先仲裁）。
         let mut applied = false;
         let remote_input = self.remote_ws.take_input();
@@ -2980,6 +2986,16 @@ impl AppState {
 }
 
 /// 远程控制一次性通知 → toast（分级 + 本地化文案，按机器可读原因细分）。M5.3 part2b。
+/// part3c-2 #7：粘贴检测到同名后、等覆盖模态拍板的待决下载。
+struct PendingPaste {
+    /// 要下载的远程项（剪贴板快照）。
+    items: Vec<remote_ws::ClipItem>,
+    /// 本地落地目录。
+    dest_dir: String,
+    /// 冲突项数（驱动模态文案）。
+    conflict_count: usize,
+}
+
 fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, String) {
     use lumen_protocol::remote::{DenyReason, EndReason, FsErr, PairingFailReason, Role};
     use remote_ws::Notice;
@@ -3031,6 +3047,22 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
                 _ => s.remote_fetch_failed,
             };
             (ToastKind::Warn, text.to_string())
+        }
+        Notice::DownloadStarted => (ToastKind::Info, s.remote_download_started.to_string()),
+        Notice::DownloadDone {
+            done,
+            skipped,
+            errors,
+        } => {
+            let kind = if *errors > 0 {
+                ToastKind::Warn
+            } else {
+                ToastKind::Info
+            };
+            (
+                kind,
+                i18n::fmt3(s.remote_download_done_fmt, done, skipped, errors),
+            )
         }
     }
 }
@@ -3449,6 +3481,7 @@ impl App {
             mirror_src: None,
             mirror_bounds_sent: None,
             mirror_rect_px: None,
+            pending_paste: None,
             remote_viewport: None,
             mirror_viewport_sent: None,
             mirror_texture: None,
@@ -5557,6 +5590,9 @@ impl ApplicationHandler<PtyWake> for App {
                         None
                     },
                     remote_view_active: state.is_mirror_active(),
+                    // part3c-2 #7：文件剪贴板来源侧 + 待决覆盖冲突项数（驱动菜单 / 覆盖模态）。
+                    file_clipboard_side: state.remote_ws.file_clipboard().map(|c| c.side),
+                    overwrite_conflict_count: state.pending_paste.as_ref().map(|p| p.conflict_count),
                 };
                 // 「回到底部」浮动按钮目标（上一帧几何；run_ui 闭包内绘制、
                 // 闭包后处理点击）。须在可变借用 state.shell_state 之前算好。
@@ -6777,6 +6813,67 @@ impl ApplicationHandler<PtyWake> for App {
                 // #5：双击远程文件 → 起 Fetch（传到控制端临时文件 → 本地默认程序打开）。
                 if let Some(path) = shell_out.remote_fetch_open {
                     state.remote_ws.start_fetch_open(path);
+                }
+                // #7：复制文件 / 文件夹到剪贴板（记引用，零传输）。
+                if let Some((side, path, name, is_dir)) = shell_out.file_copy {
+                    state.remote_ws.set_file_clipboard(
+                        side,
+                        vec![remote_ws::ClipItem { path, name, is_dir }],
+                    );
+                    state.shell_state.toast.push(
+                        shell::toast::ToastKind::Info,
+                        i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
+                    );
+                }
+                // #7：粘贴 → 按剪贴板侧 × 目标侧定方向。本片做下载（Remote→Local）；上传留片5。
+                if let Some((target_side, dir)) = shell_out.file_paste {
+                    let clip = state
+                        .remote_ws
+                        .file_clipboard()
+                        .map(|c| (c.side, c.items.clone()));
+                    if let Some((clip_side, items)) = clip {
+                        match (clip_side, target_side) {
+                            // 下载：远程剪贴板 → 本地目录。检查本地同名冲突 → 有则弹覆盖模态。
+                            (remote_ws::ClipSide::Remote, remote_ws::ClipSide::Local) => {
+                                let dest_root = std::path::Path::new(&dir);
+                                let conflicts = items
+                                    .iter()
+                                    .filter(|it| dest_root.join(&it.name).exists())
+                                    .count();
+                                if conflicts > 0 {
+                                    state.pending_paste = Some(PendingPaste {
+                                        items,
+                                        dest_dir: dir,
+                                        conflict_count: conflicts,
+                                    });
+                                } else {
+                                    state.remote_ws.start_download(items, dir, true);
+                                }
+                            }
+                            // 上传（控制端本地 → 被控端目录）：片5 实装。本片仅记日志，不弹
+                            // 用户可见（避免硬编码文案破坏 i18n；菜单本不应在无上传能力时让点）。
+                            (remote_ws::ClipSide::Local, remote_ws::ClipSide::Remote) => {
+                                let _ = (items, dir);
+                                log::debug!("上传（local→remote）将在片5 实装");
+                            }
+                            // 同侧（本地→本地 / 远程→远程）：本期不支持。
+                            _ => {}
+                        }
+                    }
+                }
+                // #7：覆盖模态选择 → 续传 / 跳过 / 取消待决下载。
+                if let Some(choice) = shell_out.overwrite_choice {
+                    if let Some(p) = state.pending_paste.take() {
+                        match choice {
+                            shell::OverwriteChoice::Overwrite => {
+                                state.remote_ws.start_download(p.items, p.dest_dir, true);
+                            }
+                            shell::OverwriteChoice::Skip => {
+                                state.remote_ws.start_download(p.items, p.dest_dir, false);
+                            }
+                            shell::OverwriteChoice::Cancel => {}
+                        }
+                    }
                 }
                 if let Some(dir) = shell_out.cd_dir {
                     // UI 已按 shell 空闲闸门过滤，这里直接注入。

@@ -133,6 +133,18 @@ pub fn fmt2(tpl: &str, a: impl std::fmt::Display, b: impl std::fmt::Display) -> 
         .replace("{1}", &b.to_string())
 }
 
+/// 三参模板替换：`{0}`/`{1}`/`{2}` 依次替换为 `a`/`b`/`c`（同 [`fmt2`] 的边界行为）。
+pub fn fmt3(
+    tpl: &str,
+    a: impl std::fmt::Display,
+    b: impl std::fmt::Display,
+    c: impl std::fmt::Display,
+) -> String {
+    tpl.replace("{0}", &a.to_string())
+        .replace("{1}", &b.to_string())
+        .replace("{2}", &c.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
