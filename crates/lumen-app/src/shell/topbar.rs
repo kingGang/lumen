@@ -734,6 +734,7 @@ mod topbar_layout_tests {
                     sidebar_visible: true,
                     filetree_visible: true,
                     update_version: None,
+                    current_view: false,
                 },
             );
             got = Some(tb.maximize_btn_rect.unwrap_or(egui::Rect::NOTHING));
@@ -773,6 +774,7 @@ mod topbar_layout_tests {
                     sidebar_visible: true,
                     filetree_visible: true,
                     update_version: None,
+                    current_view: false,
                 },
             );
         });
@@ -824,6 +826,7 @@ mod topbar_layout_tests {
                     sidebar_visible: true,
                     filetree_visible: false,
                     update_version: None,
+                    current_view: false,
                 },
             );
         });
