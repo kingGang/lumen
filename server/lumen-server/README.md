@@ -74,8 +74,19 @@ cargo run -p lumen-server
 | DELETE | `/api/v1/devices/{id}` | Bearer | 删除设备 |
 | GET/PUT | `/api/v1/sync/settings` | Bearer | 偏好同步（version 守卫 last-write-wins） |
 | GET/POST | `/api/v1/sync/history` | Bearer | 命令历史同步（`text+ts` 去重） |
+| GET (升级) | `/api/v1/ws` | Bearer（`Authorization` 头） | **M5.3** 远程控制 WebSocket 中继 |
 
 类型定义见 `crates/lumen-protocol`（客户端/服务端共享）。
+
+### 3.1 WebSocket 远程控制中继（M5.3 part1）
+
+`GET /api/v1/ws` 升级为 WebSocket 长连接，承载终端远程的**控制面**。鉴权走
+`Authorization: Bearer <jwt>` 头（同 REST，不走 query，避免反代日志泄漏）。消息
+为 JSON **Text 帧**，类型见 `crates/lumen-protocol/src/remote.rs`（`RemoteC2S` /
+`RemoteS2C`）。中继状态机在 `src/hub.rs`（纯内存：presence / 9 位配对 / 控制独占 /
+会话生命周期 / 数据面盲转），传输层在 `src/ws.rs`。配对码由**服务端生成、仅下发
+被控端展示**、控制端人工输入、服务端校验（attempts=5、TTL 120s、后台 GC）。
+数据面 `Relay` 载荷为不透明 JSON，服务端原样转发不解析（part2/3 扩展零改服务端）。
 
 ---
 

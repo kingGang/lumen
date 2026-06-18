@@ -10,9 +10,12 @@ mod config;
 mod db;
 mod error;
 mod handlers;
+mod hub;
 mod state;
+mod ws;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
@@ -20,7 +23,11 @@ use axum::Router;
 use lumen_protocol::routes as r;
 
 use crate::config::Config;
+use crate::hub::Hub;
 use crate::state::AppState;
+
+/// 后台清理周期：扫一遍未决配对，移除过期项（与配对码有效期对齐）。
+const HUB_GC_INTERVAL: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,10 +47,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("数据库就绪，建表完成");
 
     let bind_addr = config.bind_addr.clone();
+    let hub = Arc::new(Hub::new());
     let state = AppState {
         pool,
         config: Arc::new(config),
+        hub: hub.clone(),
     };
+    // 后台 GC：周期清理过期未决配对（防内存泄漏 + 释放被占目标）。
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HUB_GC_INTERVAL);
+        loop {
+            ticker.tick().await;
+            hub.gc();
+        }
+    });
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -72,8 +89,11 @@ fn build_router(state: AppState) -> Router {
             get(handlers::pull_history).post(handlers::push_history),
         )
         .route(r::HEARTBEAT, post(handlers::heartbeat))
+        // M5.3 远程控制 WebSocket 中继（升级请求无 body，下方 DefaultBodyLimit 不影响它；
+        // WS 帧大小另由 ws_handler 的 max_frame_size/max_message_size 收口）。
+        .route(r::WS, get(ws::ws_handler))
         .with_state(state)
-        // 全局请求体上限 1 MiB，防超大 payload（DoS 面收口）。
+        // 全局请求体上限 1 MiB，防超大 payload（DoS 面收口）。仅作用于 REST 请求体。
         .layer(DefaultBodyLimit::max(1_048_576))
 }
 

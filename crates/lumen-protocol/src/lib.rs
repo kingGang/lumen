@@ -14,8 +14,14 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod remote;
+
 /// 协议版本号。任何破坏性变更必须递增；登录响应回传，客户端可比对。
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 服务端仍兼容的最低客户端协议版本（M5.3 WebSocket `Welcome` 下发；低于此
+/// 的客户端应提示用户升级）。当前 = [`PROTOCOL_VERSION`]，破坏性裁撤旧消息时上调。
+pub const MIN_SUPPORTED_VERSION: u32 = 1;
 
 /// REST 端点路径（客户端与服务端共用，避免字符串漂移）。
 pub mod routes {
@@ -33,6 +39,8 @@ pub mod routes {
     pub const SYNC_HISTORY: &str = "/api/v1/sync/history";
     /// 设备心跳 `POST`（保持本设备在线，刷新 `last_seen`；M5.2）。
     pub const HEARTBEAT: &str = "/api/v1/heartbeat";
+    /// 远程控制 WebSocket 长连接 `GET`（升级；M5.3 终端远程，需 `Authorization` 头）。
+    pub const WS: &str = "/api/v1/ws";
 
     /// 单设备路径（重命名 `PATCH` / 删除 `DELETE`）。
     #[must_use]

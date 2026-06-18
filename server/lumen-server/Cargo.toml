@@ -14,7 +14,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 # 纯跨平台依赖：Windows（本地测试）与 Linux（生产发布）均可编译。
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
+# ws feature：M5.3 远程控制 WebSocket 中继（axum::extract::ws）。
+axum = { version = "0.8", features = ["ws"] }
 # Postgres：tokio-postgres + deadpool 连接池。
 # 弃用 sqlx —— sqlx-postgres 0.8.6 在 rustc 1.96 下触发编译器 ICE
 # （pre-expansion lint 崩溃）；tokio-postgres 宏更少、成熟稳定，编译可靠。
