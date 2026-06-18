@@ -1643,6 +1643,25 @@ impl AppState {
             return;
         }
         self.window.set_ime_allowed(true);
+        // M5.3 part4c：镜像态把候选框定位到**镜像光标**（被控端光标）在终端区的像素位置，
+        // 使控制端打中文时候选框出现在远端光标处（跟随态有效；回看态 mirror_cursor=None
+        // 则跳过本次定位，候选框留在上次位置）。
+        if self.is_mirror_active() {
+            if let (Some((rx, ry, _, _)), Some((crow, ccol))) =
+                (self.mirror_rect_px, self.remote_ws.mirror_cursor())
+            {
+                let (cw, ch) = self.renderer.cell_size();
+                let (cx, cy) = self.renderer.cell_origin(crow, ccol);
+                self.window.set_ime_cursor_area(
+                    winit::dpi::PhysicalPosition::new(
+                        f64::from(rx) + f64::from(cx),
+                        f64::from(ry) + f64::from(cy),
+                    ),
+                    winit::dpi::PhysicalSize::new(f64::from(cw), f64::from(ch)),
+                );
+            }
+            return;
+        }
         let Some((px, py, pw, ph)) = self.focused_pane_rect_px() else {
             if log_it {
                 log::info!("[IME-ENABLED] 无焦点窗格矩形（首帧布局未完成），跳过本次定位");
@@ -4301,8 +4320,14 @@ impl ApplicationHandler<PtyWake> for App {
                         || state.shell_state.pane_renaming.is_some(),
                     filetree_dialog_open: state.shell_state.filetree.dialog_open(),
                     terminal_focused: state.terminal_focused,
-                    win32_input: state.tabs[ti].panes[pi].term.win32_input()
-                        && std::env::var_os("LUMEN_WIN32_INPUT").is_some(),
+                    // part4c：镜像态按**被控端**焦点窗格 win32 模式裁决（控制端转发
+                    // win32 编码 + key-up）；本地态按本地窗格 + env 门控。
+                    win32_input: if mirror_active {
+                        state.remote_ws.mirror_win32_input()
+                    } else {
+                        state.tabs[ti].panes[pi].term.win32_input()
+                            && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
+                    },
                     // M4.1 批D1：Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D）。
                     // 镜像态视作空：Ctrl+C 无镜像选区时落 Interrupt（转发中断）而非 CancelLine。
                     #[cfg(feature = "input-editor")]
@@ -4371,8 +4396,17 @@ impl ApplicationHandler<PtyWake> for App {
                 let mode =
                     mode::effective_mode(&state.tabs[ti].panes[pi].term, state.force_fallback);
 
-                // 查表。
-                let result = keymap::lookup(&event, state.modifiers, mode, pressed, &guard);
+                // 查表。M5.3 part4c：镜像态强制按非 Compose（Running）路由——否则控制端
+                // 本地窗格停在自己提示符（Compose 态）时，普通字符/按键会被 keymap 第 9 层
+                // 判成**本地编辑器**输入（灌进本地 composer 而非转发给被控端，且 win32
+                // release 仍转发→幽灵 key-up）。Running 路由让字符/按键落 PassThrough 转发，
+                // Ctrl+C/V/Shift 等仍由 guard（选区/中断/粘贴镜像感知）在层 5/10/11 正确处理。
+                let lookup_mode = if mirror_active {
+                    mode::InputMode::Running
+                } else {
+                    mode
+                };
+                let result = keymap::lookup(&event, state.modifiers, lookup_mode, pressed, &guard);
 
                 // 任意按键命中 → 清退出码角标（设计稿 §3.2 第⑥步，M4.1 批D2）。
                 // 仅 Compose 态有 exit_badge；result=None（keymap 拦截）时也清，
@@ -4463,10 +4497,14 @@ impl ApplicationHandler<PtyWake> for App {
                     }
 
                     Some(keymap::LookupResult::Win32KeyUp) => {
-                        // win32-input-mode 抬起事件：encode_key_win32(Kd=0) 写 PTY。
+                        // win32-input-mode 抬起事件：encode_key_win32(Kd=0)。part4c：镜像态
+                        // 转发给被控端（与 key-down 配对），否则写本地 PTY。
                         if let Some(bytes) = input::encode_key_win32(&event, state.modifiers, false)
                         {
-                            if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
+                            if state.is_mirror_active() {
+                                state.remote_ws.send_input(&bytes);
+                                state.last_key_at = Some(Instant::now());
+                            } else if let Err(e) = state.tabs[ti].panes[pi].write_user_input(&bytes) {
                                 error!("写入 PTY 失败（win32 key-up）: {e:#}");
                             }
                         }
@@ -4580,11 +4618,17 @@ impl ApplicationHandler<PtyWake> for App {
                     Some(keymap::LookupResult::PassThrough) => {
                         // M5.3 part4：镜像视图生效（控制中+远程视图）则把按键编码转发
                         // 给被控端、不写本地窗格（bug3：本地视图时仍是本地输入）。
-                        // （win32-input 模式为 env 门控边角，转发统一用标准 encode_key；
-                        // IME/粘贴转发留 part4b。）
+                        // part4c：镜像态按被控端 win32 模式选编码（win32 则 key-down，
+                        // key-up 走 Win32KeyUp 分支转发）；否则标准 encode_key。
                         if state.is_mirror_active() {
-                            if let Some(bytes) = input::encode_key(&event, state.modifiers) {
+                            let bytes = if state.remote_ws.mirror_win32_input() {
+                                input::encode_key_win32(&event, state.modifiers, true)
+                            } else {
+                                input::encode_key(&event, state.modifiers)
+                            };
+                            if let Some(bytes) = bytes {
                                 state.remote_ws.send_input(&bytes);
+                                state.last_key_at = Some(Instant::now());
                             }
                         } else {
                             // 兜底直通：encode_key / encode_key_win32 编码后写 PTY。
@@ -4954,6 +4998,11 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.terminal_focused && !route {
                     return;
                 }
+                // M5.3 part4c：镜像态不把 preedit 灌进本地编辑器——组合由本地 OS IME 负责
+                // （候选框已定位到被控端光标处），仅在 Commit 时转发提交文本给被控端。
+                if state.is_mirror_active() {
+                    return;
+                }
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
                 #[cfg(feature = "input-editor")]
                 {
@@ -4988,6 +5037,13 @@ impl ApplicationHandler<PtyWake> for App {
                     state.terminal_focused
                 );
                 if !state.terminal_focused && !route {
+                    return;
+                }
+                // M5.3 part4c：镜像态把 IME 提交文本（中文等）转发给被控端 PTY，不写本地、
+                // 不进本地编辑器（控制端本地 IME 仅负责候选/组合，提交即转发）。
+                if state.is_mirror_active() {
+                    state.remote_ws.send_input(text.as_bytes());
+                    state.last_key_at = Some(Instant::now());
                     return;
                 }
                 // M4.1 批D1：IME 分流——设计稿 §7.3
@@ -6554,6 +6610,16 @@ impl ApplicationHandler<PtyWake> for App {
                     // part4b：切换视图即清镜像选区/拖选态——否则远程→本地→远程后会复制
                     // 陈旧选区、或（左键仍按住时切换）回来后产生幻影拖选。
                     state.remote_ws.clear_mirror_selection();
+                    // part4c：切视图复位焦点窗格 preedit（仿 activate()）——否则进镜像态前
+                    // 本地打了一半的中文组合串，退出镜像态后会残留在 footer/composer。
+                    #[cfg(feature = "input-editor")]
+                    {
+                        let ti = state.active_tab;
+                        let pi = state.tabs[ti].focused;
+                        if let Some(p) = state.tabs[ti].panes.get_mut(pi) {
+                            p.preedit = None;
+                        }
+                    }
                     true
                 } else {
                     false

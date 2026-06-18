@@ -318,7 +318,16 @@ impl RemoteWs {
     }
 
     /// 控制端：把用户输入的 VT 字节转发给被控端（part4）。
-    pub fn send_input(&self, bytes: &[u8]) {
+    ///
+    /// 转发输入即把镜像 **snap 回跟随实时底部**（标准终端「输入即滚到底」）——否则
+    /// 回看历史时打字会看不到自己输入的回显。是所有控制端→被控端输入（按键 / Ctrl+C /
+    /// win32 / IME / 粘贴）的收口，故在此统一 snap。
+    pub fn send_input(&mut self, bytes: &[u8]) {
+        if self.hist_top.is_some() {
+            self.hist_top = None;
+            self.mirror_selection = None;
+            self.mirror_selecting = false;
+        }
         self.send_frame(&RemoteFrame::Input(bytes.to_vec()));
     }
 
@@ -574,6 +583,28 @@ impl RemoteWs {
         self.mirror_selection.is_some_and(|s| !s.is_empty())
     }
 
+    /// 控制端（part4c）：被控端焦点窗格是否处于 win32-input 模式（镜像跟踪自 VT 流）。
+    /// 转发按键时据此选 win32 编码 + 发 key-up，使被控端 win32 程序收到完整输入记录。
+    #[must_use]
+    pub fn mirror_win32_input(&self) -> bool {
+        self.mirror.as_ref().is_some_and(Terminal::win32_input)
+    }
+
+    /// 控制端（part4c）：当前镜像光标 `(row, col)`（跟随态 Some；回看态 None）。IME
+    /// 候选框定位到被控端光标处用。
+    #[must_use]
+    pub fn mirror_cursor(&self) -> Option<(usize, usize)> {
+        if self.hist_top.is_some() {
+            return None;
+        }
+        self.mirror.as_ref().map(|m| {
+            let g = m.grid();
+            // 加 display_offset 与渲染侧 cursor_view_row / 本地 IME 定位口径统一（镜像 grid
+            // 当前恒 display_offset==0，显式加上以防将来非零时候选框纵向偏 display_offset 行）。
+            (g.display_offset() + g.cursor.row, g.cursor.col)
+        })
+    }
+
     /// 控制端：在镜像区 `(row, col)` 起选（建空选区、进拖选态）。`row/col` 为显示终端
     /// 内的行列（调用方按镜像区像素换算并夹紧）。
     pub fn mirror_sel_start(&mut self, row: usize, col: usize) {
@@ -626,7 +657,7 @@ impl RemoteWs {
 
     /// 控制端：把文本作为「粘贴」转发给被控端 PTY——换行规整为 CR，按被控端 bracketed
     /// paste 模式（镜像跟踪自 VT 流）包裹，经 `RemoteFrame::Input` 发送。
-    pub fn send_paste(&self, text: &str) {
+    pub fn send_paste(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -1198,6 +1229,31 @@ mod tests {
         assert!(ws.has_mirror_selection(), "拖出非空选区");
         ws.clear_mirror_selection();
         assert!(!ws.has_mirror_selection(), "清空后无选区");
+    }
+
+    #[test]
+    fn 转发输入回跟随底部() {
+        // part4c：回看态转发输入（打字/中文/粘贴）即 snap 回跟随，使用户看到回显。
+        let mut ws = RemoteWs::default();
+        起会话(&mut ws, Role::Controller);
+        relay(&mut ws, &RemoteFrame::HistoryBounds { base: 0, screen_top: 100 });
+        ws.scroll_mirror(5);
+        assert_eq!(ws.hist_top, Some(95), "已进回看态");
+        ws.send_input(b"x");
+        assert_eq!(ws.hist_top, None, "转发输入后回跟随实时底部");
+    }
+
+    #[test]
+    fn 镜像光标跟随态有回看态无() {
+        // part4c：IME 候选框只在跟随态定位到镜像光标，回看态不定位。
+        let mut ws = RemoteWs::default();
+        起会话(&mut ws, Role::Controller);
+        relay(&mut ws, &RemoteFrame::Output(b"abc".to_vec()));
+        assert!(ws.mirror_cursor().is_some(), "跟随态有镜像光标");
+        assert!(!ws.mirror_win32_input(), "默认非 win32 输入模式");
+        relay(&mut ws, &RemoteFrame::HistoryBounds { base: 0, screen_top: 100 });
+        ws.scroll_mirror(5);
+        assert!(ws.mirror_cursor().is_none(), "回看态不返回光标");
     }
 
     #[test]
