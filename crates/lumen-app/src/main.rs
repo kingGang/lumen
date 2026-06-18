@@ -7007,11 +7007,15 @@ impl ApplicationHandler<PtyWake> for App {
                 // 跟镜像网格×cell，shell 以 Image 铺满终端区（SSH 视口下网格≈终端区）。
                 if state.is_mirror_active() {
                     if let Some(mirror) = state.remote_ws.mirror() {
-                        let (cell_w, cell_h) = state.renderer.cell_size();
                         let g = mirror.grid();
                         let cur = (g.cursor.row, g.cursor.col, true);
-                        let w = ((g.cols() as f32 * cell_w).ceil() as u32).max(1);
-                        let h = ((g.rows() as f32 * cell_h).ceil() as u32).max(1);
+                        // 离屏尺寸用控制端**终端区像素**（与窗格同款，含 padding）——
+                        // renderer 渲染时有边距，若按裸网格×cell 定尺寸会把「网格+padding」
+                        // 挤出纹理、底行被裁；用 term_rect 像素则网格+padding 正好画满。
+                        let ppp = state.egui_ctx.pixels_per_point();
+                        let tr = shell_out.term_rect;
+                        let w = ((tr.width() * ppp).round() as u32).max(1);
+                        let h = ((tr.height() * ppp).round() as u32).max(1);
                         // 尺寸变化时重建离屏并重绑 egui 纹理（句柄不变）。
                         if state.renderer.ensure_offscreen(MIRROR_OFFSCREEN_ID, w, h) {
                             if let (Some(view), Some(tex)) = (
