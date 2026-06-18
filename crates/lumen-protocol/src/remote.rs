@@ -94,6 +94,11 @@ pub enum EndReason {
 /// 一个无 PTY 的镜像 `Terminal::advance` 复现整状态（颜色/光标/标题/cwd/命令块全在
 /// 字节流的 SGR/OSC 里，自动还原）。故数据面**只传字节**，无需把结构化 Cell 上线，
 /// `lumen-protocol` 保持零依赖。后续 part3c（多窗格/布局）再加变体，**服务端中继零改**。
+///
+/// **part3d 历史按需分页**：会话只传当前可见屏，被控端的 scrollback 历史不预传。
+/// 控制端上滚回看时按视口窗口发 [`RemoteFrame::HistoryReq`]，被控端按绝对行号
+/// （`Grid::line_by_abs`）序列化对应行回 [`RemoteFrame::HistoryRows`]——「滚到哪屏拉哪屏」，
+/// 断线重连亦按需重拉，不再因镜像会话内 scrollback 丢失而看不到历史。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteFrame {
     /// 回环测试帧：原样转发给对端，用于 part1 验证中继通路连通。
@@ -120,6 +125,36 @@ pub enum RemoteFrame {
         rows: u16,
         /// 列数。
         cols: u16,
+    },
+    /// 控制端 → 被控端（part3d 历史按需分页）：请求被控端焦点窗格历史行
+    /// `[top, top + count)`（**绝对行号**，跨滚动稳定）。控制端镜像上滚回看时按当前
+    /// 视口窗口缺哪段拉哪段——会话起始只发当前可见屏，历史不预传，断线重连亦按需重拉。
+    HistoryReq {
+        /// 起始绝对行号。
+        top: u64,
+        /// 请求行数。
+        count: u16,
+    },
+    /// 被控端 → 控制端：应答 [`Self::HistoryReq`]。`lines[i]` 是绝对行 `top + i` 的
+    /// VT 序列化（每行一段绝对 SGR 字节，空 `Vec` = 该行空白 / 越界）。同时回带当前
+    /// 历史边界，使控制端夹紧回看范围并随实时输出推进。
+    HistoryRows {
+        /// 起始绝对行号（与请求对齐，`lines[i]` 对应 `top + i`）。
+        top: u64,
+        /// 被控端当前最旧保留行的绝对行号（更旧的已被 scrollback 淘汰）。
+        base: u64,
+        /// 被控端当前可视区首行（screen row 0）的绝对行号。
+        screen_top: u64,
+        /// 逐行 VT 字节。
+        lines: Vec<Vec<u8>>,
+    },
+    /// 被控端 → 控制端：历史边界（最旧保留行 + 可视区首行的绝对行号）。会话起始
+    /// 随整屏快照发一次，使控制端在首次回看前即知可滚范围。
+    HistoryBounds {
+        /// 最旧保留行绝对行号。
+        base: u64,
+        /// 可视区首行绝对行号。
+        screen_top: u64,
     },
 }
 
@@ -283,6 +318,24 @@ mod tests {
         for frame in [
             RemoteFrame::Output(vec![0x1b, b'[', b'2', b'J']),
             RemoteFrame::Resize { rows: 40, cols: 120 },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn 历史分页帧经value往返() {
+        for frame in [
+            RemoteFrame::HistoryReq { top: 1000, count: 40 },
+            RemoteFrame::HistoryRows {
+                top: 1000,
+                base: 0,
+                screen_top: 1234,
+                lines: vec![vec![b'h', b'i'], Vec::new(), vec![0x1b, b'[', b'0', b'm']],
+            },
+            RemoteFrame::HistoryBounds { base: 0, screen_top: 1234 },
         ] {
             let v = frame.to_value().expect("to_value");
             let back = RemoteFrame::from_value(&v).expect("from_value");
