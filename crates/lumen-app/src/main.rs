@@ -6067,6 +6067,13 @@ impl ApplicationHandler<PtyWake> for App {
                 } else {
                     false
                 };
+                // M5.2：本地/远程 tab 切换 → 写 settings 并触发存盘。
+                let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
+                    state.settings.layout.view_mode = v;
+                    true
+                } else {
+                    false
+                };
                 let need_save = shell_out.settings_font_changed
                     || shell_out.settings_theme_changed
                     || shell_out.settings_background_image_changed
@@ -6075,7 +6082,8 @@ impl ApplicationHandler<PtyWake> for App {
                     || shell_out.settings_update_changed
                     || shell_out.settings_proxy_changed
                     || sidebar_changed
-                    || filetree_changed;
+                    || filetree_changed
+                    || view_mode_changed;
                 // F3：auto_check 开关改动 → 同步给定时检查线程的原子镜像。
                 if shell_out.settings_update_changed {
                     state

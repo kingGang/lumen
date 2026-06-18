@@ -188,6 +188,8 @@ pub static STRINGS: Strings = Strings {
     topbar_filetree_show_tip: "显示文件树 (Ctrl+B)",
     topbar_filetree_hide_tip: "隐藏文件树 (Ctrl+B)",
     topbar_reset_layout_tip: "恢复窗格默认大小",
+    topbar_tab_local: "本地",
+    topbar_tab_remote: "远程",
     topbar_reset_layout_disabled_tip: "单窗格无需复位",
 
     // F3 热更

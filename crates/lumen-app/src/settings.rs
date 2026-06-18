@@ -154,6 +154,10 @@ pub struct LayoutSettings {
     /// （与 [`Default`] 一致），平滑升级无感知。
     #[serde(default = "default_filetree_visible")]
     pub filetree_visible: bool,
+    /// 当前视图（M5.2）：false = 本地（默认），true = 远程（设备栏）。
+    /// 顶栏「本地/远程」tab 切换；`#[serde(default)]` 旧文件缺字段补 false。
+    #[serde(default = "default_view_mode")]
+    pub view_mode: bool,
 }
 
 /// sidebar_visible 字段的 serde default 函数（旧文件缺字段时补 true）。
@@ -166,6 +170,11 @@ fn default_filetree_visible() -> bool {
     true
 }
 
+/// view_mode 字段的 serde default 函数（旧文件缺字段时补 false = 本地）。
+fn default_view_mode() -> bool {
+    false
+}
+
 impl Default for LayoutSettings {
     fn default() -> Self {
         Self {
@@ -173,6 +182,7 @@ impl Default for LayoutSettings {
             filetree_width: FILETREE_WIDTH_DEFAULT,
             sidebar_visible: true,
             filetree_visible: true,
+            view_mode: false,
         }
     }
 }
@@ -442,6 +452,14 @@ impl Settings {
                     "filetree_visible",
                     "layout.filetree_visible",
                     d.filetree_visible,
+                    path,
+                );
+                // view_mode（M5.2）：旧文件缺字段静默补 false（本地）。
+                s.layout.view_mode = lenient_field(
+                    ly,
+                    "view_mode",
+                    "layout.view_mode",
+                    d.view_mode,
                     path,
                 );
             } else {
@@ -718,6 +736,7 @@ mod tests {
                 filetree_width: 320.0,
                 sidebar_visible: true,
                 filetree_visible: false,
+                view_mode: true,
             },
             language: crate::i18n::Language::ZhTw,
             classic_mode: false,

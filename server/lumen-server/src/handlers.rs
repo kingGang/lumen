@@ -26,6 +26,22 @@ pub async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok", "protocol_version": PROTOCOL_VERSION }))
 }
 
+/// `POST /heartbeat`：保持本设备在线（刷新 `last_seen`）。M5.2 在线状态机制。
+pub async fn heartbeat(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> AppResult<Json<serde_json::Value>> {
+    let now = auth::now_secs();
+    let client = state.pool.get().await?;
+    client
+        .execute(
+            "UPDATE devices SET last_seen=$1 WHERE id=$2 AND user_id=$3",
+            &[&now, &user.device_id, &user.user_id],
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// 邮箱 `@` 前段作为展示名。
 fn display_name_of(email: &str) -> String {
     email.split('@').next().unwrap_or("").to_string()

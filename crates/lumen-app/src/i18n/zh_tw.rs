@@ -194,6 +194,8 @@ pub static STRINGS: Strings = Strings {
     topbar_filetree_show_tip: "顯示檔案樹 (Ctrl+B)",
     topbar_filetree_hide_tip: "隱藏檔案樹 (Ctrl+B)",
     topbar_reset_layout_tip: "還原窗格預設大小",
+    topbar_tab_local: "本地",
+    topbar_tab_remote: "遠端",
     topbar_reset_layout_disabled_tip: "單一窗格無需復位",
 
     // F3 熱更

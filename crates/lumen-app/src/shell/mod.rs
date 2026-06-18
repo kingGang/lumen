@@ -203,6 +203,8 @@ pub struct ShellOutput {
     pub toggle_sidebar: Option<bool>,
     /// 顶栏②切换文件树显示/隐藏（问题7，Ctrl+B 同状态源）。
     pub toggle_filetree: Option<bool>,
+    /// 本地/远程视图切换（M5.2）：main 写 settings.layout.view_mode + 存盘。
+    pub toggle_view_mode: Option<bool>,
     /// 分隔条拖动中：(分隔条, 指针位置（逻辑点）)。main 据此把对应
     /// 边界拖到指针处（绝对定位无累积漂移；最小尺寸钳制在 layout）。
     pub divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
@@ -340,6 +342,7 @@ pub fn show(
         layout_reset: false,
         toggle_sidebar: None,
         toggle_filetree: None,
+        toggle_view_mode: None,
         divider_drag: None,
         divider_drag_ended: false,
         divider_reset: None,
@@ -435,6 +438,7 @@ pub fn show(
             sidebar_visible: app_settings.layout.sidebar_visible,
             filetree_visible: st.filetree.visible,
             update_version: input.update_version.clone(),
+            current_view: app_settings.layout.view_mode,
         },
     );
     if tb.new_pane {
@@ -467,6 +471,10 @@ pub fn show(
         // 文件树 toggle：同步 filetree state（与 Ctrl+B 共享同一 visible 状态源）
         st.filetree.visible = v;
         out.toggle_filetree = Some(v);
+    }
+    // M5.2：本地/远程 tab 切换 → 转发给 main（写 settings.layout.view_mode + 存盘）。
+    if let Some(v) = tb.toggle_view_mode {
+        out.toggle_view_mode = Some(v);
     }
     if tb.open_settings {
         out.settings_opened = true;

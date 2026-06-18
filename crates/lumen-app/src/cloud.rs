@@ -155,6 +155,12 @@ impl CloudClient {
         Self::decode(&txt)
     }
 
+    /// 设备心跳（保持本设备在线，刷新服务端 `last_seen`）。
+    pub fn heartbeat(&self, token: &str) -> Result<(), CloudError> {
+        self.send("POST", routes::HEARTBEAT, Some(token), None)?;
+        Ok(())
+    }
+
     /// 重命名设备。
     pub fn rename_device(&self, token: &str, id: &str, name: &str) -> Result<(), CloudError> {
         let body = Self::encode(&RenameDeviceRequest {

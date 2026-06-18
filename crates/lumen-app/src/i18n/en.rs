@@ -190,6 +190,8 @@ pub static STRINGS: Strings = Strings {
     topbar_filetree_show_tip: "Show file tree (Ctrl+B)",
     topbar_filetree_hide_tip: "Hide file tree (Ctrl+B)",
     topbar_reset_layout_tip: "Reset pane sizes",
+    topbar_tab_local: "Local",
+    topbar_tab_remote: "Remote",
     topbar_reset_layout_disabled_tip: "Only one pane, nothing to reset",
 
     // F3 auto-update

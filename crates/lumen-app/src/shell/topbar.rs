@@ -102,6 +102,9 @@ pub struct TopbarOutput {
     pub toggle_sidebar: Option<bool>,
     /// 切换文件树显示/隐藏（点击②按钮，与 Ctrl+B 同状态源）。None = 未点击，Some(v) = 新可见值。
     pub toggle_filetree: Option<bool>,
+    /// 切换本地/远程视图（点击顶栏「本地/远程」tab，M5.2）。
+    /// None = 未点击，Some(false) = 本地，Some(true) = 远程。
+    pub toggle_view_mode: Option<bool>,
 }
 
 /// 顶栏额外状态（打包传入 [`show`]，避免参数列表超过 clippy 7 参数限制）。
@@ -113,6 +116,8 @@ pub struct ViewState {
     /// 头像菜单更新项：Some(版本号) = 有就绪更新（显示「更新到 vX」强调项），
     /// None = 无更新（显示「检查更新」）。
     pub update_version: Option<String>,
+    /// 当前视图（M5.2）：false = 本地，true = 远程。
+    pub current_view: bool,
 }
 
 /// 绘制顶栏（全宽窄条；须先于侧栏加入面板布局才能横贯整窗）。
@@ -392,6 +397,18 @@ pub fn show(
                         out.reset_layout = true;
                     }
                 }
+
+                // ── 本地/远程 tab（M5.2）：与三视图图标拉开间距 ──
+                left_ui.add_space(VIEW_BTN_GAP * 3.0);
+                if draw_view_tab(&mut left_ui, s.topbar_tab_local, !view.current_view, pal).clicked()
+                {
+                    out.toggle_view_mode = Some(false);
+                }
+                left_ui.add_space(VIEW_BTN_GAP);
+                if draw_view_tab(&mut left_ui, s.topbar_tab_remote, view.current_view, pal).clicked()
+                {
+                    out.toggle_view_mode = Some(true);
+                }
             });
         });
     out
@@ -527,6 +544,33 @@ fn draw_icon_grid(ui: &egui::Ui, rect: egui::Rect, enabled: bool, pal: &Palette)
         ],
         stroke,
     );
+}
+
+/// 本地/远程 tab 按钮（M5.2）：文字 pill。active = accent 字 + bg_highlight 底；
+/// hover = fg 字 + 半透底；常态 = fg_dim 字。返回点击 Response。
+fn draw_view_tab(ui: &mut egui::Ui, text: &str, active: bool, pal: &Palette) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, VIEW_BTN_H), egui::Sense::click());
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, 4.0, pal.bg_highlight);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, pal.bg_highlight.gamma_multiply(0.5));
+    }
+    let color = if active {
+        pal.accent
+    } else if resp.hovered() {
+        pal.fg
+    } else {
+        pal.fg_dim
+    };
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(12.5),
+        color,
+    );
+    resp
 }
 
 /// 圆形头像按钮：已登录 = 强调色圆底 + 首字母；未登录 = 占位人形。

@@ -341,6 +341,10 @@ pub struct Strings {
     pub topbar_filetree_hide_tip: &'static str,
     /// 还原窗格大小 tooltip（启用态，对应原「▦」功能）
     pub topbar_reset_layout_tip: &'static str,
+    /// 顶栏「本地」tab（M5.2）
+    pub topbar_tab_local: &'static str,
+    /// 顶栏「远程」tab（M5.2）
+    pub topbar_tab_remote: &'static str,
     /// 还原窗格大小禁用 tooltip（单窗格时）
     pub topbar_reset_layout_disabled_tip: &'static str,
 

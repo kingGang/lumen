@@ -76,6 +76,7 @@ fn build_router(state: AppState) -> Router {
             r::SYNC_HISTORY,
             get(handlers::pull_history).post(handlers::push_history),
         )
+        .route(r::HEARTBEAT, post(handlers::heartbeat))
         .with_state(state)
         // 全局请求体上限 1 MiB，防超大 payload（DoS 面收口）。
         .layer(DefaultBodyLimit::max(1_048_576))

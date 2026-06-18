@@ -31,6 +31,8 @@ pub mod routes {
     pub const SYNC_SETTINGS: &str = "/api/v1/sync/settings";
     /// 命令历史同步：`GET ?since=<ts_ms>` 拉取 / `POST` 推送。
     pub const SYNC_HISTORY: &str = "/api/v1/sync/history";
+    /// 设备心跳 `POST`（保持本设备在线，刷新 `last_seen`；M5.2）。
+    pub const HEARTBEAT: &str = "/api/v1/heartbeat";
 
     /// 单设备路径（重命名 `PATCH` / 删除 `DELETE`）。
     #[must_use]
