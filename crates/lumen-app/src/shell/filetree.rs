@@ -1837,8 +1837,10 @@ pub fn show_remote(
     visible: bool,
     pal: &theme::Palette,
     width: f32,
-    // part3c-2 #7：是否显示远程目录右键「粘贴到此目录」（= 本地侧剪贴板有项，上传目标，片5）。
+    // part3c-2 #7：是否显示远程目录右键「粘贴到此目录」（= 本地侧剪贴板有项，上传目标）。
     can_paste: bool,
+    // part3c-2 #5a：是否正在控制某设备——未控制时占位文案显示「未连接设备」而非「等待 cwd」。
+    controlling: bool,
 ) -> RemoteFileTreeOutput {
     let mut out = RemoteFileTreeOutput::default();
     if visible {
@@ -1852,11 +1854,22 @@ pub fn show_remote(
                     .fill(pal.filetree_fill)
                     .inner_margin(egui::Margin::symmetric(6, 8)),
             )
-            .show_inside(root_ui, |ui| remote_panel_ui(ui, ft, pal, can_paste, &mut out));
+            .show_inside(root_ui, |ui| {
+                remote_panel_ui(ui, ft, pal, can_paste, controlling, &mut out);
+            });
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
     }
     out
+}
+
+/// 远程树右键菜单动作（经 `RefCell` 收口，循环结束后写入 `out`——与本地树 `MenuAction`
+/// 同款范式，避免在嵌套闭包里直接借 `&mut out` 导致菜单不触发）。
+enum RemoteMenuAction {
+    /// 复制远程项（下载源）：(path, name, is_dir)。
+    Copy(String, String, bool),
+    /// 粘贴到此远程目录（上传目标）：dir path。
+    Paste(String),
 }
 
 /// 远程树面板内容：根名工具条 + 「显示隐藏项」勾选 + 可见行（按 depth 缩进，三角由
@@ -1866,15 +1879,22 @@ fn remote_panel_ui(
     ft: Option<&crate::remote_ws::RemoteFileTree>,
     pal: &theme::Palette,
     can_paste: bool,
+    controlling: bool,
     out: &mut RemoteFileTreeOutput,
 ) {
     use crate::remote_ws::RemoteRowKind;
     let s = crate::i18n::strings();
     let root_label = ft.and_then(crate::remote_ws::RemoteFileTree::root_label);
-    // 工具条：树根名（basename，悬停看全路径）+ 「显示隐藏项」勾选。空 = 等待 cwd。
+    // 占位文案：未控制设备 → 「未连接设备」（#5a）；控制中但 cwd 未到 → 「等待 shell 上报路径」。
+    let placeholder = if controlling {
+        s.filetree_waiting_cwd
+    } else {
+        s.remote_not_connected
+    };
+    // 工具条：树根名（basename，悬停看全路径）+ 「显示隐藏项」勾选。
     ui.horizontal(|ui| {
         let label = root_label.map_or_else(
-            || s.filetree_waiting_cwd.to_string(),
+            || placeholder.to_string(),
             |r| {
                 r.rsplit(['/', '\\'])
                     .find(|seg| !seg.is_empty())
@@ -1885,14 +1905,10 @@ fn remote_panel_ui(
         ui.add(egui::Label::new(egui::RichText::new(label).strong().color(pal.fg)).truncate())
             .on_hover_text(root_label.unwrap_or(""));
     });
-    // cwd 未到：占位，不画树（绝不回落本机树）。
+    // 树未到：占位，不画树（绝不回落本机树）。
     let Some(ft) = ft.filter(|f| f.root_label().is_some()) else {
         ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(s.filetree_waiting_cwd)
-                .size(11.0)
-                .color(pal.fg_dim),
-        );
+        ui.label(egui::RichText::new(placeholder).size(11.0).color(pal.fg_dim));
         return;
     };
     // 「显示隐藏项」勾选（变化经 out.toggle_hidden 回传 main）。
@@ -1904,21 +1920,26 @@ fn remote_panel_ui(
         out.toggle_hidden = Some(show_hidden);
     }
     ui.add_space(2.0);
+    // 右键菜单经 RefCell 收口，循环后写入 out——与本地树 MenuAction 同款；直接在 context_menu
+    // 闭包里借 &mut out 会导致菜单不触发（复制/粘贴失效）。
+    let menu: RefCell<Option<RemoteMenuAction>> = RefCell::new(None);
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // 每行 push_id(i) 给唯一 id：否则各行 selectable_label 的右键菜单 id 冲突，
+            // 三角紧贴名字：缩小行内控件间距（#1：默认 8px 间距让三角离名字太远，与本地树不一致）。
+            ui.spacing_mut().item_spacing.x = 3.0;
+            // 每行 push_id(row.id, i) 给唯一稳定 id：否则各行 selectable_label 的右键菜单 id 冲突，
             // 右键任一行都弹**第一行**的菜单（修 #4：复制永远复制第一个）。
             for (i, row) in ft.visible_rows().into_iter().enumerate() {
-                ui.push_id(i, |ui| {
+                ui.push_id((row.id, i), |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_space(row.depth as f32 * 14.0);
+                        ui.add_space(row.depth as f32 * 12.0);
                         match row.kind {
                             RemoteRowKind::Dir { open } => {
                                 // 三角用 painter 画——`▾`/`▸` 字形在 UI 字体里缺失会渲染成
                                 // tofu 方块（修 #1）。点三角或名字都翻转展开。
                                 let (tri_rect, tri_resp) = ui
-                                    .allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::click());
+                                    .allocate_exact_size(egui::vec2(11.0, 16.0), egui::Sense::click());
                                 paint_tri(ui.painter(), tri_rect, open, pal.fg_dim);
                                 let resp = ui
                                     .selectable_label(
@@ -1942,12 +1963,16 @@ fn remote_panel_ui(
                                 resp.context_menu(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.remote_menu_copy).clicked() {
-                                        out.copy_files =
-                                            Some((row.path.clone(), row.name.clone(), true));
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::Copy(
+                                            row.path.clone(),
+                                            row.name.clone(),
+                                            true,
+                                        ));
                                         ui.close();
                                     }
                                     if can_paste && ui.button(s.remote_menu_paste).clicked() {
-                                        out.paste_into = Some(row.path.clone());
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::Paste(row.path.clone()));
                                         ui.close();
                                     }
                                 });
@@ -1964,8 +1989,11 @@ fn remote_panel_ui(
                                 resp.context_menu(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.remote_menu_copy).clicked() {
-                                        out.copy_files =
-                                            Some((row.path.clone(), row.name.clone(), false));
+                                        *menu.borrow_mut() = Some(RemoteMenuAction::Copy(
+                                            row.path.clone(),
+                                            row.name.clone(),
+                                            false,
+                                        ));
                                         ui.close();
                                     }
                                 });
@@ -1991,6 +2019,14 @@ fn remote_panel_ui(
                 });
             }
         });
+    // 循环结束后写入 out（避免 context_menu 闭包里嵌套借 &mut out）。
+    match menu.into_inner() {
+        Some(RemoteMenuAction::Copy(path, name, is_dir)) => {
+            out.copy_files = Some((path, name, is_dir));
+        }
+        Some(RemoteMenuAction::Paste(dir)) => out.paste_into = Some(dir),
+        None => {}
+    }
 }
 
 /// 远程树目录三角（painter 画，避免 `▾`/`▸` 字形缺失渲染成 tofu）：`open`=朝下、否则朝右。

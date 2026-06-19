@@ -119,6 +119,7 @@ pub static STRINGS: Strings = Strings {
     filetree_loading: "載入中…",
     remote_show_hidden: "顯示隱藏項",
     remote_refresh_dir_tip: "重新整理此目錄",
+    remote_not_connected: "未連接裝置（在「遠端」清單選一台並連接）",
     remote_fetch_started: "正在從被控端取得檔案…",
     remote_fetch_failed: "取得檔案失敗",
     remote_fetch_too_large: "檔案過大，無法取得",

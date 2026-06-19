@@ -230,6 +230,8 @@ pub struct Strings {
     pub remote_show_hidden: &'static str,
     /// part3c-2 远程树目录行悬停刷新图标 tooltip
     pub remote_refresh_dir_tip: &'static str,
+    /// part3c-2 远程视图未控制任何设备时的占位（远程 tab 未连接）
+    pub remote_not_connected: &'static str,
     /// part3c-2 #5：开始从被控端获取文件 toast
     pub remote_fetch_started: &'static str,
     /// part3c-2 #5：获取文件失败 toast

@@ -758,6 +758,10 @@ pub fn show(
         // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏 / 复制粘贴）收集到
         // rout，由 main 闭包后以 &mut state.remote_ws 施加。远程树可粘贴 = 本地侧剪贴板有项（上传）。
         let can_paste = input.file_clipboard_side == Some(ClipSide::Local);
+        // 是否正在控制设备（占位文案区分「未连接设备」/「等待 cwd」）。
+        let controlling = input.remote_session.is_some_and(|sess| {
+            matches!(sess.role, lumen_protocol::remote::Role::Controller)
+        });
         let rout = filetree::show_remote(
             root,
             input.remote_filetree,
@@ -765,6 +769,7 @@ pub fn show(
             pal,
             app_settings.layout.filetree_width,
             can_paste,
+            controlling,
         );
         out.filetree_width = rout.panel_width;
         out.remote_dir_clicks = rout.dir_clicks;
