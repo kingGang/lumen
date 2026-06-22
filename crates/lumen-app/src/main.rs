@@ -8,6 +8,9 @@ mod background;
 // 同步等方法在 M5.2+ 才接线，故暂允许 dead_code（脚手架，非真死代码）。
 #[allow(dead_code)]
 mod cloud;
+// 系统文件剪贴板（CF_HDROP）：文件树复制/粘贴与资源管理器互通。
+mod clipboard_files;
+mod virtual_files;
 // M5.2 远程设备状态（心跳 + 设备列表后台线程）。
 mod remote;
 mod remote_mirror;
@@ -617,6 +620,21 @@ struct AppState {
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
     /// M5.3 part3c-2 #7：粘贴检测到同名、等用户在覆盖模态拍板的待决下载（None = 无待决）。
     pending_paste: Option<PendingPaste>,
+    /// 粘贴完成后待刷新的目标目录 `(is_remote, dir)`：粘贴写文件到目录后，文件树缓存未更新、新
+    /// 文件不显示，故传输完成（本机复制 / 下载 / 上传）时刷新该目录。do_file_paste 设、完成点消费。
+    paste_refresh: Option<(bool, String)>,
+    /// 上一帧鼠标是否在文件树面板内（shell::show 报回）：winit 层 Ctrl+C/V 快捷键的门控
+    /// （egui 吞掉 Ctrl+V 必须在 winit 拦，但 winit 无 egui 的 contains_pointer，故用上一帧的）。
+    filetree_hovered: bool,
+    /// 本机复制粘贴（local→local，海风哥本轮新增）在途的完成回包通道（done, skipped, errors）。
+    /// `Some` = 有一次本机复制在后台 fs 递归中；后台线程复制完经此回主线程弹 toast（并 send
+    /// PtyWake 唤醒主循环收包，防空闲不重绘收不到）。同时充当并发闸：在途时拒绝起新本机复制。
+    local_copy_rx: Option<std::sync::mpsc::Receiver<(usize, usize, usize)>>,
+    /// 片6 虚拟文件剪贴板：OLE 线程 → 主线程「把远程文件下到临时文件」请求通道（user_event
+    /// 排空 → `start_clip_fetch`）。资源管理器粘贴远程虚拟文件时由 OLE 线程投递。
+    clip_fetch_rx: Option<std::sync::mpsc::Receiver<remote_ws::ClipFetchCmd>>,
+    /// 片6 虚拟文件剪贴板服务句柄（专用 STA OLE 线程）。`None` = 未启动 / 启动失败。
+    clipboard_svc: Option<virtual_files::ClipboardService>,
     /// M5.3 part3b 控制端镜像离屏纹理的 egui 句柄（`MIRROR_OFFSCREEN_ID`，首次控制时
     /// 注册、后续复用）。控制中每帧把镜像 Terminal 渲染进它，shell 以 Image 铺满终端区。
     mirror_texture: Option<egui::TextureId>,
@@ -1035,10 +1053,21 @@ impl AppState {
             for (req_id, path, show_hidden) in self.remote_ws.take_listdir_reqs() {
                 self.remote_ws.spawn_list_dir(req_id, path, show_hidden);
             }
+            for (req_id, path, show_hidden) in self.remote_ws.take_listdir_recursive_reqs() {
+                self.remote_ws
+                    .spawn_list_dir_recursive(req_id, path, show_hidden);
+            }
             self.remote_ws.drain_service();
         } else {
             self.mirror_src = None;
             self.mirror_bounds_sent = None;
+        }
+        // 片8 控制端：递归枚举好的远程子树 → 构造系统剪贴板虚拟文件目录（资源管理器可粘贴整棵树）。
+        if let Some(entries) = self.remote_ws.take_clip_dir_ready() {
+            log::debug!("[片8] 控制端构造虚拟文件目录: {} 项", entries.len());
+            if let Some(svc) = self.clipboard_svc.as_ref() {
+                svc.set_remote_dir(entries);
+            }
         }
         // 被控端视口跟随（SSH 式）：应用控制端请求的视口尺寸，覆盖自身窗口尺寸；
         // 非被控时清除以恢复窗口尺寸（resize 循环据 remote_viewport 决定焦点窗格尺寸）。
@@ -2983,17 +3012,424 @@ impl AppState {
         snap.save();
         self.last_sessions_snapshot = Some(snap);
     }
+
+    /// 粘贴编排（右键「粘贴到此目录」与 Ctrl+V 共用）：按目标侧定方向——
+    /// - 本地目录：Lumen 内部有远程项 → 下载；否则系统剪贴板文件 → 本机复制。
+    /// - 远程目录（上传）：系统剪贴板本地文件 → 上传到被控端。
+    fn do_file_paste(&mut self, target_side: remote_ws::ClipSide, dir: String) {
+        let remote_items = self
+            .remote_ws
+            .file_clipboard()
+            .filter(|c| matches!(c.side, remote_ws::ClipSide::Remote))
+            .map(|c| c.items.clone());
+        log::info!(
+            "[文件剪贴板] 粘贴请求: target={target_side:?} dir={dir} 远程剪贴板项={} 系统剪贴板有文件={}",
+            remote_items.as_ref().map_or(0, Vec::len),
+            clipboard_files::has_files(),
+        );
+        // 记下目标目录：传输完成后刷新它，让粘贴进来的文件立即显示（本地树 / 远程树缓存不会自更新）。
+        self.paste_refresh = Some((
+            matches!(target_side, remote_ws::ClipSide::Remote),
+            dir.clone(),
+        ));
+        match target_side {
+            remote_ws::ClipSide::Local => {
+                if let Some(items) = remote_items {
+                    // 下载：远程剪贴板 → 本地目录（撞名弹覆盖模态）。
+                    let dest_root = std::path::Path::new(&dir);
+                    let conflicts = items
+                        .iter()
+                        .filter(|it| dest_root.join(&it.name).exists())
+                        .count();
+                    if conflicts > 0 {
+                        self.pending_paste = Some(PendingPaste {
+                            items,
+                            dest_dir: dir,
+                            conflict_count: conflicts,
+                            local: false,
+                        });
+                    } else {
+                        self.remote_ws.start_download(items, dir, true);
+                    }
+                } else {
+                    // 本机复制：系统剪贴板文件 → 本地目录。
+                    let paths = clipboard_files::paste_files();
+                    if paths.is_empty() {
+                        log::info!("[本机复制] 系统剪贴板无文件，忽略粘贴");
+                    } else {
+                        let items = paths_to_clipitems(&paths);
+                        self.paste_local_files(items, dir);
+                    }
+                }
+            }
+            remote_ws::ClipSide::Remote => {
+                // 上传：系统剪贴板本地文件 → 被控端目录（递归编排，撞名由被控端 Probe 决议）。
+                let paths = clipboard_files::paste_files();
+                if paths.is_empty() {
+                    log::info!("[上传] 系统剪贴板无文件，忽略粘贴");
+                } else {
+                    let items = paths_to_clipitems(&paths);
+                    self.remote_ws.start_upload(items, dir);
+                }
+            }
+        }
+    }
+
+    /// 粘贴传输完成后刷新目标目录（消费 `paste_refresh`）：本地 → 刷新本地树该目录；远程 → 刷新
+    /// 远程树该目录。作废其缓存重拉，使刚粘贴进来的文件立即显示。
+    fn apply_paste_refresh(&mut self) {
+        if let Some((is_remote, dir)) = self.paste_refresh.take() {
+            if is_remote {
+                self.remote_ws.refresh_remote_path(&dir);
+            } else {
+                self.shell_state
+                    .filetree
+                    .refresh_dir(std::path::Path::new(&dir));
+            }
+            self.window.request_redraw();
+        }
+    }
+
+    /// Ctrl+C 触发的文件树复制（winit 层拦截，与 Ctrl+V 统一门控）。远程视图 → 复制选中远程项到
+    /// Lumen 内部剪贴板（下载源）；本地视图 → 复制选中本地项到系统剪贴板（CF_HDROP，与资源管理器
+    /// 互通）。无选中则忽略。
+    fn filetree_ctrl_c(&mut self) {
+        if self.settings.layout.view_mode {
+            // 远程视图：复制选中的被控端项 → Lumen 内部剪贴板（远程路径进不了系统剪贴板，仅供下载）。
+            if let Some((path, name, is_dir, size)) = self
+                .remote_ws
+                .remote_filetree()
+                .and_then(crate::remote_ws::RemoteFileTree::selected_item)
+            {
+                // 片6/8：单文件 → 即时系统剪贴板虚拟文件；目录 → 先 clear 关竞态、起递归枚举，
+                // 枚举完成（ClipDirReady）才 set 多文件 descriptor。
+                if let Some(svc) = self.clipboard_svc.as_ref() {
+                    svc.clear();
+                }
+                if is_dir {
+                    self.remote_ws.start_clip_dir(path.clone(), name.clone());
+                } else {
+                    self.remote_ws.cancel_clip_dir(); // 作废可能在途的目录枚举（M1）
+                    if let Some(svc) = self.clipboard_svc.as_ref() {
+                        svc.set_remote_file(path.clone(), name.clone(), size);
+                    }
+                }
+                self.remote_ws.set_file_clipboard(
+                    remote_ws::ClipSide::Remote,
+                    vec![remote_ws::ClipItem { path, name, is_dir }],
+                );
+                let msg = if is_dir {
+                    i18n::strings().remote_clip_dir_preparing.to_string()
+                } else {
+                    i18n::fmt1(i18n::strings().remote_copied_fmt, 1)
+                };
+                self.shell_state
+                    .toast
+                    .push(shell::toast::ToastKind::Info, msg);
+            }
+        } else if let Some((path, _is_dir)) = self.shell_state.filetree.selected_item() {
+            // 本地视图：复制选中项 → 系统剪贴板（CF_HDROP），清 Lumen 内部远程剪贴板。
+            let ok = clipboard_files::copy_files(&[path]);
+            self.remote_ws.clear_file_clipboard();
+            self.remote_ws.cancel_clip_dir(); // 作废可能在途的远程目录枚举（M1）
+            // 片6：清掉系统剪贴板可能残留的我方远程虚拟文件（本地复制改走 CF_HDROP）。
+            if let Some(svc) = self.clipboard_svc.as_ref() {
+                svc.clear();
+            }
+            self.shell_state.toast.push(
+                if ok {
+                    shell::toast::ToastKind::Info
+                } else {
+                    shell::toast::ToastKind::Error
+                },
+                if ok {
+                    i18n::fmt1(i18n::strings().remote_copied_fmt, 1)
+                } else {
+                    i18n::strings().local_copy_clipboard_failed.to_string()
+                },
+            );
+        }
+    }
+
+    /// Ctrl+V 触发的文件树粘贴（winit 层拦截，因 egui 把 Ctrl+V 吞成 Paste/consume V，文件剪贴板
+    /// 无文本时连信号都没）。按当前视图定目标目录：远程视图 → 选中目录 / 树根（上传）；本地视图 →
+    /// 选中目录 / 树根（下载或本机复制）。无目标目录则忽略。
+    fn filetree_ctrl_v(&mut self) {
+        if self.settings.layout.view_mode {
+            // 远程视图：上传到选中的远程目录（或树根）。
+            let dir = self.remote_ws.remote_filetree().and_then(|ft| {
+                ft.selected_dir()
+                    .or_else(|| ft.root_label().map(str::to_owned))
+            });
+            if let Some(dir) = dir {
+                self.do_file_paste(remote_ws::ClipSide::Remote, dir);
+            }
+        } else if let Some(dir) = self.shell_state.filetree.paste_target_dir() {
+            // 本地视图：下载 / 本机复制到选中目录（或树根）。
+            self.do_file_paste(remote_ws::ClipSide::Local, dir.display().to_string());
+        }
+    }
+
+    /// 本机复制粘贴落地（系统剪贴板文件 → 本地目录）：同目录粘贴自动副本 → 撞名探测 → 撞名弹
+    /// 覆盖模态 / 否则直接 [`Self::start_local_copy`]。粘贴到本地目录且无远程剪贴板项时调用。
+    fn paste_local_files(&mut self, items: Vec<remote_ws::ClipItem>, dir: String) {
+        if self.local_copy_rx.is_some() {
+            log::info!("[本机复制] 已有复制在途，忽略本次粘贴");
+            self.shell_state.toast.push(
+                shell::toast::ToastKind::Warn,
+                i18n::strings().local_copy_busy.to_string(),
+            );
+            return;
+        }
+        let dest_root = std::path::Path::new(&dir);
+        // 同目录粘贴（源父目录 == 目标目录）→ 自动副本名，避免落地名 = 源自身被撞名跳过
+        // （文件管理器标准：粘贴到原地产生「X (1)」）。
+        let items: Vec<remote_ws::ClipItem> = items
+            .into_iter()
+            .map(|mut it| {
+                if std::path::Path::new(&it.path).parent() == Some(dest_root) {
+                    let nn = unique_copy_name(dest_root, &it.name, it.is_dir);
+                    log::info!("[本机复制] 同目录粘贴 → 副本名 {} ⇒ {nn}", it.name);
+                    it.name = nn;
+                }
+                it
+            })
+            .collect();
+        let conflicts = items
+            .iter()
+            .filter(|it| dest_root.join(&it.name).exists())
+            .count();
+        log::info!(
+            "[本机复制] 撞名数={conflicts} 待落地=[{}]",
+            items
+                .iter()
+                .map(|i| dest_root.join(&i.name).display().to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        if conflicts > 0 {
+            self.pending_paste = Some(PendingPaste {
+                items,
+                dest_dir: dir,
+                conflict_count: conflicts,
+                local: true,
+            });
+        } else {
+            self.start_local_copy(items, dir, true);
+        }
+    }
+
+    /// 本机复制粘贴（local→local，海风哥本轮新增）：后台线程把剪贴板里的本地项递归 fs 复制到
+    /// `dest_dir`，完成回主线程弹 toast。`overwrite`：撞名覆盖（否则跳过已存在），由覆盖模态
+    /// 一次性决定、套用整次递归。盘 IO 绝不在 UI 线程做（大目录 / 网络盘会冻结）；完成经 mpsc
+    /// 回包 + PtyWake 唤醒主循环（[`Self::local_copy_rx`] drain 处弹 toast）。已有本机复制在途
+    /// 则忽略（`local_copy_rx` 充当并发闸，防回包错配）。
+    fn start_local_copy(
+        &mut self,
+        items: Vec<remote_ws::ClipItem>,
+        dest_dir: String,
+        overwrite: bool,
+    ) {
+        if items.is_empty() || self.local_copy_rx.is_some() {
+            log::info!(
+                "[本机复制] 跳过: empty={} busy={}",
+                items.is_empty(),
+                self.local_copy_rx.is_some()
+            );
+            return;
+        }
+        log::info!(
+            "[本机复制] 开始: {} 项 → {dest_dir}（overwrite={overwrite}）",
+            items.len()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.local_copy_rx = Some(rx);
+        self.shell_state.toast.push(
+            shell::toast::ToastKind::Info,
+            i18n::strings().local_copy_started.to_string(),
+        );
+        let proxy = self.proxy.clone();
+        let wake = self.wake_pending.clone();
+        std::thread::spawn(move || {
+            // catch_unwind 保证：即便 local_copy_item 意外 panic（如 OOM），也必发回包解开
+            // local_copy_rx 并发闸——否则 rx 永停在 Some、整个会话内再不能发起本机复制。
+            let stats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut stats = CopyStats::default();
+                let dest_root = std::path::PathBuf::from(&dest_dir);
+                for item in &items {
+                    local_copy_item(
+                        &dest_root.join(&item.name),
+                        std::path::Path::new(&item.path),
+                        item.is_dir,
+                        overwrite,
+                        0,
+                        &mut stats,
+                    );
+                }
+                stats
+            }))
+            .unwrap_or_else(|_| {
+                log::error!("本机复制后台线程 panic，回错误计数以解开并发闸");
+                CopyStats {
+                    done: 0,
+                    skipped: 0,
+                    errors: 1,
+                }
+            });
+            let _ = tx.send((stats.done, stats.skipped, stats.errors));
+            // 唤醒主循环收包弹 toast（与 PTY 转发同一套 wake 去重，避免空闲不重绘收不到）。
+            if !wake.swap(true, Ordering::AcqRel) {
+                let _ = proxy.send_event(PtyWake);
+            }
+        });
+    }
 }
 
 /// 远程控制一次性通知 → toast（分级 + 本地化文案，按机器可读原因细分）。M5.3 part2b。
 /// part3c-2 #7：粘贴检测到同名后、等覆盖模态拍板的待决下载。
 struct PendingPaste {
-    /// 要下载的远程项（剪贴板快照）。
+    /// 要落地的项（剪贴板快照；下载=远程项 / 本机复制=本地项）。
     items: Vec<remote_ws::ClipItem>,
     /// 本地落地目录。
     dest_dir: String,
     /// 冲突项数（驱动模态文案）。
     conflict_count: usize,
+    /// 本轮粘贴方向：`true` = 本机复制（local→local，fs 递归）；`false` = 下载（远程→本地，
+    /// WS Fetch）。覆盖模态拍板后据此路由 `start_local_copy` / `start_download`。
+    local: bool,
+}
+
+/// 把系统剪贴板取出的本地路径转成 `ClipItem`（统一交给本机复制 / 上传编排）。`is_dir` 现读盘
+/// （系统剪贴板只给路径），失败按文件处理。
+fn paths_to_clipitems(paths: &[std::path::PathBuf]) -> Vec<remote_ws::ClipItem> {
+    paths
+        .iter()
+        .map(|p| {
+            let name = p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            remote_ws::ClipItem {
+                path: p.display().to_string(),
+                name,
+                is_dir: p.is_dir(),
+            }
+        })
+        .collect()
+}
+
+/// 在 `dir` 下为 `name` 找一个不冲突的副本名（文件管理器式「X (1)」「X (2)」…）。同目录粘贴
+/// （粘贴到源文件自己的目录）时用——此时落地名若不变就会撞到源自身，故自动改名产生副本。
+fn unique_copy_name(dir: &std::path::Path, name: &str, is_dir: bool) -> String {
+    if !dir.join(name).exists() {
+        return name.to_string();
+    }
+    // 文件保留扩展名（`a.txt` → `a (1).txt`）；目录或无扩展名整体加后缀。
+    let (stem, ext) = if is_dir {
+        (name.to_string(), String::new())
+    } else {
+        match name.rfind('.') {
+            Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+            _ => (name.to_string(), String::new()),
+        }
+    };
+    for n in 1..10_000 {
+        let candidate = format!("{stem} ({n}){ext}");
+        if !dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    name.to_string() // 兜底：上万个同名副本，几乎不可能。
+}
+
+/// 本机复制粘贴（local→local）的统计计数：完成 / 跳过（撞名或复制到原地）/ 出错文件数。
+#[derive(Default)]
+struct CopyStats {
+    done: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+/// 本机递归复制一项（[`AppState::start_local_copy`] 后台线程的工作函数，纯 std::fs）：
+///
+/// - 文件：撞名按 `overwrite` 覆盖 / 跳过，`fs::copy` 落地（源与目标同一文件则跳过，防 truncate 毁源）。
+/// - 目录：建目标目录后递归子项。
+///
+/// 防御：深度上限 64（防 symlink / junction 成环）；拒绝把目录复制进自身子树（否则无限递归）。
+/// 统计累计进 `stats`，回主线程汇总 toast。
+fn local_copy_item(
+    dest: &std::path::Path,
+    src: &std::path::Path,
+    is_dir: bool,
+    overwrite: bool,
+    depth: usize,
+    stats: &mut CopyStats,
+) {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        stats.errors += 1;
+        return;
+    }
+    if is_dir {
+        // 防御：目标落在源子树内（复制目录到自身 / 子目录）→ 无限递归，拒绝。dest 首次未必存在，
+        // 故用「dest 父目录 canonical + 末段」与「src canonical」比较，不依赖 dest 自身可解析。
+        if let Ok(src_canon) = src.canonicalize() {
+            let dest_canon = dest
+                .parent()
+                .and_then(|p| p.canonicalize().ok())
+                .and_then(|p| dest.file_name().map(|n| p.join(n)));
+            if dest_canon.is_some_and(|d| d == src_canon || d.starts_with(&src_canon)) {
+                log::warn!(
+                    "本机复制：目标在源子树内，拒绝（防无限递归）: {}",
+                    dest.display()
+                );
+                stats.errors += 1;
+                return;
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(dest) {
+            log::warn!("本机复制建目录失败 {}: {e}", dest.display());
+            stats.errors += 1;
+            return;
+        }
+        let rd = match std::fs::read_dir(src) {
+            Ok(rd) => rd,
+            Err(e) => {
+                log::warn!("本机复制读源目录失败 {}: {e}", src.display());
+                stats.errors += 1;
+                return;
+            }
+        };
+        for entry in rd.flatten() {
+            let child_src = entry.path();
+            let child_dest = dest.join(entry.file_name());
+            let child_is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            local_copy_item(&child_dest, &child_src, child_is_dir, overwrite, depth + 1, stats);
+        }
+    } else {
+        if !overwrite && dest.exists() {
+            stats.skipped += 1;
+            return;
+        }
+        // 防御：源与目标解析为同一文件 → fs::copy 会先 truncate 毁掉源，跳过（复制到原地无意义）。
+        if let (Ok(s), Ok(d)) = (src.canonicalize(), dest.canonicalize()) {
+            if s == d {
+                stats.skipped += 1;
+                return;
+            }
+        }
+        match std::fs::copy(src, dest) {
+            Ok(_) => stats.done += 1,
+            Err(e) => {
+                log::warn!(
+                    "本机复制文件失败 {} → {}: {e}",
+                    src.display(),
+                    dest.display()
+                );
+                stats.errors += 1;
+            }
+        }
+    }
 }
 
 fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, String) {
@@ -3080,6 +3516,20 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
                 i18n::fmt3(s.remote_upload_done_fmt, done, skipped, errors),
             )
         }
+        Notice::ClipDirReady { count, truncated } => {
+            if *truncated {
+                (
+                    ToastKind::Warn,
+                    i18n::fmt1(s.remote_clip_dir_truncated_fmt, *count),
+                )
+            } else {
+                (
+                    ToastKind::Info,
+                    i18n::fmt1(s.remote_clip_dir_ready_fmt, *count),
+                )
+            }
+        }
+        Notice::ClipDirFailed => (ToastKind::Warn, s.remote_clip_dir_failed.to_string()),
     }
 }
 
@@ -3498,6 +3948,11 @@ impl App {
             mirror_bounds_sent: None,
             mirror_rect_px: None,
             pending_paste: None,
+            local_copy_rx: None,
+            clip_fetch_rx: None,
+            clipboard_svc: None,
+            paste_refresh: None,
+            filetree_hovered: false,
             remote_viewport: None,
             mirror_viewport_sent: None,
             mirror_texture: None,
@@ -3563,6 +4018,17 @@ impl App {
         }
         // 窗口标题对齐激活会话（恢复多会话时 active 可能非 0）。
         state.update_window_title();
+
+        // 片6 虚拟文件剪贴板：启动专用 STA OLE 线程。OLE 线程经 clip_fetch_tx 请主线程把远程
+        // 文件下到临时文件（资源管理器粘贴远程虚拟文件时触发）；rx 在 user_event 排空。非 Windows
+        // 为空桩。failure（OleInitialize 失败）时服务静默无效，不影响主程序。
+        let (clip_fetch_tx, clip_fetch_rx) = std::sync::mpsc::channel();
+        state.clip_fetch_rx = Some(clip_fetch_rx);
+        state.clipboard_svc = Some(virtual_files::ClipboardService::start(
+            self.proxy.clone(),
+            state.wake_pending.clone(),
+            clip_fetch_tx,
+        ));
 
         // M3.8 批2 Snap Layouts 子类化：窗口创建后安装子类过程。
         // 失败时记 warn 日志并继续（Snap 是增强功能，不影响应用主体逻辑）。
@@ -3702,6 +4168,37 @@ impl ApplicationHandler<PtyWake> for App {
         // M5.3：先处理远程控制 WS（失焦也经此路径，bug2）——收帧 + 应用远程输入 +
         // 整屏快照转发。置于 PTY drain 之前，保证「快照先于实时增量」。
         state.pump_remote();
+
+        // 片6 虚拟文件剪贴板：OLE 线程请求把远程文件下到临时文件（资源管理器粘贴远程虚拟文件
+        // 触发）。先收齐释放 rx 借用，再逐个起 Clipboard Fetch（传完经 reply 回临时文件路径）。
+        let clip_cmds: Vec<remote_ws::ClipFetchCmd> = state
+            .clip_fetch_rx
+            .as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+        for cmd in clip_cmds {
+            state.remote_ws.start_clip_fetch(cmd.path, cmd.data_tx);
+        }
+
+        // 本机复制粘贴（local→local）完成回包 → toast。后台 fs 递归复制完会 send PtyWake 唤醒到此
+        // user_event；try_recv 非阻塞，无在途/未完成则空过。先取值再清字段，规避 rx 借用与赋值冲突。
+        if let Some((done, skipped, errors)) =
+            state.local_copy_rx.as_ref().and_then(|rx| rx.try_recv().ok())
+        {
+            state.local_copy_rx = None;
+            let kind = if errors > 0 {
+                shell::toast::ToastKind::Warn
+            } else {
+                shell::toast::ToastKind::Info
+            };
+            state.shell_state.toast.push(
+                kind,
+                i18n::fmt3(i18n::strings().local_copy_done_fmt, done, skipped, errors),
+            );
+            // 本机复制完成 → 刷新目标目录，新文件立即显示。
+            state.apply_paste_refresh();
+            state.window.request_redraw();
+        }
 
         let drain_t0 = Instant::now();
         let active_tab = state.active_tab;
@@ -4002,6 +4499,21 @@ impl ApplicationHandler<PtyWake> for App {
         // 频率，比对不同才写）。
         if got_data.iter().any(|&b| b) {
             state.persist_sessions();
+            // M5.3 part3c-2（本轮反馈 #3「cd 后远程树延迟数秒才刷新」）：被控端 cd 后秒级刷新控制端
+            // 树根。唯一的 send_root_changed 调用点在 pump_remote()（上方约 3704），它跑在
+            // term.advance()（约 3780，OSC 9;9 在此把 cwd 改成新目录）**之前**，读到的是旧 cwd → 被
+            // send_root_changed 的去重逻辑丢弃；而 cd 后被控端空闲、ControlFlow::Wait 没有「cwd 变了」
+            // 的主动唤醒，新 cwd 只能卡到下一个偶发事件（下段 PTY 输出/鼠标键盘）才被顺带推出，用户
+            // 感知为数秒延迟。此处在 drain 之后、cwd 已随本批 advance 为最新值时补推一次：
+            // send_root_changed 自带去重（remote_root_sent），只在真变化时发帧，cd 当帧即推 RootChanged。
+            if matches!(
+                state.remote_ws.session.as_ref().map(|s| s.role),
+                Some(lumen_protocol::remote::Role::Controlled)
+            ) {
+                if let Some(cwd) = state.tabs[state.active_tab].cwd_path() {
+                    state.remote_ws.send_root_changed(cwd);
+                }
+            }
         }
         if want_redraw || needs_shell_redraw {
             state.window.request_redraw();
@@ -4364,6 +4876,33 @@ impl ApplicationHandler<PtyWake> for App {
 
                 let pressed = event.state == ElementState::Pressed;
                 let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+
+                // —— 文件树 Ctrl+C / Ctrl+V（winit 层直接拦）——
+                // egui 把 Ctrl+V 吞成 Event::Paste（读剪贴板**文本**）：文件剪贴板（CF_HDROP）无文本
+                // 时既不产生 Paste、也吞掉 V 键事件，egui input 层根本检测不到；Ctrl+C 一并统一在此
+                // 处理。门控用「鼠标在文件树面板内」（上一帧 shell::show 报回，与右键菜单一致——点终端
+                // 不改 terminal_focused 故不能用它当门控），复用右键复制/粘贴编排，命中则不走下方 keymap。
+                if pressed
+                    && state.modifiers.control_key()
+                    && state.filetree_hovered
+                    && !state.shell_state.settings.open
+                    && !state.shell_state.login.open
+                {
+                    use winit::keyboard::{KeyCode, PhysicalKey};
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::KeyC) => {
+                            state.filetree_ctrl_c();
+                            state.window.request_redraw();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyV) => {
+                            state.filetree_ctrl_v();
+                            state.window.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
 
                 // 组装守卫状态（从 AppState 采样，不缓存）。
                 // M5.3 part4b：镜像态（控制中+远程视图）下 Ctrl+C 的「复制 vs 中断」裁决
@@ -6111,6 +6650,8 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.term_clicked {
                     state.terminal_focused = true;
                 }
+                // 文件树面板悬停态存到下一帧：winit 层 Ctrl+C/V 快捷键的门控（鼠标在文件树面板内）。
+                state.filetree_hovered = shell_out.filetree_hovered;
 
                 // ── footer 右键菜单动作 dispatch（第十一轮）───────────────
                 #[cfg(feature = "input-editor")]
@@ -6284,6 +6825,14 @@ impl ApplicationHandler<PtyWake> for App {
                     for n in &remote_notices {
                         let (kind, text) = remote_notice_toast(n);
                         state.shell_state.toast.push(kind, text);
+                        // 下载（→本地）/ 上传（→远程）完成 → 刷新粘贴目标目录，新文件立即显示。
+                        if matches!(
+                            n,
+                            remote_ws::Notice::DownloadDone { .. }
+                                | remote_ws::Notice::UploadDone { .. }
+                        ) {
+                            state.apply_paste_refresh();
+                        }
                     }
                     state.window.request_redraw();
                 }
@@ -6821,6 +7370,10 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote.stop();
                     // M5.3：停止远程控制 WS 引擎，清远程会话/配对态。
                     state.remote_ws.stop();
+                    // 片6：登出后被控端不可达，清掉系统剪贴板里指向它的虚拟文件，免得粘贴空等失败。
+                    if let Some(svc) = state.clipboard_svc.as_ref() {
+                        svc.clear();
+                    }
                 }
 
                 // —— 文件树动作：双击目录 cd / 双击文件系统默认程序
@@ -6833,6 +7386,9 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(id) = shell_out.remote_refresh_dir {
                     state.remote_ws.remote_refresh_dir(id);
                 }
+                if let Some(id) = shell_out.remote_select {
+                    state.remote_ws.set_remote_selected(id);
+                }
                 if let Some(show) = shell_out.remote_toggle_hidden {
                     state.remote_ws.set_remote_show_hidden(show);
                 }
@@ -6840,62 +7396,89 @@ impl ApplicationHandler<PtyWake> for App {
                 if let Some(path) = shell_out.remote_fetch_open {
                     state.remote_ws.start_fetch_open(path);
                 }
-                // #7：复制文件 / 文件夹到剪贴板（记引用，零传输）。
-                if let Some((side, path, name, is_dir)) = shell_out.file_copy {
-                    state.remote_ws.set_file_clipboard(
-                        side,
-                        vec![remote_ws::ClipItem { path, name, is_dir }],
-                    );
-                    state.shell_state.toast.push(
-                        shell::toast::ToastKind::Info,
-                        i18n::fmt1(i18n::strings().remote_copied_fmt, 1),
-                    );
-                }
-                // #7：粘贴 → 按剪贴板侧 × 目标侧定方向。本片做下载（Remote→Local）；上传留片5。
-                if let Some((target_side, dir)) = shell_out.file_paste {
-                    let clip = state
-                        .remote_ws
-                        .file_clipboard()
-                        .map(|c| (c.side, c.items.clone()));
-                    if let Some((clip_side, items)) = clip {
-                        match (clip_side, target_side) {
-                            // 下载：远程剪贴板 → 本地目录。检查本地同名冲突 → 有则弹覆盖模态。
-                            (remote_ws::ClipSide::Remote, remote_ws::ClipSide::Local) => {
-                                let dest_root = std::path::Path::new(&dir);
-                                let conflicts = items
-                                    .iter()
-                                    .filter(|it| dest_root.join(&it.name).exists())
-                                    .count();
-                                if conflicts > 0 {
-                                    state.pending_paste = Some(PendingPaste {
-                                        items,
-                                        dest_dir: dir,
-                                        conflict_count: conflicts,
-                                    });
+                // 复制：本地文件 → **系统剪贴板**（CF_HDROP，与资源管理器及任意应用互通，海风哥
+                // 反馈核心）；远程文件路径在被控端、进不了系统剪贴板 → 存 Lumen 内部（仅供下载到本地）。
+                if let Some((side, path, name, is_dir, size)) = shell_out.file_copy {
+                    log::info!("[文件剪贴板] 复制: side={side:?} is_dir={is_dir} size={size} path={path}");
+                    match side {
+                        remote_ws::ClipSide::Local => {
+                            let ok = clipboard_files::copy_files(&[std::path::PathBuf::from(&path)]);
+                            // 清 Lumen 内部远程剪贴板：避免随后本地粘贴误走「下载」分支（系统优先）。
+                            state.remote_ws.clear_file_clipboard();
+                            // 片6：本地复制已抢占系统剪贴板（CF_HDROP），让 OLE 线程释放可能残留的
+                            // 我方虚拟文件对象引用，避免后续判属/泄漏。
+                            if let Some(svc) = state.clipboard_svc.as_ref() {
+                                svc.clear();
+                            }
+                            state.shell_state.toast.push(
+                                if ok {
+                                    shell::toast::ToastKind::Info
                                 } else {
-                                    state.remote_ws.start_download(items, dir, true);
+                                    shell::toast::ToastKind::Error
+                                },
+                                if ok {
+                                    i18n::fmt1(i18n::strings().remote_copied_fmt, 1)
+                                } else {
+                                    i18n::strings().local_copy_clipboard_failed.to_string()
+                                },
+                            );
+                        }
+                        remote_ws::ClipSide::Remote => {
+                            // 片6/8：单文件 → 即时系统剪贴板虚拟文件；目录 → 先 clear 关竞态、起
+                            // 递归枚举，枚举完成（ClipDirReady）才 set 多文件 descriptor。
+                            if let Some(svc) = state.clipboard_svc.as_ref() {
+                                svc.clear();
+                            }
+                            if is_dir {
+                                state.remote_ws.start_clip_dir(path.clone(), name.clone());
+                            } else {
+                                state.remote_ws.cancel_clip_dir();
+                                if let Some(svc) = state.clipboard_svc.as_ref() {
+                                    svc.set_remote_file(path.clone(), name.clone(), size);
                                 }
                             }
-                            // 上传（控制端本地 → 被控端目录）：递归编排（撞名由被控端 Probe
-                            // 决议、首个冲突弹覆盖模态一次性决策套用整次递归）。
-                            (remote_ws::ClipSide::Local, remote_ws::ClipSide::Remote) => {
-                                state.remote_ws.start_upload(items, dir);
-                            }
-                            // 同侧（本地→本地 / 远程→远程）：本期不支持。
-                            _ => {}
+                            state.remote_ws.set_file_clipboard(
+                                side,
+                                vec![remote_ws::ClipItem { path, name, is_dir }],
+                            );
+                            let msg = if is_dir {
+                                i18n::strings().remote_clip_dir_preparing.to_string()
+                            } else {
+                                i18n::fmt1(i18n::strings().remote_copied_fmt, 1)
+                            };
+                            state
+                                .shell_state
+                                .toast
+                                .push(shell::toast::ToastKind::Info, msg);
                         }
                     }
+                }
+                // 粘贴：按目标侧定方向。
+                // - 粘贴到本地目录：Lumen 内部有远程项 → 下载；否则系统剪贴板文件 → 本机复制。
+                // - 粘贴到远程目录（上传）：系统剪贴板本地文件 → 上传到被控端。
+                if let Some((target_side, dir)) = shell_out.file_paste {
+                    state.do_file_paste(target_side, dir);
                 }
                 // #7 / 片5：覆盖模态选择 → 续传 / 跳过 / 取消。先看待决下载（pending_paste），
                 // 否则路由到待决上传冲突（resolve_upload_conflict）。两者互斥（同一模态）。
                 if let Some(choice) = shell_out.overwrite_choice {
                     if let Some(p) = state.pending_paste.take() {
+                        // 按方向路由：本机复制 → start_local_copy；下载 → start_download。
+                        let is_local = p.local;
                         match choice {
                             shell::OverwriteChoice::Overwrite => {
-                                state.remote_ws.start_download(p.items, p.dest_dir, true);
+                                if is_local {
+                                    state.start_local_copy(p.items, p.dest_dir, true);
+                                } else {
+                                    state.remote_ws.start_download(p.items, p.dest_dir, true);
+                                }
                             }
                             shell::OverwriteChoice::Skip => {
-                                state.remote_ws.start_download(p.items, p.dest_dir, false);
+                                if is_local {
+                                    state.start_local_copy(p.items, p.dest_dir, false);
+                                } else {
+                                    state.remote_ws.start_download(p.items, p.dest_dir, false);
+                                }
                             }
                             shell::OverwriteChoice::Cancel => {}
                         }
@@ -7572,6 +8155,112 @@ mod tests {
         drain_order, estimate_restored_pane_px, load_icon, maximized_overflow,
         width_worth_persisting, PaneLayout,
     };
+
+    // ── 本机复制粘贴（local→local，海风哥本轮新增）单测 ───────────────────
+    use super::{local_copy_item, unique_copy_name, CopyStats};
+
+    #[test]
+    fn 副本名_不冲突原样_冲突加序号() {
+        let base = lc_tmp("uniq");
+        // 不存在 → 原样返回。
+        assert_eq!(unique_copy_name(&base, "a.txt", false), "a.txt");
+        // 存在 → a (1).txt（保留扩展名）。
+        std::fs::write(base.join("a.txt"), b"x").unwrap();
+        assert_eq!(unique_copy_name(&base, "a.txt", false), "a (1).txt");
+        // a (1).txt 也在 → a (2).txt。
+        std::fs::write(base.join("a (1).txt"), b"x").unwrap();
+        assert_eq!(unique_copy_name(&base, "a.txt", false), "a (2).txt");
+        // 目录：整体加后缀（不切扩展名）。
+        std::fs::create_dir(base.join("d")).unwrap();
+        assert_eq!(unique_copy_name(&base, "d", true), "d (1)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 建唯一临时根目录（进程 id + 标签区分，各测试互不撞），测完自行清理。
+    fn lc_tmp(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("lumen_lc_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("建测试根");
+        base
+    }
+
+    #[test]
+    fn 本机复制_单文件_落地正确() {
+        let base = lc_tmp("file");
+        let src = base.join("a.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let dst_dir = base.join("dst");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let mut st = CopyStats::default();
+        local_copy_item(&dst_dir.join("a.txt"), &src, false, true, 0, &mut st);
+        assert_eq!((st.done, st.skipped, st.errors), (1, 0, 0));
+        assert_eq!(std::fs::read(dst_dir.join("a.txt")).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 本机复制_撞名_不覆盖跳过_覆盖替换() {
+        let base = lc_tmp("conflict");
+        let src = base.join("src.txt");
+        std::fs::write(&src, b"NEW").unwrap();
+        let dst = base.join("d").join("src.txt");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&dst, b"OLD").unwrap();
+        // 不覆盖 → 跳过，旧内容保留。
+        let mut st = CopyStats::default();
+        local_copy_item(&dst, &src, false, false, 0, &mut st);
+        assert_eq!((st.done, st.skipped, st.errors), (0, 1, 0));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"OLD");
+        // 覆盖 → 替换为新内容。
+        let mut st2 = CopyStats::default();
+        local_copy_item(&dst, &src, false, true, 0, &mut st2);
+        assert_eq!((st2.done, st2.skipped, st2.errors), (1, 0, 0));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 本机复制_目录递归_子项全到() {
+        let base = lc_tmp("dir");
+        let src = base.join("srcdir");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("f1.txt"), b"1").unwrap();
+        std::fs::write(src.join("sub").join("f2.txt"), b"2").unwrap();
+        let dst = base.join("dstdir");
+        let mut st = CopyStats::default();
+        local_copy_item(&dst, &src, true, true, 0, &mut st);
+        assert_eq!((st.done, st.errors), (2, 0), "两个文件都复制、无错");
+        assert_eq!(std::fs::read(dst.join("f1.txt")).unwrap(), b"1");
+        assert_eq!(std::fs::read(dst.join("sub").join("f2.txt")).unwrap(), b"2");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 本机复制_目标在源子树内_拒绝防无限递归() {
+        let base = lc_tmp("recur");
+        let src = base.join("a");
+        std::fs::create_dir_all(src.join("sub")).unwrap(); // a/sub 已存在 → 父目录可 canonical
+        std::fs::write(src.join("f.txt"), b"x").unwrap();
+        // 复制 a 到 a/sub/a（目标落在源子树内）→ 顶层即被自递归防御拦下、计 error、零复制。
+        let dst = src.join("sub").join("a");
+        let mut st = CopyStats::default();
+        local_copy_item(&dst, &src, true, true, 0, &mut st);
+        assert_eq!((st.done, st.errors), (0, 1), "顶层拒绝，无任何文件被复制");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn 本机复制_源即目标_跳过防毁源() {
+        let base = lc_tmp("self");
+        let f = base.join("a.txt");
+        std::fs::write(&f, b"keep").unwrap();
+        // dest==src（复制到原地，覆盖模式）→ 必须跳过，否则 fs::copy 先 truncate 毁掉源。
+        let mut st = CopyStats::default();
+        local_copy_item(&f, &f, false, true, 0, &mut st);
+        assert_eq!((st.done, st.skipped), (0, 1));
+        assert_eq!(std::fs::read(&f).unwrap(), b"keep", "源文件未被毁");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     // ── 第二十二轮：运行时图标加载单元测试 ─────────────────────────────
 

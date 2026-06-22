@@ -258,6 +258,22 @@ pub struct Strings {
     pub remote_overwrite_skip: &'static str,
     /// part3c-2 #7：复制成功 toast（单参 `{}` = 项数）
     pub remote_copied_fmt: &'static str,
+    /// 片8：正在递归枚举远程目录（复制目录后、descriptor 就绪前的提示）。
+    pub remote_clip_dir_preparing: &'static str,
+    /// 片8：远程目录枚举完成、可粘贴（`{}` = 子树项数）。
+    pub remote_clip_dir_ready_fmt: &'static str,
+    /// 片8：远程目录过大、仅复制前 N 项（`{}` = 已复制项数）。
+    pub remote_clip_dir_truncated_fmt: &'static str,
+    /// 片8：远程目录枚举失败（权限 / 路径不存在 / 空目录）。
+    pub remote_clip_dir_failed: &'static str,
+    /// 本机复制粘贴（local→local）开始的 toast。
+    pub local_copy_started: &'static str,
+    /// 本机复制粘贴完成的 toast（`{0}` 完成 / `{1}` 跳过 / `{2}` 出错；走 fmt3，须用索引占位）。
+    pub local_copy_done_fmt: &'static str,
+    /// 已有本机复制在途时再次粘贴的提示 toast。
+    pub local_copy_busy: &'static str,
+    /// 复制本地文件写入系统剪贴板失败的提示 toast。
+    pub local_copy_clipboard_failed: &'static str,
     // 新建对话框
     /// "新建文件夹" 对话框标题
     pub filetree_create_dir_title: &'static str,

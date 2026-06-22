@@ -11,3 +11,5 @@ serde = { workspace = true }
 # M5.3 数据面盲转：Relay 载荷用不透明 serde_json::Value，服务端不解析内部、
 # 原样转发；客户端两端共享 RemoteFrame 强类型收发。纯跨平台，零平台依赖。
 serde_json = { workspace = true }
+# 文件传输块 base64 编码（避免 Vec<u8> JSON 数字数组膨胀 ~4x）。
+base64 = { workspace = true }

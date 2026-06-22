@@ -343,6 +343,32 @@ impl FileTreeState {
         }
     }
 
+    /// 当前选中节点的 `(path, is_dir)`——Ctrl+C 复制源用（ltreeview 单击选中）。占位 / 无选中
+    /// 返回 `None`。
+    pub fn selected_item(&self) -> Option<(PathBuf, bool)> {
+        let id = *self.tree.selected().last()?;
+        let n = self.nodes.get(id)?;
+        match n.kind {
+            NodeKind::Dir => Some((n.path.clone(), true)),
+            NodeKind::File => Some((n.path.clone(), false)),
+            _ => None,
+        }
+    }
+
+    /// Ctrl+V 粘贴目标目录：选中目录→它本身；选中文件→其父目录；无选中→树根。
+    pub fn paste_target_dir(&self) -> Option<PathBuf> {
+        if let Some(&id) = self.tree.selected().last() {
+            if let Some(n) = self.nodes.get(id) {
+                return match n.kind {
+                    NodeKind::Dir => Some(n.path.clone()),
+                    NodeKind::File => n.path.parent().map(Path::to_path_buf),
+                    _ => self.root.clone(),
+                };
+            }
+        }
+        self.root.clone()
+    }
+
     // M5.3 part3c-2：Option A 的快照抽取 / 远程展开入口（snapshot_rows / snapshot_visit /
     // find_dir_by_path / remote_expand / remote_collapse）已删。Option B 下被控端不再持远程
     // 展开态，控制端自持的远程树状态机（含路径反查 DFS）见 remote_ws::RemoteFileTree（片2）。
@@ -469,7 +495,7 @@ impl FileTreeState {
     /// ensure_listing 重新派发读取；后代目录的展开状态先按路径收集
     /// 进 [`Self::restore_open`]，回包建新节点时恢复——比整树
     /// reset_nodes 轻得多（不丢其余分支的展开/选中状态）。
-    fn refresh_dir(&mut self, dir: &Path) {
+    pub fn refresh_dir(&mut self, dir: &Path) {
         let ids: Vec<usize> = self
             .nodes
             .iter()
@@ -632,6 +658,8 @@ pub struct FileTreeOutput {
     /// 面板本帧实际占用矩形（含展开态与窄条；P16 描边用）。None
     /// 仅在极端边角（面板未渲染）时出现，正常帧必有值。
     pub panel_rect: Option<egui::Rect>,
+    /// 本帧鼠标是否在文件树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键的门控）。
+    pub hovered: bool,
 }
 
 /// 绘制文件树栏（位于 tab 侧栏右侧、终端区左侧）。
@@ -678,6 +706,10 @@ pub fn show(
             .show_inside(root, |ui| panel_ui(ui, st, shell_idle, pal, can_paste, &mut out));
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
+        // Ctrl+C/V 快捷键统一在 winit 层处理（main::filetree_ctrl_c / filetree_ctrl_v）——egui 把
+        // Ctrl+V 吞成 Paste 事件、文件剪贴板无文本时连 V 键都不产生，egui input 层拦不到。门控用
+        // 「鼠标在文件树面板内」（与右键菜单一致），存到下一帧供 winit 判定。
+        out.hovered = resp.response.contains_pointer();
     }
     // else：st.visible == false → 不画任何面板，panel_rect = None，
     // panel_width = None（mod.rs 已处理 None 跳过描边/手柄逻辑）。
@@ -1633,9 +1665,17 @@ fn ensure_listing(load: &mut LoadCtx<'_>, id: usize) {
     });
 }
 
+/// [`read_dir_worker_ex`] 产物：(子项 `[(路径, 是否目录, 字节数)]`, 单层溢出计数)。
+type ReadDirResult = (Vec<(PathBuf, bool, u64)>, usize);
+
 /// 本地文件树用：读目录并过滤隐藏项（[`read_dir_worker_ex`] 的 `show_hidden=false` 包装）。
+/// 本地树不需要文件大小，丢弃 size。
 fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
-    read_dir_worker_ex(dir, false)
+    let (entries, overflow) = read_dir_worker_ex(dir, false)?;
+    Ok((
+        entries.into_iter().map(|(p, d, _)| (p, d)).collect(),
+        overflow,
+    ))
 }
 
 /// 后台线程的目录读取：`show_hidden=false` 过滤隐藏项 → 目录在前文件在后、各按名排序
@@ -1645,10 +1685,7 @@ fn read_dir_worker(dir: &Path) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
 ///
 /// `show_hidden`：part3c-2 远程「文件管理」语义下控制端可选显示 `.env`/`.gitignore` 等
 /// （本地树恒传 `false` 维持现状）。
-pub(crate) fn read_dir_worker_ex(
-    dir: &Path,
-    show_hidden: bool,
-) -> Result<(Vec<(PathBuf, bool)>, usize), ()> {
+pub(crate) fn read_dir_worker_ex(dir: &Path, show_hidden: bool) -> Result<ReadDirResult, ()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
@@ -1656,9 +1693,8 @@ pub(crate) fn read_dir_worker_ex(
             return Err(());
         }
     };
-    // (小写排序键, 是否目录, 路径)。单个条目元数据读取失败（竞态删除
-    // 等）跳过。
-    let mut entries: Vec<(String, bool, PathBuf)> = Vec::new();
+    // (小写排序键, 是否目录, 字节数, 路径)。单个条目元数据读取失败（竞态删除等）跳过。
+    let mut entries: Vec<(String, bool, u64, PathBuf)> = Vec::new();
     for entry in rd.flatten() {
         if entries.len() >= ENUM_HARD_CAP {
             break;
@@ -1670,14 +1706,17 @@ pub(crate) fn read_dir_worker_ex(
         if !show_hidden && is_hidden(&name, &meta) {
             continue;
         }
-        entries.push((name.to_lowercase(), is_dir(&meta), entry.path()));
+        entries.push((name.to_lowercase(), is_dir(&meta), meta.len(), entry.path()));
     }
     // 目录在前（true 排前用降序），同类按名不区分大小写排序。
     entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let overflow = entries.len().saturating_sub(MAX_ENTRIES_PER_DIR);
     entries.truncate(MAX_ENTRIES_PER_DIR);
     Ok((
-        entries.into_iter().map(|(_, d, path)| (path, d)).collect(),
+        entries
+            .into_iter()
+            .map(|(_, d, sz, path)| (path, d, sz))
+            .collect(),
         overflow,
     ))
 }
@@ -1696,10 +1735,11 @@ pub(crate) fn list_dir_entries(
     let (entries, overflow) = read_dir_worker_ex(dir, show_hidden)?;
     let out = entries
         .into_iter()
-        .map(|(path, is_dir)| lumen_protocol::remote::DirEntry {
+        .map(|(path, is_dir, size)| lumen_protocol::remote::DirEntry {
             path: path.display().to_string(),
             name: display_name(&path),
             is_dir,
+            size: if is_dir { 0 } else { size },
         })
         .collect();
     Ok((out, overflow))
@@ -1756,6 +1796,118 @@ fn search_worker(
     (items, false)
 }
 
+/// part3c-2 片8 递归遍历的不变参数（打包以免 [`walk_recursive`] 参数过多）。
+struct RecurseCtx {
+    show_hidden: bool,
+    /// 最大递归深度（根目录深度 1）；已把协议的 `0=无穷` 归一成 `u32::MAX`。
+    max_depth: u32,
+    /// 最大总项数（目录 + 文件）；已把 `0=无穷` 归一成 `usize::MAX`。
+    max_entries: usize,
+    /// 扫描截止时刻（防网络盘长阻塞）；`None` 不限时。
+    deadline: Option<Instant>,
+}
+
+/// part3c-2 片8 被控端递归目录遍历（DFS pre-order）：产出协议平铺子树
+/// [`lumen_protocol::remote::RecursiveDirEntry`]，供 `ListDirRecursive` 服务调用。
+///
+/// **对齐铁律**（与 descriptor `fgd` 顺序 / 资源管理器 `lindex` 索引一致，下游严禁重排）：父目录项
+/// 必在其所有子项之前（pre-order 天然保证），空目录单独成项（资源管理器据此建出空目录）。
+///
+/// - `rel_path` 一律正斜杠 `/` 分隔；目录在前 + 同类按名不分大小写排序（与单层 `ListDir` 一致）。
+/// - 符号链接 / junction 目录列为目录项但**不下钻**（防环，免 `canonicalize`）。
+/// - 三个截断源：深度 > `max_depth`、项数 ≥ `max_entries`、过 `deadline`；任一触发置 `truncated`
+///   （`max_depth==0` / `max_entries==0` 视作无穷）。单个子目录读失败（权限等）跳过、不中断整体。
+pub(crate) fn list_dir_recursive(
+    root: &Path,
+    show_hidden: bool,
+    max_depth: u32,
+    max_entries: u32,
+    deadline: Option<Instant>,
+) -> (Vec<lumen_protocol::remote::RecursiveDirEntry>, bool) {
+    let ctx = RecurseCtx {
+        show_hidden,
+        max_depth: if max_depth == 0 { u32::MAX } else { max_depth },
+        max_entries: if max_entries == 0 {
+            usize::MAX
+        } else {
+            max_entries as usize
+        },
+        deadline,
+    };
+    let mut out = Vec::new();
+    let mut truncated = false;
+    walk_recursive(root, "", 1, &ctx, &mut out, &mut truncated);
+    (out, truncated)
+}
+
+/// [`list_dir_recursive`] 的 DFS 递归体。`rel_prefix` 是 `dir` 相对根的正斜杠路径（根为空串），
+/// `depth` 为 `dir` 自身深度（根 = 1）。
+fn walk_recursive(
+    dir: &Path,
+    rel_prefix: &str,
+    depth: u32,
+    ctx: &RecurseCtx,
+    out: &mut Vec<lumen_protocol::remote::RecursiveDirEntry>,
+    truncated: &mut bool,
+) {
+    use lumen_protocol::remote::RecursiveDirEntry;
+    // 单层读失败（权限 / 网络盘断）跳过、不中断整棵树。
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // (小写排序键, 是否目录, 是否符号链接, 字节数, 路径, 原名)。单项元数据读失败（竞态删）跳过。
+    let mut children: Vec<(String, bool, bool, u64, PathBuf, String)> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !ctx.show_hidden && is_hidden(&name, &meta) {
+            continue;
+        }
+        let symlink = entry.file_type().is_ok_and(|t| t.is_symlink());
+        children.push((
+            name.to_lowercase(),
+            is_dir(&meta),
+            symlink,
+            meta.len(),
+            entry.path(),
+            name,
+        ));
+    }
+    // 目录在前（降序 bool）、同类按名不分大小写——与单层 ListDir 排序一致，序稳定可预期。
+    children.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    for (_, is_dir_flag, symlink, size, path, name) in children {
+        if ctx.deadline.is_some_and(|d| Instant::now() >= d) || out.len() >= ctx.max_entries {
+            *truncated = true;
+            return;
+        }
+        let rel_path = if rel_prefix.is_empty() {
+            name
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        out.push(RecursiveDirEntry {
+            rel_path: rel_path.clone(),
+            path: path.display().to_string(),
+            is_dir: is_dir_flag,
+            size: if is_dir_flag { 0 } else { size },
+        });
+        // 下钻：真实目录（非符号链接 / junction）。达深度上限则不再下钻并标截断（深层可能漏列）。
+        if is_dir_flag && !symlink {
+            if depth < ctx.max_depth {
+                walk_recursive(&path, &rel_path, depth + 1, ctx, out, truncated);
+                if *truncated {
+                    return;
+                }
+            } else {
+                *truncated = true;
+            }
+        }
+    }
+}
+
 /// 追加节点并返回其 id（= 下标）。
 fn push_node(nodes: &mut Vec<NodeInfo>, path: PathBuf, kind: NodeKind) -> usize {
     nodes.push(NodeInfo { path, kind });
@@ -1810,6 +1962,8 @@ pub struct RemoteFileTreeOutput {
     pub panel_width: Option<f32>,
     /// 面板矩形（mod.rs 描边 / 拖宽手柄用；隐藏时 None）。
     pub panel_rect: Option<egui::Rect>,
+    /// 本帧鼠标是否在远程树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键门控）。
+    pub hovered: bool,
     /// 本帧被点击的目录节点 id（翻转展开态：纯本地、未缓存则触发 ListDir）。
     pub dir_clicks: Vec<usize>,
     /// 「显示隐藏项」勾选变化（main 闭包后 set + 重列根）。
@@ -1817,11 +1971,13 @@ pub struct RemoteFileTreeOutput {
     /// 本帧双击的文件的被控端路径（#5：main 起 Fetch → 传到控制端本地默认程序打开）。
     pub fetch_open: Option<String>,
     /// 本帧右键「复制」的远程项 (path, name, is_dir)（#7 下载源 → 文件剪贴板 Remote 侧）。
-    pub copy_files: Option<(String, String, bool)>,
+    pub copy_files: Option<(String, String, bool, u64)>,
     /// 本帧右键「粘贴到此目录」的远程目录 path（上传目标；片5 接入）。
     pub paste_into: Option<String>,
     /// 本帧点了「刷新」图标的目录节点 id（重拉该目录最新内容；新增文件可见）。
     pub refresh_dir: Option<usize>,
+    /// 本帧单击选中的节点 id（main 设 ft.selected → 渲染高亮 + Ctrl+C 复制源）。
+    pub select: Option<usize>,
 }
 
 /// M5.3 part3c-2 控制端远程视图——按需浏览被控端文件系统的目录树（只读渲染）。
@@ -1859,6 +2015,8 @@ pub fn show_remote(
             });
         out.panel_width = Some(resp.response.rect.width());
         out.panel_rect = Some(resp.response.rect);
+        // Ctrl+C/V 快捷键统一在 winit 层处理；门控用「鼠标在远程树面板内」，存到下一帧供 winit 判定。
+        out.hovered = resp.response.contains_pointer();
     }
     out
 }
@@ -1867,7 +2025,7 @@ pub fn show_remote(
 /// 同款范式，避免在嵌套闭包里直接借 `&mut out` 导致菜单不触发）。
 enum RemoteMenuAction {
     /// 复制远程项（下载源）：(path, name, is_dir)。
-    Copy(String, String, bool),
+    Copy(String, String, bool, u64),
     /// 粘贴到此远程目录（上传目标）：dir path。
     Paste(String),
 }
@@ -1926,47 +2084,84 @@ fn remote_panel_ui(
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            // 三角紧贴名字：缩小行内控件间距（#1：默认 8px 间距让三角离名字太远，与本地树不一致）。
-            ui.spacing_mut().item_spacing.x = 3.0;
-            // 每行 push_id(row.id, i) 给唯一稳定 id：否则各行 selectable_label 的右键菜单 id 冲突，
-            // 右键任一行都弹**第一行**的菜单（修 #4：复制永远复制第一个）。
+            // 三角紧贴名字（本轮反馈 #4「三角间距太远」）：①item_spacing 收到 2.0，贴近本地树
+            // ltreeview 的 add_space(2)；②button_padding.x 清零——selectable_label 自带 4px 左内边距
+            // 才是真凶，上一轮只调 item_spacing 没碰它（三角尖→文字曾 ≈ 框内死白 2.7 + item_spacing 3
+            // + 按钮内边距 4 ≈ 9.7px，本地树仅 ~3.75px）。二者皆 spacing 字段，下面 horizontal/push_id
+            // 子 ui 继承（egui 0.34 new_child 复制父 style，已核源码）。
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding.x = 0.0;
+            // 每行用**稳定**唯一 salt（本轮反馈 #2「复制只复制第一个」）：真实行用节点 id（nodes 下标，
+            // 跨帧稳定），**不含**可见行位置 i——否则某目录 listing 在「右键弹菜单帧」与「点菜单帧」之间
+            // 到达，会让其后所有行的 i 整体位移，已打开菜单的 response.id 与当前帧不再匹配，菜单错位/
+            // 落回首行（egui context_menu 按 response.id 路由，id 一变就丢）。占位行（id=usize::MAX、不挂
+            // 右键菜单）用帧内 i 兜底，仅防多个占位行 push_id 相撞。
             for (i, row) in ft.visible_rows().into_iter().enumerate() {
-                ui.push_id((row.id, i), |ui| {
+                let id_salt: (u8, usize) = if row.id == usize::MAX { (0, i) } else { (1, row.id) };
+                ui.push_id(id_salt, |ui| {
                     ui.horizontal(|ui| {
                         ui.add_space(row.depth as f32 * 12.0);
                         match row.kind {
                             RemoteRowKind::Dir { open } => {
                                 // 三角用 painter 画——`▾`/`▸` 字形在 UI 字体里缺失会渲染成
-                                // tofu 方块（修 #1）。点三角或名字都翻转展开。
-                                let (tri_rect, tri_resp) = ui
-                                    .allocate_exact_size(egui::vec2(11.0, 16.0), egui::Sense::click());
+                                // tofu 方块。点三角或名字都翻转展开。框宽 9（原 11）收掉三角尖右侧
+                                // 死白、让名字更近，点击热区 9×16 仍够（本轮反馈 #4 三角间距）。
+                                // 交互全部走**显式稳定 id** 的 ui.interact（row.id 全局唯一）：
+                                // selectable_label / allocate_exact_size 的 auto-id 在「ScrollArea +
+                                // horizontal + push_id」嵌套下实测会相撞，导致 clicked()/选中/右键菜单
+                                // 全部错乱落到首行——这正是海风哥反馈「选不中、复制第一个、快捷键无效」
+                                // 的总根因。selectable_label 仅用于画选中高亮，点击判定一律用显式 id 句柄。
+                                let (tri_rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(9.0, 16.0), egui::Sense::hover());
+                                let tri_resp = ui.interact(
+                                    tri_rect,
+                                    egui::Id::new(("lumen_remote_tri", row.id)),
+                                    egui::Sense::click(),
+                                );
                                 paint_tri(ui.painter(), tri_rect, open, pal.fg_dim);
-                                let resp = ui
+                                let is_sel = ft.selected() == Some(row.id);
+                                let name_resp = ui
                                     .selectable_label(
-                                        false,
+                                        is_sel,
                                         egui::RichText::new(&row.name).color(pal.fg),
                                     )
                                     .on_hover_text(&row.path);
-                                if resp.clicked() || tri_resp.clicked() {
+                                let row_resp = ui.interact(
+                                    name_resp.rect,
+                                    egui::Id::new(("lumen_remote_dir_row", row.id)),
+                                    egui::Sense::click(),
+                                );
+                                if row_resp.clicked() {
+                                    // 单击名字：选中（高亮 + Ctrl+C 源）+ 翻转展开。
+                                    out.select = Some(row.id);
+                                    out.dir_clicks.push(row.id);
+                                } else if tri_resp.clicked() {
+                                    // 仅点三角：只翻转展开，不改选中。
                                     out.dir_clicks.push(row.id);
                                 }
                                 // #6 刷新图标：悬停目录行时名字右侧出现，点击重拉该目录最新内容。
-                                let (rf_rect, rf_resp) = ui
-                                    .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::click());
-                                if resp.hovered() || tri_resp.hovered() || rf_resp.hovered() {
+                                let (rf_rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                                let rf_resp = ui.interact(
+                                    rf_rect,
+                                    egui::Id::new(("lumen_remote_rf", row.id)),
+                                    egui::Sense::click(),
+                                );
+                                if row_resp.hovered() || tri_resp.hovered() || rf_resp.hovered() {
                                     paint_refresh_small(ui.painter(), rf_rect, pal.fg_dim);
                                     if rf_resp.on_hover_text(s.remote_refresh_dir_tip).clicked() {
                                         out.refresh_dir = Some(row.id);
                                     }
                                 }
-                                // 右键：复制（下载源）/ 粘贴到此目录（上传目标，can_paste 时）。
-                                resp.context_menu(|ui| {
+                                // 右键菜单挂同一显式 id 句柄（路由必中本行）。
+                                egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.remote_menu_copy).clicked() {
                                         *menu.borrow_mut() = Some(RemoteMenuAction::Copy(
                                             row.path.clone(),
                                             row.name.clone(),
                                             true,
+                                            0, // 目录 size 无意义（目录复制走旧路径）
                                         ));
                                         ui.close();
                                     }
@@ -1979,25 +2174,36 @@ fn remote_panel_ui(
                             }
                             RemoteRowKind::File => {
                                 // 双击 → Fetch 传到控制端本地默认程序打开（#5）。悬停看全路径。
-                                let resp = ui
+                                let is_sel = ft.selected() == Some(row.id);
+                                let name_resp = ui
                                     .selectable_label(
-                                        false,
+                                        is_sel,
                                         egui::RichText::new(&row.name).color(pal.fg),
                                     )
                                     .on_hover_text(&row.path);
+                                // 同 Dir 分支：交互走显式 id 句柄（auto-id 相撞会让点击/双击/菜单错乱）。
+                                let row_resp = ui.interact(
+                                    name_resp.rect,
+                                    egui::Id::new(("lumen_remote_file_row", row.id)),
+                                    egui::Sense::click(),
+                                );
+                                if row_resp.clicked() {
+                                    out.select = Some(row.id); // 单击选中（高亮 + Ctrl+C 下载源）
+                                }
                                 // 右键：复制（下载源 → 文件剪贴板 Remote 侧）。
-                                resp.context_menu(|ui| {
+                                egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.remote_menu_copy).clicked() {
                                         *menu.borrow_mut() = Some(RemoteMenuAction::Copy(
                                             row.path.clone(),
                                             row.name.clone(),
                                             false,
+                                            row.size,
                                         ));
                                         ui.close();
                                     }
                                 });
-                                if resp.double_clicked() {
+                                if row_resp.double_clicked() {
                                     out.fetch_open = Some(row.path.clone());
                                 }
                             }
@@ -2021,8 +2227,8 @@ fn remote_panel_ui(
         });
     // 循环结束后写入 out（避免 context_menu 闭包里嵌套借 &mut out）。
     match menu.into_inner() {
-        Some(RemoteMenuAction::Copy(path, name, is_dir)) => {
-            out.copy_files = Some((path, name, is_dir));
+        Some(RemoteMenuAction::Copy(path, name, is_dir, size)) => {
+            out.copy_files = Some((path, name, is_dir, size));
         }
         Some(RemoteMenuAction::Paste(dir)) => out.paste_into = Some(dir),
         None => {}
@@ -2268,6 +2474,106 @@ fn reap_in_background(mut child: std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造一棵唯一的临时目录树根（同款于 main.rs 的 lc_tmp；不引 tempfile）。
+    fn lr_tmp(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!("lumen_lr_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("建测试根");
+        base
+    }
+
+    #[test]
+    fn 递归_dfs序_父在子前_空目录单独成项() {
+        let root = lr_tmp("dfs");
+        std::fs::create_dir_all(root.join("dir_a")).unwrap();
+        std::fs::write(root.join("dir_a").join("f1.txt"), b"hi").unwrap();
+        std::fs::create_dir_all(root.join("dir_b")).unwrap(); // 空目录
+        std::fs::write(root.join("file_x.txt"), b"xyz").unwrap();
+
+        let (entries, truncated) = list_dir_recursive(&root, false, 20, 10_000, None);
+        let rels: Vec<(&str, bool)> = entries
+            .iter()
+            .map(|e| (e.rel_path.as_str(), e.is_dir))
+            .collect();
+        assert_eq!(
+            rels,
+            vec![
+                ("dir_a", true),
+                ("dir_a/f1.txt", false),
+                ("dir_b", true),
+                ("file_x.txt", false),
+            ],
+            "DFS pre-order：父目录在子项前、空目录单独成项、目录在前按名排序、rel 用正斜杠"
+        );
+        assert!(!truncated);
+        // size 透传：文件有大小、目录为 0。
+        let fx = entries.iter().find(|e| e.rel_path == "file_x.txt").unwrap();
+        assert_eq!(fx.size, 3);
+        let f1 = entries.iter().find(|e| e.rel_path == "dir_a/f1.txt").unwrap();
+        assert_eq!(f1.size, 2);
+        let da = entries.iter().find(|e| e.rel_path == "dir_a").unwrap();
+        assert_eq!(da.size, 0, "目录 size 恒 0");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 递归_深度上限_截断() {
+        let root = lr_tmp("depth");
+        std::fs::create_dir_all(root.join("a").join("b")).unwrap();
+        std::fs::write(root.join("a").join("deep.txt"), b"x").unwrap();
+
+        // max_depth=1：只列根直接子项（a/），不下钻。a 是非空目录 → 标截断。
+        let (entries, truncated) = list_dir_recursive(&root, false, 1, 10_000, None);
+        let rels: Vec<&str> = entries.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["a"], "depth=1 只列根直接子项");
+        assert!(truncated, "a 是非空目录但因深度上限未下钻 → 截断");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 递归_项数上限_截断() {
+        let root = lr_tmp("count");
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::write(root.join("d").join("1.txt"), b"x").unwrap();
+        std::fs::write(root.join("d").join("2.txt"), b"x").unwrap();
+        std::fs::write(root.join("z.txt"), b"x").unwrap();
+
+        let (entries, truncated) = list_dir_recursive(&root, false, 20, 2, None);
+        assert_eq!(entries.len(), 2, "max_entries=2 截断到 2 项");
+        assert!(truncated);
+        // 前两项是 DFS 序：d/ 目录项、d/1.txt。
+        assert_eq!(entries[0].rel_path, "d");
+        assert_eq!(entries[1].rel_path, "d/1.txt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 递归_隐藏项过滤() {
+        let root = lr_tmp("hidden");
+        std::fs::write(root.join("visible.txt"), b"x").unwrap();
+        std::fs::write(root.join(".secret"), b"x").unwrap();
+
+        let (no_hidden, _) = list_dir_recursive(&root, false, 20, 10_000, None);
+        let rels: Vec<&str> = no_hidden.iter().map(|e| e.rel_path.as_str()).collect();
+        assert_eq!(rels, vec!["visible.txt"], "show_hidden=false 不含 .secret");
+
+        let (with_hidden, _) = list_dir_recursive(&root, true, 20, 10_000, None);
+        assert_eq!(with_hidden.len(), 2, "show_hidden=true 含 .secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn 递归_deadline过点_立即截断() {
+        let root = lr_tmp("deadline");
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        // deadline 取调用前一刻：时间单调不减，首项检查即 now >= deadline → 截断、产物空。
+        let past = Instant::now();
+        let (entries, truncated) = list_dir_recursive(&root, false, 20, 10_000, Some(past));
+        assert!(entries.is_empty(), "deadline 已过，首项即截断");
+        assert!(truncated);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     // part3c-2：Option A 的「快照按展开态扁平化与指纹」「快照根默认展开含子项」两测试
     // 已删（snapshot_rows / snapshot_fingerprint / remote_expand 等被删）。Option B 的控制端

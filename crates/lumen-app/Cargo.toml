@@ -48,6 +48,9 @@ tungstenite.workspace = true
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+# 远程虚拟文件剪贴板（virtual_files.rs）：COM IDataObject 延迟渲染，需 #[implement] 宏。
+windows.workspace = true
+windows-core.workspace = true
 
 # exe 资源图标嵌入（第二十二轮）：仅 Windows 构建期生效，零运行时依赖。
 [target.'cfg(windows)'.build-dependencies]

@@ -193,6 +193,39 @@ pub enum RemoteFrame {
         /// 读失败原因；`Some` 时 `entries` 空、`overflow=0`。
         err: Option<FsErr>,
     },
+    /// 控制端 → 被控端：递归列目录整棵子树（一次扫完，DFS 平铺）。用于「复制远程目录 → 资源管理器
+    /// 粘贴」：控制端需先拿到整棵子树清单才能构造虚拟文件 descriptor。受最大深度 / 项数上限约束，
+    /// 超限截断。`req_id` 关联应答（多目录可并发在途，同 [`ListDir`](RemoteFrame::ListDir)）。
+    ListDirRecursive {
+        /// 控制端单调递增请求号（0 保留为哨兵无效）。
+        req_id: u64,
+        /// 被控端不透明根目录路径（取自 [`RootChanged`](RemoteFrame::RootChanged) 或 [`DirEntry`]）。
+        path: String,
+        /// 是否包含隐藏项（与单层 [`ListDir`](RemoteFrame::ListDir) 取同一 `show_hidden`，保持一致）。
+        show_hidden: bool,
+        /// 最大递归深度（根目录为深度 1；`0` 视作无穷大）。建议传 [`LIST_DIR_RECURSIVE_MAX_DEPTH`]。
+        max_depth: u32,
+        /// 最多返回的总项数（目录项 + 文件项都计；`0` 视作无穷大）。建议传
+        /// [`LIST_DIR_RECURSIVE_MAX_ENTRIES`]。
+        max_entries: u32,
+    },
+    /// 被控端 → 控制端：[`ListDirRecursive`](RemoteFrame::ListDirRecursive) 应答（`err=Some` 时
+    /// `entries` 为空、`truncated=false`）。
+    ListDirRecursiveResult {
+        /// 与请求对齐。
+        req_id: u64,
+        /// 原样回带请求根目录路径。
+        path: String,
+        /// 平铺子树。**DFS 遍历序，且此顺序即虚拟文件 descriptor 的 `fgd` 数组顺序、即资源管理器
+        /// 请求 `FILECONTENTS` 的 `lindex` 索引**——全链路严禁任何一层重排，否则 lindex 错位、
+        /// 粘贴出错位文件内容（数据静默损坏）。父目录项必在其所有子项之前（DFS 天然保证，空目录
+        /// 也借此建出）。
+        entries: Vec<RecursiveDirEntry>,
+        /// 是否因超上限（深度 / 项数）而截断。
+        truncated: bool,
+        /// 读失败原因；`Some` 时 `entries` 空、`truncated=false`。
+        err: Option<FsErr>,
+    },
     /// 控制端 → 被控端：请求读取整个文件字节（被控端按 [`FILE_CHUNK`] 分块、受 ACK 窗口节流）。
     FetchReq {
         /// 关联请求号。
@@ -221,7 +254,8 @@ pub enum RemoteFrame {
         req_id: u64,
         /// 块序号（自 0 连续）。
         seq: u32,
-        /// 原始字节（≤ [`FILE_CHUNK`]）。
+        /// 原始字节（≤ [`FILE_CHUNK`]）。JSON 里走 base64（见 [`b64`]），免数字数组 ~4x 膨胀。
+        #[serde(with = "b64")]
         data: Vec<u8>,
     },
     /// 控制端 → 被控端：确认已收 `seq`，被控端方可发 `seq + FETCH_WINDOW` 之后的块（滑动窗口背压）。
@@ -273,7 +307,8 @@ pub enum RemoteFrame {
         req_id: u64,
         /// 块序号（自 0 连续）。
         seq: u32,
-        /// 原始字节（≤ [`FILE_CHUNK`]）。
+        /// 原始字节（≤ [`FILE_CHUNK`]）。JSON 里走 base64（见 [`b64`]），免数字数组 ~4x 膨胀。
+        #[serde(with = "b64")]
         data: Vec<u8>,
     },
     /// 被控端 → 控制端：确认已落盘 `seq`，控制端方可发后续窗口块
@@ -330,6 +365,26 @@ pub struct DirEntry {
     pub name: String,
     /// 是否目录（控制端据此画三角 / 决定可下钻；不让控制端自己 stat）。
     pub is_dir: bool,
+    /// 文件字节数（目录为 0）。片6 虚拟文件剪贴板的 descriptor 据此填 `FD_FILESIZE`，让资源管理器
+    /// 知道文件大小（否则当 0 字节空文件、不取内容）。
+    pub size: u64,
+}
+
+/// part3c-2 片8 递归目录树平铺项（[`ListDirRecursiveResult`](RemoteFrame::ListDirRecursiveResult)
+/// 的元素）。被控端 DFS 遍历产出，控制端据此构造虚拟文件 descriptor。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecursiveDirEntry {
+    /// 相对请求 `root_path` 的相对路径。**跨平台约定：一律用正斜杠 `/` 分隔**（被控端无论
+    /// Linux / Windows 都规范化为 `/`），控制端构造 Windows descriptor 的 `cFileName` 时再转 `\`。
+    /// 例：`sub/deep/file.txt`。根目录本身不出现（只列其内容）。
+    pub rel_path: String,
+    /// 被控端不透明完整绝对路径（后续 [`FetchReq`](RemoteFrame::FetchReq) 的 key；任何一端都不拆、
+    /// 不 join、不 basename，同 [`DirEntry::path`]）。
+    pub path: String,
+    /// 是否目录（目录项在 descriptor 里打 `FILE_ATTRIBUTE_DIRECTORY`、不被请求 `FILECONTENTS`）。
+    pub is_dir: bool,
+    /// 文件字节数（目录为 0）。填 descriptor 的 `FD_FILESIZE`（缺则 0KB bug）。
+    pub size: u64,
 }
 
 /// 文件系统操作错误（机器可读，控制端本地化提示；风格同 [`DenyReason`] / [`EndReason`]）。
@@ -378,12 +433,44 @@ pub enum PutStatus {
     Skipped,
 }
 
-/// 文件传输单块原始字节上限（serde 数字数组膨胀后 ~256 KiB << 4 MiB 帧上限；不引 base64 保零依赖）。
-pub const FILE_CHUNK: usize = 64 * 1024;
-/// 在途未 ACK 块窗口（背压：发送端最多领先对端 `FETCH_WINDOW` 块）。
-pub const FETCH_WINDOW: u32 = 4;
+/// 文件传输单块原始字节上限。`data` 在 JSON 里走 base64（膨胀 ~1.33x：256 KiB → ~341 KiB
+/// << 4 MiB 帧上限）。块设为 256 KiB（旧 64 KiB 的 4 倍）：等量数据帧数 / ACK 往返 / JSON
+/// 序列化次数降到 1/4。
+pub const FILE_CHUNK: usize = 256 * 1024;
+/// 在途未 ACK 块窗口（背压：发送端最多领先对端 `FETCH_WINDOW` 块）。8 块 = 2 MiB 在途，
+/// 填满局域网 / 中等延迟链路的带宽时延积。
+pub const FETCH_WINDOW: u32 = 8;
 /// 单文件 Fetch 字节上限（防控制端临时盘塞满；超出回 [`FsErr::TooLarge`]）。
 pub const FETCH_MAX_LEN: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 递归列目录（[`RemoteFrame::ListDirRecursive`]）最大总项数（目录项 + 文件项），超限截断。
+/// 与 4 MiB 单帧上限自洽：10000 项 × ~140 B JSON ≈ 2 MB << 4 MiB。也封顶虚拟文件 descriptor 的
+/// `fgd` 数组规模，防资源管理器粘贴时内存 / 并发流爆炸。
+pub const LIST_DIR_RECURSIVE_MAX_ENTRIES: u32 = 10_000;
+/// 递归列目录最大深度（根目录深度 1；`0` 视作无穷大）。防符号链接环 / 病态深树；常见「复制项目树」
+/// 远不及此。深层相对路径还会撞 Windows `MAX_PATH=260`，descriptor 端对超 259 的项另行剔除。
+pub const LIST_DIR_RECURSIVE_MAX_DEPTH: u32 = 20;
+
+/// 文件块字节在 JSON 里的 base64 编解码（`#[serde(with = "b64")]`）。原始 `Vec<u8>` 经 serde
+/// 会序列化成 JSON 数字数组（每字节形如 `123,` ≈ 4 字符）、膨胀约 4 倍；base64 仅膨胀 ~1.33x，
+/// 等量数据传输量降到约 1/3、接近原始二进制。app / server 对此无感知（字段仍是 `Vec<u8>`，
+/// 服务端继续盲转 [`serde_json::Value`]）。
+mod b64 {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// `Vec<u8>` → base64 字符串。
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    /// base64 字符串 → `Vec<u8>`（非法 base64 回 serde 自定义错误）。
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
 
 impl RemoteFrame {
     /// 序列化为不透明 JSON 值，包进 [`RemoteC2S::Relay`] / [`RemoteS2C::Relay`]。
@@ -572,11 +659,13 @@ mod tests {
                         path: "C:\\Users\\hf\\sub".into(),
                         name: "sub".into(),
                         is_dir: true,
+                        size: 0,
                     },
                     DirEntry {
                         path: "C:\\Users\\hf\\a.txt".into(),
                         name: "a.txt".into(),
                         is_dir: false,
+                        size: 1234,
                     },
                 ],
                 overflow: 3,
@@ -667,6 +756,107 @@ mod tests {
             let back = RemoteFrame::from_value(&v).expect("from_value");
             assert_eq!(back, frame);
         }
+    }
+
+    #[test]
+    fn list_dir_recursive_帧经value往返() {
+        // 片8 目录递归：请求 + 成功（DFS 嵌套序：父目录项在子项前 + 空目录单独成项）+
+        // 截断 + 错误 四场景的 value 往返。
+        let frames = vec![
+            RemoteFrame::ListDirRecursive {
+                req_id: 7,
+                path: "C:\\proj".into(),
+                show_hidden: false,
+                max_depth: LIST_DIR_RECURSIVE_MAX_DEPTH,
+                max_entries: LIST_DIR_RECURSIVE_MAX_ENTRIES,
+            },
+            RemoteFrame::ListDirRecursiveResult {
+                req_id: 7,
+                path: "C:\\proj".into(),
+                // DFS 序：sub/ 目录项在其子项 sub/a.txt 之前；empty/ 空目录单独成项。
+                entries: vec![
+                    RecursiveDirEntry {
+                        rel_path: "sub".into(),
+                        path: "C:\\proj\\sub".into(),
+                        is_dir: true,
+                        size: 0,
+                    },
+                    RecursiveDirEntry {
+                        rel_path: "sub/a.txt".into(),
+                        path: "C:\\proj\\sub\\a.txt".into(),
+                        is_dir: false,
+                        size: 1234,
+                    },
+                    RecursiveDirEntry {
+                        rel_path: "empty".into(),
+                        path: "C:\\proj\\empty".into(),
+                        is_dir: true,
+                        size: 0,
+                    },
+                    RecursiveDirEntry {
+                        rel_path: "root.txt".into(),
+                        path: "C:\\proj\\root.txt".into(),
+                        is_dir: false,
+                        size: 9,
+                    },
+                ],
+                truncated: false,
+                err: None,
+            },
+            RemoteFrame::ListDirRecursiveResult {
+                req_id: 8,
+                path: "C:\\big".into(),
+                entries: vec![RecursiveDirEntry {
+                    rel_path: "x.bin".into(),
+                    path: "C:\\big\\x.bin".into(),
+                    is_dir: false,
+                    size: 1,
+                }],
+                truncated: true,
+                err: None,
+            },
+            RemoteFrame::ListDirRecursiveResult {
+                req_id: 9,
+                path: "C:\\nope".into(),
+                entries: vec![],
+                truncated: false,
+                err: Some(FsErr::PermissionDenied),
+            },
+        ];
+        for frame in frames {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn list_dir_recursive_满载单帧不超上限() {
+        // 上限自洽：MAX_ENTRIES 项的应答序列化后应远小于 server 4 MiB 单帧上限。
+        let entries: Vec<RecursiveDirEntry> = (0..LIST_DIR_RECURSIVE_MAX_ENTRIES)
+            .map(|i| RecursiveDirEntry {
+                rel_path: format!("dir{}/sub{}/file{i}.dat", i % 64, i % 8),
+                path: format!("C:\\root\\dir{}\\sub{}\\file{i}.dat", i % 64, i % 8),
+                is_dir: false,
+                size: u64::from(i),
+            })
+            .collect();
+        let frame = RemoteFrame::ListDirRecursiveResult {
+            req_id: 1,
+            path: "C:\\root".into(),
+            entries,
+            truncated: true,
+            err: None,
+        };
+        let v = frame.to_value().expect("to_value");
+        let json = serde_json::to_string(&v).expect("序列化");
+        // 4 MiB 单帧上限（server ws.rs MAX_WS_MESSAGE）。留足余量。
+        assert!(
+            json.len() < 4 * 1024 * 1024,
+            "满载 {} 项 JSON {} 字节，超 4 MiB 帧上限",
+            LIST_DIR_RECURSIVE_MAX_ENTRIES,
+            json.len()
+        );
     }
 
     #[test]

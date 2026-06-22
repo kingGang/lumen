@@ -45,6 +45,9 @@ winit = "0.30"
 wgpu = "29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 文件传输块在 JSON 里 base64 编码（lumen-protocol remote.rs 的 b64 mod），
+# 避免 Vec<u8> 序列化成数字数组膨胀 ~4x；服务端仍盲转 Value，无感知。
+base64 = "0.22"
 glyphon = "0.11"
 pollster = "0.4"
 # egui 三件套版本必须一致（0.34 → wgpu 29 / winit 0.30，与现有渲染栈同源）。
@@ -76,7 +79,49 @@ windows-sys = { version = "0.61", features = [
     # 最大化越界修复（第十轮问题1）：MonitorFromWindow / GetMonitorInfoW /
     # MONITORINFO / HMONITOR，用于计算最大化时窗口超出工作区的越界量。
     "Win32_Graphics_Gdi",
+    # 系统文件剪贴板（clipboard_files.rs）：文件树复制/粘贴接入 Windows CF_HDROP，
+    # 与资源管理器及任意应用互通。DataExchange = OpenClipboard/SetClipboardData/
+    # GetClipboardData/EmptyClipboard/IsClipboardFormatAvailable；Ole = CF_HDROP 常量；
+    # Memory = GlobalAlloc/GlobalLock/GlobalFree 构造 DROPFILES。DragQueryFileW/DROPFILES/
+    # HDROP 在已启用的 Win32_UI_Shell。
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
 ] }
+
+# 远程虚拟文件剪贴板（virtual_files.rs，M5.3 part3c-2 片6）：自定义 COM IDataObject +
+# 延迟渲染，让「远程复制」的文件在资源管理器/桌面 Ctrl+V 时按需从被控端下载（类似
+# WinSCP 拖拽下载）。windows-sys 是纯 FFI、无法实现 COM server（手写 vtable/IUnknown
+# 引用计数几百行 unsafe），故引 windows crate 用 #[implement] 宏；与 windows-sys 0.61
+# 同代并存。仅 Windows 客户端用，server 不依赖。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # IDataObject / IStream / FORMATETC / STGMEDIUM / IEnumFORMATETC / TYMED / DATADIR。
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    # OleInitialize / OleSetClipboard / OleFlushClipboard / OleIsCurrentClipboard /
+    # IDataObjectAsyncCapability（异步数据对象，避免大文件阻塞资源管理器）。
+    "Win32_System_Ole",
+    # RegisterClipboardFormatW（CFSTR_FILEDESCRIPTORW / CFSTR_FILECONTENTS /
+    # CFSTR_PREFERREDDROPEFFECT 是注册型格式，非预定义常量）。
+    "Win32_System_DataExchange",
+    # GlobalAlloc / GlobalLock / GlobalUnlock 构造 FILEGROUPDESCRIPTORW 的 HGLOBAL。
+    "Win32_System_Memory",
+    # STGMEDIUM / STGMEDIUM_0 / IDataObject_Impl 在 windows 0.61 gated 于 Gdi（其 union 含
+    # HBITMAP / HENHMETAFILE 等 GDI 句柄）+ Com_StructuredStorage。
+    "Win32_Graphics_Gdi",
+    # FILEGROUPDESCRIPTORW / FILEDESCRIPTORW（文件描述符结构）。
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    # 专用 STA 线程消息泵：GetMessageW / TranslateMessage / DispatchMessageW / MSG /
+    # PostThreadMessageW / WM_* 常量。
+    "Win32_UI_WindowsAndMessaging",
+    # GetCurrentThreadId（OLE 线程把自身 id 报回 UI 线程供 PostThreadMessageW）。
+    "Win32_System_Threading",
+] }
+# COM server：`#[implement]` 宏展开引用 windows_core crate，须显式依赖使其在 crate root 可见
+# （与 windows 0.61 同版）。
+windows-core = "0.61"
 
 # 背景图片解码（P13）：纯 CPU 解码、不依赖系统图形库，支持 png/jpeg/webp/bmp。
 # default-features = false 只开必要格式，避免引入不必要的编解码器代码。

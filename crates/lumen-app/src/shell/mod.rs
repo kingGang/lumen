@@ -316,8 +316,12 @@ pub struct ShellOutput {
     pub remote_fetch_open: Option<String>,
     /// 控制端远程树：点了「刷新」图标的目录节点 id（main 重拉该目录最新内容）。
     pub remote_refresh_dir: Option<usize>,
+    /// 控制端远程树：本帧单击选中的节点 id（main 设 ft.selected → 高亮 + Ctrl+C 下载源）。
+    pub remote_select: Option<usize>,
+    /// 本帧鼠标是否在文件树面板内（main 存到下一帧，作 Ctrl+C/V 快捷键门控）。
+    pub filetree_hovered: bool,
     /// part3c-2 #7：复制文件 / 文件夹到剪贴板 (来源侧, path, name, is_dir)。
-    pub file_copy: Option<(crate::remote_ws::ClipSide, String, String, bool)>,
+    pub file_copy: Option<(crate::remote_ws::ClipSide, String, String, bool, u64)>,
     /// part3c-2 #7：粘贴到某目录 (目标侧, 目录 path)（main 据剪贴板侧 × 目标侧定方向）。
     pub file_paste: Option<(crate::remote_ws::ClipSide, String)>,
     /// part3c-2 #7：覆盖确认模态的本帧选择（main 据此续传 / 跳过 / 取消）。
@@ -448,6 +452,8 @@ pub fn show(
         remote_toggle_hidden: None,
         remote_fetch_open: None,
         remote_refresh_dir: None,
+        remote_select: None,
+        filetree_hovered: false,
         file_copy: None,
         file_paste: None,
         overwrite_choice: None,
@@ -756,8 +762,9 @@ pub fn show(
     let (ft_panel_width, ft_panel_rect, ft_external_drop) = if input.remote_view_active {
         // 远程视图：一律画被控端 Option B 浏览树（只读渲染）。cwd 未到时画占位，绝不回落
         // 本地树（否则点击串扰控制端本机）。交互意图（展开点击 / 显示隐藏 / 复制粘贴）收集到
-        // rout，由 main 闭包后以 &mut state.remote_ws 施加。远程树可粘贴 = 本地侧剪贴板有项（上传）。
-        let can_paste = input.file_clipboard_side == Some(ClipSide::Local);
+        // rout，由 main 闭包后以 &mut state.remote_ws 施加。远程树可粘贴 = 系统剪贴板有文件
+        //（本地复制的文件→上传到被控端；本地复制现走系统剪贴板 CF_HDROP，与资源管理器互通）。
+        let can_paste = crate::clipboard_files::has_files();
         // 是否正在控制设备（占位文案区分「未连接设备」/「等待 cwd」）。
         let controlling = input.remote_session.is_some_and(|sess| {
             matches!(sess.role, lumen_protocol::remote::Role::Controller)
@@ -776,15 +783,19 @@ pub fn show(
         out.remote_toggle_hidden = rout.toggle_hidden;
         out.remote_fetch_open = rout.fetch_open;
         out.remote_refresh_dir = rout.refresh_dir;
+        out.remote_select = rout.select;
+        out.filetree_hovered = rout.hovered;
         // 复制远程项 → 剪贴板 Remote 侧（下载源）；粘贴到远程目录 → Remote 目标（上传，片5）。
         out.file_copy = rout
             .copy_files
-            .map(|(path, name, is_dir)| (ClipSide::Remote, path, name, is_dir));
+            .map(|(path, name, is_dir, size)| (ClipSide::Remote, path, name, is_dir, size));
         out.file_paste = rout.paste_into.map(|dir| (ClipSide::Remote, dir));
         (rout.panel_width, rout.panel_rect, None) // 远程树无拖放
     } else {
-        // 本地树可粘贴 = 远程侧剪贴板有项（下载目标）。
-        let can_paste = input.file_clipboard_side == Some(ClipSide::Remote);
+        // 本地树可粘贴 = 系统剪贴板有文件（资源管理器/Lumen 本地复制 → 本机复制到此目录）
+        // 或 Lumen 内部有远程项（远程复制 → 下载到此目录）。粘贴方向在 main 按目标侧分派。
+        let can_paste = crate::clipboard_files::has_files()
+            || input.file_clipboard_side == Some(ClipSide::Remote);
         let ft = filetree::show(
             root,
             &mut st.filetree,
@@ -795,6 +806,7 @@ pub fn show(
             can_paste,
         );
         out.filetree_width = ft.panel_width;
+        out.filetree_hovered = ft.hovered;
         out.cd_dir = ft.cd_dir;
         out.open_file = ft.open_file;
         out.copy_text = ft.copy_text;
@@ -804,7 +816,8 @@ pub fn show(
             let name = path
                 .file_name()
                 .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-            (ClipSide::Local, path.display().to_string(), name, is_dir)
+            // 本地复制走系统剪贴板 CF_HDROP，不需要 size（恒 0）。
+            (ClipSide::Local, path.display().to_string(), name, is_dir, 0)
         });
         out.file_paste = ft
             .file_paste_dir
