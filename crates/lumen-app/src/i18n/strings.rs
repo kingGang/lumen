@@ -266,6 +266,12 @@ pub struct Strings {
     pub remote_clip_dir_truncated_fmt: &'static str,
     /// 片8：远程目录枚举失败（权限 / 路径不存在 / 空目录）。
     pub remote_clip_dir_failed: &'static str,
+    /// part3d Phase 2：远程新建会话超上限（`REMOTE_MAX_SESSIONS`）。
+    pub remote_session_limit: &'static str,
+    /// part3d Phase 2：拒绝关闭被控端最后一个会话（否则被控端退出）。
+    pub remote_close_last: &'static str,
+    /// part3d Phase 2：远程会话增删操作失败的通用兜底（如目标不存在）。
+    pub remote_op_failed: &'static str,
     /// 本机复制粘贴（local→local）开始的 toast。
     pub local_copy_started: &'static str,
     /// 本机复制粘贴完成的 toast（`{0}` 完成 / `{1}` 跳过 / `{2}` 出错；走 fmt3，须用索引占位）。

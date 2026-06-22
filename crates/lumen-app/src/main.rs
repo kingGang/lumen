@@ -115,6 +115,15 @@ const REMOTE_INPUT_ARBITRATION: std::time::Duration = std::time::Duration::from_
 /// 镜像 `Terminal` 复用窗格同款 wgpu 渲染器画进此 id 的离屏纹理（上色/属性/光标）。
 const MIRROR_OFFSCREEN_ID: session::SessionId = u64::MAX;
 
+/// part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
+/// 变化即重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。
+type MirrorSig = (
+    session::TabId,
+    Vec<(session::SessionId, u16, u16)>,
+    u32,
+    Option<u32>,
+);
+
 /// 从 PNG 字节流解码并构造 winit 窗口图标。
 ///
 /// 解码失败（格式损坏、尺寸越界）时返回 `None` 并打印 warn，
@@ -603,9 +612,10 @@ struct AppState {
     remote: remote::RemoteState,
     /// M5.3 远程控制 WS 引擎（配对 / 会话 / 数据面中继；part2a 引擎，UI part2b）。
     remote_ws: remote_ws::RemoteWs,
-    /// M5.3 part3a 被控端镜像源标识 `(焦点窗格 id, 行, 列)`：变化（会话起始 / resize /
-    /// 切焦点 / 切 tab）即重发尺寸 + 整屏快照。被控期间外为 None。
-    mirror_src: Option<(session::SessionId, usize, usize)>,
+    /// M5.3 part3d 被控端镜像源签名：订阅会话的 `(tab_id, 各窗格(id,行,列), 焦点下标, 最大化下标)`。
+    /// 变化（订阅切换 / 窗格增删 / 任一窗格 resize / 切焦点 / 最大化翻转 / 分隔条拖动改尺寸）即
+    /// 重发全部窗格整屏快照 + 布局（`SubscriptionStarted`）。被控期间外为 None。
+    mirror_src: Option<MirrorSig>,
     /// M5.3 part3d 被控端上次发给控制端的历史边界 `(base, screen_top)`：实时输出推进
     /// 边界时变化才重发 `HistoryBounds`，使控制端 `screen_top` 近实时——否则控制端首次
     /// 上滚回看会锚到会话起始的陈旧屏位、跳到很旧的历史而非当前屏上方。
@@ -613,8 +623,6 @@ struct AppState {
     /// M5.3 被控端远程视口覆盖 `(行, 列)`：被控期间焦点窗格按此 resize（SSH 式跟随
     /// 控制端视图尺寸），覆盖自身窗口尺寸；非被控时 None（恢复窗口尺寸）。
     remote_viewport: Option<(usize, usize)>,
-    /// M5.3 控制端上次发给被控端的视口尺寸 `(行, 列)`：变化才重发，避免每帧刷。
-    mirror_viewport_sent: Option<(u16, u16)>,
     /// M5.3 part4b 控制端镜像区物理像素矩形 `(x, y, w, h)`：仅控制中+远程视图时为
     /// Some（每帧由终端区矩形换算），供鼠标命中→镜像选区的像素↔单元格换算。
     mirror_rect_px: Option<(f32, f32, f32, f32)>,
@@ -982,6 +990,16 @@ impl AppState {
         if !self.remote_ws.is_controlling() {
             self.pending_paste = None;
         }
+        // part3d 控制端：进入远程视图且尚未订阅任何会话 → 自动订阅列表首个，使镜像立即有内容
+        // （否则用户须先手动点列表项；首个=被控端侧栏顺序首位）。订阅后本分支不再触发。
+        if self.remote_ws.is_controlling()
+            && self.settings.layout.view_mode
+            && self.remote_ws.subscribed_tab().is_none()
+        {
+            if let Some(first) = self.remote_ws.remote_tabs().first().map(|t| t.id) {
+                self.remote_ws.subscribe_tab(first);
+            }
+        }
         // 被控端：执行控制端转发来的远程输入（本地输入优先仲裁）。
         let mut applied = false;
         let remote_input = self.remote_ws.take_input();
@@ -1003,49 +1021,168 @@ impl AppState {
                 applied = true;
             }
         }
-        // 被控端：焦点窗格 (id,行,列) 变化（会话起始 / resize / 切焦点 / 切 tab）即
-        // 重发尺寸 + 整屏 VT 快照（控制端 advance 重放得起始整屏）。
+        // 被控端：part3d 多会话镜像——推会话列表 + 按控制端订阅的会话推焦点窗格快照
+        // （被控端自身焦点不动，需求 c/e）。
         let controlled = matches!(
             self.remote_ws.session.as_ref().map(|s| s.role),
             Some(lumen_protocol::remote::Role::Controlled)
         );
         if controlled {
-            let ti = self.active_tab;
-            {
-                let pane = self.tabs[ti].focused_pane();
-                let g = pane.term.grid();
-                let key = (pane.id, g.rows(), g.cols());
-                // 当前历史边界（screen_top 随实时输出推进而增长）。
-                let screen_top = g.absolute_cursor_line().saturating_sub(g.cursor.row as u64);
-                let base = screen_top.saturating_sub(g.scrollback_len() as u64);
-                if self.mirror_src != Some(key) {
-                    // 焦点窗格 (id,行,列) 变化：重发尺寸 + 整屏快照 + 历史边界。
-                    let snap = remote_mirror::screen_snapshot_vt(&pane.term);
-                    self.mirror_src = Some(key);
-                    self.remote_ws.send_resize(key.1 as u16, key.2 as u16);
-                    self.remote_ws.send_output(&snap);
-                    self.remote_ws.send_history_bounds(base, screen_top);
-                    self.mirror_bounds_sent = Some((base, screen_top));
-                } else if self.mirror_bounds_sent != Some((base, screen_top)) {
-                    // 同一窗格、实时输出推进了边界：刷新控制端 screen_top（变化才发），
-                    // 使其首次上滚回看锚到当前屏上方、而非会话起始陈旧屏位。
-                    self.remote_ws.send_history_bounds(base, screen_top);
-                    self.mirror_bounds_sent = Some((base, screen_top));
+            // part3d Phase 2（需求 d）：先执行控制端的远程增删会话请求，使本帧 tab 列表即时反映。
+            for req_id in self.remote_ws.take_new_tab_reqs() {
+                if self.tabs.len() >= lumen_protocol::remote::REMOTE_MAX_SESSIONS as usize {
+                    self.remote_ws.send_new_tab_result(
+                        req_id,
+                        None,
+                        Some(lumen_protocol::remote::RemoteOpErr::LimitReached),
+                    );
+                } else if let Some(new_id) = self.new_tab_unfocused() {
+                    self.persist_sessions(); // 不夺焦变体不落盘，结构性变更须显式落盘。
+                    self.remote_ws.send_new_tab_result(req_id, Some(new_id), None);
+                } else {
+                    self.remote_ws.send_new_tab_result(
+                        req_id,
+                        None,
+                        Some(lumen_protocol::remote::RemoteOpErr::Io),
+                    );
                 }
             }
-            // part3d：应答控制端回看请求——按绝对行号序列化焦点窗格历史行回传。
+            for (req_id, tab_id) in self.remote_ws.take_close_tab_reqs() {
+                if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
+                    if self.tabs.len() <= 1 {
+                        // 拒绝关被控端最后一个会话：否则 close_tab 触发被控端退出、会话骤断。
+                        log::warn!("拒绝远程关闭被控端最后一个会话 tab_id={tab_id}");
+                        self.remote_ws.send_close_tab_result(
+                            req_id,
+                            tab_id,
+                            Some(lumen_protocol::remote::RemoteOpErr::Io),
+                        );
+                    } else {
+                        // 非最后一个 → close_tab 必返回 false（不退出）。关被控端当前焦点 tab 时
+                        // close_tab 内部会切到邻位（焦点必须落到存活 tab，无法避免）；关后台 tab 不扰焦。
+                        let _ = self.close_tab(idx);
+                        self.remote_ws.send_close_tab_result(req_id, tab_id, None);
+                    }
+                } else {
+                    self.remote_ws.send_close_tab_result(
+                        req_id,
+                        tab_id,
+                        Some(lumen_protocol::remote::RemoteOpErr::NotFound),
+                    );
+                }
+            }
+            // part3d：推会话(tab)列表 + 概览状态（K6 去重，变化才发；busy 是布尔判定不含
+            // spinner 字形、不刷链路）。
+            let tab_states: Vec<lumen_protocol::remote::TabState> = self
+                .tabs
+                .iter()
+                .map(|t| lumen_protocol::remote::TabState {
+                    id: t.id,
+                    name: t.display_name(),
+                    path: t.cwd_path(),
+                    busy: t.is_busy(),
+                    unseen: t.has_unseen(),
+                    pane_count: t.panes.len() as u32,
+                })
+                .collect();
+            self.remote_ws.push_tab_list(tab_states);
+            // 订阅目标刚变（含重订同一会话）→ 复位 mirror_src 强制重发 SubscriptionStarted，
+            // 否则重订同一会话因窗格 key 未变不重发、控制端镜像空白。
+            if self.remote_ws.take_sub_dirty() {
+                self.mirror_src = None;
+            }
+            // part3d Phase 3：把控制端订阅会话的**全部窗格**快照 + 布局推过去（几何签名变 或
+            // 刚订阅 → 发 SubscriptionStarted 含各窗格整屏快照 + 行列权重 + 最大化；签名未变、仅焦点
+            // 窗格边界推进 → 刷 HistoryBounds 供焦点/单窗格回看）。被控端自身焦点不动（需求 c/e）。
+            if let Some(sub_id) = self.remote_ws.sub_target() {
+                if let Some(ti) = self.tabs.iter().position(|t| t.id == sub_id) {
+                    // 廉价几何签名（不含整屏快照）：各窗格 (id,行,列) + 焦点下标 + 最大化下标。
+                    let sig: MirrorSig = {
+                        let tab = &self.tabs[ti];
+                        (
+                            tab.id,
+                            tab.panes
+                                .iter()
+                                .map(|p| {
+                                    let g = p.term.grid();
+                                    (p.id, g.rows() as u16, g.cols() as u16)
+                                })
+                                .collect(),
+                            tab.focused as u32,
+                            tab.maximized.map(|m| m as u32),
+                        )
+                    };
+                    // 焦点窗格当前历史边界（HistoryBounds 刷新，焦点/单窗格回看锚点跟实时推进）。
+                    let (fbase, fscreen_top) = {
+                        let g = self.tabs[ti].focused_pane().term.grid();
+                        let st = g.absolute_cursor_line().saturating_sub(g.cursor.row as u64);
+                        (st.saturating_sub(g.scrollback_len() as u64), st)
+                    };
+                    if self.mirror_src.as_ref() != Some(&sig) {
+                        // 几何变 / 刚订阅：发全部窗格整屏快照 + 布局。
+                        let panes: Vec<lumen_protocol::remote::PaneSnapshot> = self.tabs[ti]
+                            .panes
+                            .iter()
+                            .map(|p| {
+                                let g = p.term.grid();
+                                let st =
+                                    g.absolute_cursor_line().saturating_sub(g.cursor.row as u64);
+                                let base = st.saturating_sub(g.scrollback_len() as u64);
+                                lumen_protocol::remote::PaneSnapshot {
+                                    session_id: p.id,
+                                    rows: g.rows() as u16,
+                                    cols: g.cols() as u16,
+                                    snapshot: remote_mirror::screen_snapshot_vt(&p.term),
+                                    base,
+                                    screen_top: st,
+                                    custom_title: p.custom_title.clone(),
+                                }
+                            })
+                            .collect();
+                        let row_weights = self.tabs[ti].layout.row_weights().to_vec();
+                        let col_weights = self.tabs[ti].layout.col_weights().to_vec();
+                        let maximized = self.tabs[ti].maximized.map(|m| m as u32);
+                        let focused = self.tabs[ti].focused as u32;
+                        self.mirror_src = Some(sig);
+                        self.remote_ws.send_subscription_started(
+                            sub_id,
+                            focused,
+                            panes,
+                            row_weights,
+                            col_weights,
+                            maximized,
+                        );
+                        self.mirror_bounds_sent = Some((fbase, fscreen_top));
+                    } else if self.mirror_bounds_sent != Some((fbase, fscreen_top)) {
+                        self.remote_ws.send_history_bounds(fbase, fscreen_top);
+                        self.mirror_bounds_sent = Some((fbase, fscreen_top));
+                    }
+                } else {
+                    // 订阅会话已不存在（被关）：复位，待控制端改订阅 / 收 TabClosed 回退。
+                    self.mirror_src = None;
+                }
+            } else {
+                self.mirror_src = None;
+            }
+            // part3d：应答控制端回看请求——从**订阅会话**焦点窗格按绝对行号序列化历史行回传。
             // count 上限与控制端请求共用 HISTORY_CHUNK_MAX，避免截断致 inflight 泄漏。
             let reqs = self.remote_ws.take_history_reqs();
-            for (top, count) in reqs {
-                let count = usize::from(count.min(remote_ws::HISTORY_CHUNK_MAX));
-                let pane = self.tabs[ti].focused_pane();
-                let (lines, base, screen_top) =
-                    remote_mirror::history_rows_vt(&pane.term, top, count);
-                self.remote_ws.send_history_rows(top, base, screen_top, lines);
+            if !reqs.is_empty() {
+                if let Some(sub_id) = self.remote_ws.sub_target() {
+                    if let Some(ti) = self.tabs.iter().position(|t| t.id == sub_id) {
+                        for (top, count) in reqs {
+                            let count = usize::from(count.min(remote_ws::HISTORY_CHUNK_MAX));
+                            let pane = self.tabs[ti].focused_pane();
+                            let (lines, base, screen_top) =
+                                remote_mirror::history_rows_vt(&pane.term, top, count);
+                            self.remote_ws.send_history_rows(top, base, screen_top, lines);
+                        }
+                    }
+                }
             }
-            // part3c-2 Option B：焦点窗格 cwd 变即推 RootChanged（替代 Option A 整树快照）；
-            // 控制端据此重置远程树根。cwd 未知（首个提示符前）不推，控制端维持「等待 cwd」。
-            if let Some(cwd) = self.tabs[ti].cwd_path() {
+            // part3c-2 Option B：远程文件树跟随**被控端自身焦点窗格** cwd（需求 1 既有行为，
+            // 与订阅会话解耦——保持已验收语义）。cwd 未知（首个提示符前）不推，控制端维持「等待 cwd」。
+            if let Some(cwd) = self.tabs[self.active_tab].cwd_path() {
                 self.remote_ws.send_root_changed(cwd);
             }
             // part3c-2 Option B 文件服务：控制端按需 ListDir → 被控端后台读盘 → 回包发回。
@@ -2624,6 +2761,16 @@ impl AppState {
     /// 新建 tab（单窗格，继承当前 shell 配置）并切换为激活。
     /// 行列数先取焦点窗格网格，下一帧按实际窗格矩形校正。
     fn new_tab(&mut self) {
+        if self.new_tab_unfocused().is_some() {
+            // activate 内部会落盘会话快照（新建是结构性变更）。
+            self.activate(self.tabs.len() - 1);
+        }
+    }
+
+    /// 新建一个会话(tab)但**不切换焦点 / 不 activate**，返回新 tab id。供 part3d 远程
+    /// [`RemoteFrame::NewTab`]：控制端远程建会话**不得移动被控端焦点**（需求 e「互不同步」）。
+    /// 不在此落盘——调用方按需 [`Self::persist_sessions`]（本地 [`Self::new_tab`] 走 activate 落盘）。
+    fn new_tab_unfocused(&mut self) -> Option<TabId> {
         let g = self.focused_pane().term.grid();
         let (rows, cols) = (g.rows(), g.cols());
         let id = self.next_session_id;
@@ -2649,10 +2796,12 @@ impl AppState {
                     layout: PaneLayout::uniform(1),
                     maximized: None,
                 });
-                // activate 内部会落盘会话快照（新建是结构性变更）。
-                self.activate(self.tabs.len() - 1);
+                Some(tab_id)
             }
-            Err(e) => error!("新建会话失败: {e:#}"),
+            Err(e) => {
+                error!("新建会话失败: {e:#}");
+                None
+            }
         }
     }
 
@@ -3530,6 +3679,22 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
             }
         }
         Notice::ClipDirFailed => (ToastKind::Warn, s.remote_clip_dir_failed.to_string()),
+        // part3d Phase 2：远程增删会话失败提示（需求 d #11）。
+        Notice::RemoteNewTabFailed(err) => {
+            let text = match err {
+                lumen_protocol::remote::RemoteOpErr::LimitReached => s.remote_session_limit,
+                _ => s.remote_op_failed,
+            };
+            (ToastKind::Warn, text.to_string())
+        }
+        Notice::RemoteCloseTabFailed(err) => {
+            let text = match err {
+                // 被控端用 Io 表示「拒关最后一个会话」（见 main 关闭分支）。
+                lumen_protocol::remote::RemoteOpErr::Io => s.remote_close_last,
+                _ => s.remote_op_failed,
+            };
+            (ToastKind::Warn, text.to_string())
+        }
     }
 }
 
@@ -3954,7 +4119,6 @@ impl App {
             paste_refresh: None,
             filetree_hovered: false,
             remote_viewport: None,
-            mirror_viewport_sent: None,
             mirror_texture: None,
             egui_state,
             egui_renderer,
@@ -4275,16 +4439,22 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         }
                         state.tabs[ti].panes[pi].term.advance(&bytes);
-                        // M5.3 part3a 被控端：被控期间转发**焦点窗格**的 PTY 输出给
-                        // 控制端（控制端喂入镜像 Terminal 复现）。整屏初始快照由
-                        // RedrawRequested 里的 mirror_src 变化触发，先于此实时增量。
+                        // M5.3 part3d 被控端：被控期间转发**控制端订阅会话**的焦点窗格 PTY
+                        // 输出给控制端（带双 id；与被控端自身焦点解耦——需求 c/e）。整屏初始
+                        // 快照由 pump_remote 的 mirror_src 变化触发 SubscriptionStarted，先于
+                        // 此实时增量（D3 保序）。订阅会话可为被控端后台 tab，其窗格照常 drain。
                         if matches!(
                             state.remote_ws.session.as_ref().map(|s| s.role),
                             Some(lumen_protocol::remote::Role::Controlled)
-                        ) && ti == state.active_tab
-                            && pi == state.tabs[ti].focused
-                        {
-                            state.remote_ws.send_output(&bytes);
+                        ) {
+                            if let Some(sub_id) = state.remote_ws.sub_target() {
+                                // Phase 3：转发订阅会话的**全部窗格**（双路 tee）——非焦点窗格亦推，
+                                // 控制端按 session_id 路由到对应镜像。后台窗格受 BG_DRAIN_CAP 节流（D7）。
+                                if state.tabs[ti].id == sub_id {
+                                    let session_id = state.tabs[ti].panes[pi].id;
+                                    state.remote_ws.send_output_with_id(sub_id, session_id, &bytes);
+                                }
+                            }
                         }
                         got_data[k] = true;
 
@@ -5886,16 +6056,33 @@ impl ApplicationHandler<PtyWake> for App {
                 // 图标纹理（侧栏隐藏时 probe 内部直接跳过，零开销）。
                 state.probe_session_icons(Instant::now());
                 state.ensure_session_icon_textures();
-                let entries: Vec<shell::TabItem> = state
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        // 两行条目（F7②样式）：名称行=自定义名/cwd 尾目录名/
-                        // 会话 N（Tab::display_name），路径行=完整 cwd
-                        // （Tab::cwd_path，未知为 None 时只画名称行）；图标=前台
-                        // 运行程序 exe 图标（查不到为 None，回退自绘字形）。
-                        shell::TabItem {
+                // part3d（K3）：远程视图 + 控制中 → 会话栏整组替换为被控端的远程会话列表
+                // （active = 当前订阅会话；点击切换 = 订阅，由下方 activate 分流）。否则画本地
+                // tab 列表（原 F7② 两行条目：名称行 + 路径行 + 前台程序 exe 图标）。
+                let entries: Vec<shell::TabItem> = if state.is_mirror_active() {
+                    let sub = state.remote_ws.subscribed_tab();
+                    state
+                        .remote_ws
+                        .remote_tabs()
+                        .iter()
+                        .map(|t| shell::TabItem {
+                            id: t.id,
+                            name: t.name.clone(),
+                            path: t.path.clone(),
+                            active: Some(t.id) == sub,
+                            unseen: t.unseen,
+                            pane_count: t.pane_count as usize,
+                            // 远程会话图标不上线（egui 纹理不可序列化），回退自绘终端字形。
+                            icon: None,
+                            busy: t.busy,
+                        })
+                        .collect()
+                } else {
+                    state
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| shell::TabItem {
                             id: t.id,
                             name: t.display_name(),
                             path: t.cwd_path(),
@@ -5904,9 +6091,9 @@ impl ApplicationHandler<PtyWake> for App {
                             pane_count: t.panes.len(),
                             icon: state.session_icon_for(t.id),
                             busy: t.is_busy(),
-                        }
-                    })
-                    .collect();
+                        })
+                        .collect()
+                };
                 let tab = &state.tabs[state.active_tab];
                 // 本帧布局对应的窗格 id 快照：下方动作（关 tab/增删窗
                 // 格）可能改变结构，矩形与窗格的对应关系以此校验。
@@ -6764,7 +6951,13 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // —— 侧栏动作：切换 / 重命名 / 新建 / 关闭（tab 级）——
                 if let Some(id) = shell_out.activate {
-                    if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
+                    if state.is_mirror_active() {
+                        // part3d（K3）：远程视图点击列表项 = 订阅查看该被控端会话（被控端焦点
+                        // 不动）；非重复订阅才发（subscribe_tab 内含回看复位）。
+                        if state.remote_ws.subscribed_tab() != Some(id) {
+                            state.remote_ws.subscribe_tab(id);
+                        }
+                    } else if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
                         if idx != state.active_tab {
                             state.activate(idx);
                         }
@@ -6796,27 +6989,17 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.end_remote_session {
                     state.remote_ws.end_session();
                 }
-                // M5.3 控制端视口跟随（SSH 式）：控制中（远程视图）按自己终端区尺寸
-                // （同款 grid_size_for）算行列，请求被控端 resize 到此 → 被控端 shell
-                // 按控制端尺寸重排 → 镜像满屏渲染、零 letterbox。变化才重发。
+                // M5.3 part3d：多会话模型下**不再做 SSH 式视口跟随**——订阅会话可能是被控端
+                // 后台 tab，强制其 resize 到控制端视图会扰动被控端正在用的别处 shell（违背
+                // 「被控端焦点不动」），且后台 tab 不在被控端每帧 resize 循环内、retarget 代价大。
+                // 改为镜像按被控端实际网格渲染、Image 缩放铺满（离屏尺寸取镜像自然像素，见镜像
+                // 渲染段）。此处仅记录镜像区物理像素矩形，供鼠标命中→镜像选区换算（part4b）。
                 if state.is_mirror_active() {
                     let ppp = state.egui_ctx.pixels_per_point();
                     let tr = shell_out.term_rect;
-                    let pw = (tr.width() * ppp).max(1.0) as u32;
-                    let ph = (tr.height() * ppp).max(1.0) as u32;
-                    let (rows, cols) = state.renderer.grid_size_for(pw, ph);
-                    if rows > 0 && cols > 0 {
-                        let dims = (rows as u16, cols as u16);
-                        if state.mirror_viewport_sent != Some(dims) {
-                            state.mirror_viewport_sent = Some(dims);
-                            state.remote_ws.send_viewport_resize(dims.0, dims.1);
-                        }
-                    }
-                    // part4b：记录镜像区物理像素矩形，供鼠标命中→镜像选区换算。
                     state.mirror_rect_px =
                         Some((tr.min.x * ppp, tr.min.y * ppp, tr.width() * ppp, tr.height() * ppp));
                 } else {
-                    state.mirror_viewport_sent = None;
                     state.mirror_rect_px = None;
                 }
                 // 远程控制一次性通知 → toast（弹窗在 egui 帧后 push，需请求重绘）。
@@ -6865,10 +7048,20 @@ impl ApplicationHandler<PtyWake> for App {
                     state.persist_sessions();
                 }
                 if shell_out.new_session {
-                    state.new_tab();
+                    if state.is_mirror_active() {
+                        // part3d（需求 d）：远程视图「＋」= 请被控端新建会话（被控端焦点不动），
+                        // 成功后自动订阅查看（见 apply_relay 的 NewTabResult）。
+                        state.remote_ws.new_remote_tab();
+                    } else {
+                        state.new_tab();
+                    }
                 }
                 if let Some(id) = shell_out.close {
-                    if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
+                    if state.is_mirror_active() {
+                        // part3d（需求 d）：远程视图关会话 = 请被控端关该会话；列表 / 订阅回退
+                        // 由后续 TabListSnapshot 驱动。
+                        state.remote_ws.close_remote_tab(id);
+                    } else if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
                         if state.close_tab(idx) {
                             info!("最后一个会话已关闭，退出应用");
                             event_loop.exit();
@@ -7984,9 +8177,8 @@ impl ApplicationHandler<PtyWake> for App {
                     state.last_term_render_at = Some(render_t0);
                 }
 
-                // —— M5.3 part3b 控制端镜像渲染：把镜像 Terminal 画进保留 id 的离屏
-                // 纹理（wgpu 上色，复用窗格渲染器；控制端主题就地解析颜色）。离屏尺寸
-                // 跟镜像网格×cell，shell 以 Image 铺满终端区（SSH 视口下网格≈终端区）。
+                // —— M5.3 part3b/part3d 控制端镜像渲染：把镜像 Terminal 画进保留 id 的离屏
+                // 纹理（wgpu 上色，复用窗格渲染器；控制端主题就地解析颜色）。
                 if state.is_mirror_active() {
                     // part3d：渲染源由 RemoteWs 决定——跟随态借 live 镜像 + 真实光标，
                     // 回看态借按需填好的历史窗口 scratch + 隐藏光标。
@@ -7994,13 +8186,17 @@ impl ApplicationHandler<PtyWake> for App {
                         let cur = frame.cursor;
                         let term = frame.term;
                         let sel = frame.selection; // part4b 镜像选区高亮
-                        // 离屏尺寸用控制端**终端区像素**（与窗格同款，含 padding）——
-                        // renderer 渲染时有边距，若按裸网格×cell 定尺寸会把「网格+padding」
-                        // 挤出纹理、底行被裁；用 term_rect 像素则网格+padding 正好画满。
-                        let ppp = state.egui_ctx.pixels_per_point();
-                        let tr = shell_out.term_rect;
-                        let w = ((tr.width() * ppp).round() as u32).max(1);
-                        let h = ((tr.height() * ppp).round() as u32).max(1);
+                        // part3d：离屏尺寸取**镜像网格的自然像素**（网格×cell + 四周 padding），
+                        // 使被控端整屏完整渲染进纹理、不裁底行（被控端屏比控制端大时尤其关键）；
+                        // shell 端 Image 再缩放铺满终端区（替代已移除的 SSH 视口跟随）。
+                        let (cell_w, cell_h) = state.renderer.cell_size();
+                        let pad = state.renderer.padding();
+                        let (grows, gcols) = {
+                            let g = term.grid();
+                            (g.rows(), g.cols())
+                        };
+                        let w = ((gcols as f32 * cell_w + pad * 2.0).round() as u32).max(1);
+                        let h = ((grows as f32 * cell_h + pad * 2.0).round() as u32).max(1);
                         // 尺寸变化时重建离屏并重绑 egui 纹理（句柄不变）。
                         if state.renderer.ensure_offscreen(MIRROR_OFFSCREEN_ID, w, h) {
                             if let (Some(view), Some(tex)) = (

@@ -87,6 +87,17 @@ pub enum EndReason {
     Replaced,
 }
 
+/// 会话(tab)唯一标识——镜像 `lumen-app` 侧 `session::TabId`（自增 `u64`、关闭后不复用）。
+/// 协议 crate 不依赖 app，故在此独立别名；两端同为 `u64`，边界零转换。**part3d 起数据面按
+/// `(TabId, SessionId)` 双 id 路由**（见 [`RemoteFrame::OutputWithId`]），不再用无 id 的
+/// [`RemoteFrame::Output`]。
+pub type TabId = u64;
+
+/// 窗格(pane)唯一标识——镜像 app 侧 `session::SessionId`（每个分屏窗格一个稳定 id、关窗格后
+/// `Vec<Session>` 下标会重排但 id 不变不复用）。**绝不用窗格下标(渲染序)做路由 / 缓存键**
+/// （part3d D1：关窗格令下标重排，用下标会静默错位内容）；下标仅作渲染顺序。
+pub type SessionId = u64;
+
 /// 数据面帧（控制端↔被控端，经服务端**盲转**；服务端不解释内容）。
 ///
 /// part1 仅含 [`RemoteFrame::Echo`] 占位；**part3a 终端镜像**采用「VT 字节流转发」
@@ -105,7 +116,10 @@ pub enum EndReason {
 /// 自持展开态（不同步）；文件读取 [`FetchReq`](RemoteFrame::FetchReq)（分块 + ACK 背压，打开 / 下载）；
 /// 文件写入 [`PutBegin`](RemoteFrame::PutBegin)（两阶段 + 撞名决议 + 背压，上传）。被控端只服务无
 /// 状态读/写原语，所有递归 / 复制粘贴 / 打开由控制端编排。路径全程不透明字符串往返、被控端解释。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// part3d Phase 3 起 [`SubscriptionStarted`](RemoteFrame::SubscriptionStarted) 携多窗格布局权重
+/// （`f32`），故本枚举**不再 `derive(Eq)`**（`f32` 无 `Eq`）；`PartialEq` 仍在（往返测试用）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RemoteFrame {
     /// 回环测试帧：原样转发给对端，用于 part1 验证中继通路连通。
     Echo(String),
@@ -354,6 +368,134 @@ pub enum RemoteFrame {
         /// 失败原因。
         err: Option<FsErr>,
     },
+    // ── part3d 多会话 × 多窗格镜像 ───────────────────────────────────────────────
+    //    控制端镜像被控端「所有会话(tab) + 每会话多窗格(pane)」：会话列表/状态帧（被控端推、
+    //    随增删实时更新）+ 订阅切换（控制端选看某会话，被控端焦点不动）+ `(TabId,SessionId)`
+    //    双 id 路由的内容帧 + 远程增删会话。**`pane_index` 仅渲染序、绝不做路由/缓存键**（D1）。
+    //    旧无 id 的 [`Output`](RemoteFrame::Output) / [`Resize`](RemoteFrame::Resize) 于 Phase 1
+    //    一次性切到带 id 帧（K2：`Welcome.min_supported_version` 版本门，不双发灰度）。
+    /// 被控端 → 控制端：**全部**会话(tab)列表 + 概览状态（名/路径/忙/未读/窗格数）。控制端进入
+    /// 远程视图 / (重)连后由被控端推一次做基线，之后增量走 [`TabCreated`](RemoteFrame::TabCreated)
+    /// / [`TabClosed`](RemoteFrame::TabClosed) / [`TabUpdated`](RemoteFrame::TabUpdated)。`tabs`
+    /// 顺序即被控端侧栏顺序（控制端按此渲染、不另排序；D6 重连按排序而非 HashMap 迭代序）。
+    TabListSnapshot {
+        /// 会话列表（被控端侧栏顺序）。
+        tabs: Vec<TabState>,
+    },
+    /// 被控端 → 控制端：新建了一个会话(tab)（本地新建 / 远程 [`NewTab`](RemoteFrame::NewTab) 均推）。
+    /// 控制端按 `tab.id` 插入列表（已存在则等价一次 [`TabUpdated`](RemoteFrame::TabUpdated)）。
+    TabCreated {
+        /// 新会话概览。
+        tab: TabState,
+    },
+    /// 被控端 → 控制端：一个会话(tab)已关闭。控制端从列表移除；若正订阅它则按排序回退到邻近
+    /// 会话（part3d Phase 2）。
+    TabClosed {
+        /// 被关会话 id。
+        tab_id: TabId,
+    },
+    /// 被控端 → 控制端：一个会话(tab)概览状态变化（重命名 / cwd 变 / 忙闲翻转 / 未读 / 窗格增删）。
+    /// 携全量 [`TabState`]；被控端按 K6 去重后才发——去重键**排除布局浮点、归一化 spinner 标题**，
+    /// 高频抖动字段不刷链路。
+    TabUpdated {
+        /// 变化后的会话概览。
+        tab: TabState,
+    },
+    /// 控制端 → 被控端：订阅某会话(tab)的内容（点击列表项切换查看）。被控端据此把该会话各窗格
+    /// 输出经 [`OutputWithId`](RemoteFrame::OutputWithId) 推来，**被控端自身焦点不动**（需求 c/e）。
+    /// K5：同一时刻只订阅 1 个——新订阅隐式取代旧的，被控端停推旧会话。被控端先回
+    /// [`SubscriptionStarted`](RemoteFrame::SubscriptionStarted) 带初始整屏快照，再发增量（D3 保序）。
+    SubscribeSession {
+        /// 目标会话 id。
+        tab_id: TabId,
+    },
+    /// 被控端 → 控制端：[`SubscribeSession`](RemoteFrame::SubscribeSession) 应答 + 订阅会话各窗格的
+    /// **初始整屏快照**。`panes[i]` 渲染顺序即下标 `i`（复刻被控端布局：先上排自左向右、再下排），
+    /// 路由键是 [`PaneSnapshot::session_id`]、**非下标**（D1）；`focused` 为焦点窗格在 `panes` 的下标。
+    /// **此帧必先于该会话任何 [`OutputWithId`](RemoteFrame::OutputWithId) 到达**（D3：快照保序，否则
+    /// 增量喂到空镜像错乱）。Phase 1 只回焦点窗格 1 个；**Phase 3 起回全部窗格 + 布局**，控制端据
+    /// `row_weights`/`col_weights`/`maximized` 复刻被控端的 `pane_rects` 几何（网格结构由窗格数推导，
+    /// 两端同一套规则：1=满屏、2=左右、3=左中右、4=上2下2、5=上3下2、6=上3下3）。
+    SubscriptionStarted {
+        /// 被订阅会话 id。
+        tab_id: TabId,
+        /// 焦点窗格在 `panes` 中的下标（渲染序；控制端高亮 / 单窗格镜像取此窗格）。
+        focused: u32,
+        /// 各窗格初始快照（渲染顺序 = 下标：先上排自左向右、再下排）。
+        panes: Vec<PaneSnapshot>,
+        /// 每排高度权重（长度 = 排数；归一化和为 1）。复刻被控端 `PaneLayout::row_weights`。
+        /// `#[serde(default)]`：兼容 Phase 1/2 旧端（无此字段）发来的帧——缺省空，控制端按
+        /// 单窗格降级（取 `panes[focused]`），免「两端必须同一构建」的脆弱性。
+        #[serde(default)]
+        row_weights: Vec<f32>,
+        /// 每排内各列宽度权重（外层 = 排数，内层 = 该排列数）。复刻 `PaneLayout::col_weights`。
+        #[serde(default)]
+        col_weights: Vec<Vec<f32>>,
+        /// 最大化窗格在 `panes` 中的下标（`Some` 时该窗格独占、其余隐藏；复刻被控端 `Tab::maximized`）。
+        #[serde(default)]
+        maximized: Option<u32>,
+    },
+    /// 被控端 → 控制端：带 `(tab_id, session_id)` 双 id 的窗格 PTY 输出（替代无 id 的
+    /// [`Output`](RemoteFrame::Output)）。控制端按 `session_id` 路由到对应镜像 `Terminal::advance`
+    /// （**绝不用窗格下标**，D1）。`data` 走 base64（见 [`b64`]）省 ~3x JSON 膨胀。仅订阅会话的窗格
+    /// 会推（被控端双路 tee：本地焦点 + 订阅会话各窗格 + 输出节流，Phase 3 / D7）。
+    OutputWithId {
+        /// 所属会话 id。
+        tab_id: TabId,
+        /// 所属窗格 id（路由键）。
+        session_id: SessionId,
+        /// 窗格 PTY 输出字节。
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+    },
+    /// 被控端 → 控制端：带 `(tab_id, session_id)` 双 id 的窗格尺寸（替代无 id 的
+    /// [`Resize`](RemoteFrame::Resize)）。**必先于该窗格对应尺寸的 [`OutputWithId`] 到达**，
+    /// 控制端据此 `mirror.resize(rows, cols)`。
+    ResizeWithId {
+        /// 所属会话 id。
+        tab_id: TabId,
+        /// 所属窗格 id（路由键）。
+        session_id: SessionId,
+        /// 行数。
+        rows: u16,
+        /// 列数。
+        cols: u16,
+    },
+    /// 控制端 → 被控端：远程新建一个会话(tab)（需求 d）。被控端新建后回
+    /// [`NewTabResult`](RemoteFrame::NewTabResult)，并向控制端推 [`TabCreated`](RemoteFrame::TabCreated)；
+    /// 会话数已达 [`REMOTE_MAX_SESSIONS`] 时拒绝（`err=Some(LimitReached)`）。
+    NewTab {
+        /// 控制端单调递增请求号（关联应答；0 保留为哨兵无效）。
+        req_id: u64,
+    },
+    /// 被控端 → 控制端：[`NewTab`](RemoteFrame::NewTab) 结果。**`err` 优先于 `tab_id`**：`err=Some`
+    /// 时新建失败、`tab_id` 无意义（应填 `None`）；成功时 `tab_id=Some(新 id)`、`err=None`（控制端
+    /// 据此可自动订阅新会话）。
+    NewTabResult {
+        /// 与请求对齐。
+        req_id: u64,
+        /// 新建成功的会话 id（失败为 `None`）。
+        tab_id: Option<TabId>,
+        /// 失败原因（成功为 `None`；非 `None` 时盖过 `tab_id`）。
+        err: Option<RemoteOpErr>,
+    },
+    /// 控制端 → 被控端：远程关闭指定会话(tab)（需求 d）。被控端关闭后回
+    /// [`CloseTabResult`](RemoteFrame::CloseTabResult) 并推 [`TabClosed`](RemoteFrame::TabClosed)。
+    CloseTab {
+        /// 控制端单调递增请求号。
+        req_id: u64,
+        /// 目标会话 id。
+        tab_id: TabId,
+    },
+    /// 被控端 → 控制端：[`CloseTab`](RemoteFrame::CloseTab) 结果（`err=None` 即已关）。
+    CloseTabResult {
+        /// 与请求对齐。
+        req_id: u64,
+        /// 目标会话 id（原样回带）。
+        tab_id: TabId,
+        /// 失败原因（已关成功为 `None`；如 `tab_id` 不存在回 [`RemoteOpErr::NotFound`]）。
+        err: Option<RemoteOpErr>,
+    },
 }
 
 /// part3c-2 Option B 目录条目（被控端 `read_dir_worker` 产物，控制端只展示 + 原样回传）。
@@ -385,6 +527,62 @@ pub struct RecursiveDirEntry {
     pub is_dir: bool,
     /// 文件字节数（目录为 0）。填 descriptor 的 `FD_FILESIZE`（缺则 0KB bug）。
     pub size: u64,
+}
+
+/// part3d 会话(tab)概览状态（[`TabListSnapshot`](RemoteFrame::TabListSnapshot) /
+/// [`TabCreated`](RemoteFrame::TabCreated) / [`TabUpdated`](RemoteFrame::TabUpdated) 元素）。
+/// 镜像 app 侧 `shell::TabItem` 的**可上线字段**（egui 图标纹理无法上线、不含）。控制端只展示，
+/// 路由 / 订阅用 [`Self::id`]。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabState {
+    /// 会话 id（路由 / 订阅键）。
+    pub id: TabId,
+    /// 名称行（自定义名 > 焦点窗格 cwd 尾目录名 > OSC 标题 > 「会话 N」，恒非空）。
+    pub name: String,
+    /// 路径行（焦点窗格 cwd 完整路径，OSC 9;9 上报）；cwd 未知（首个提示符前）为 `None`。
+    pub path: Option<String>,
+    /// 是否忙（焦点窗格 OSC 标题含 Braille spinner，claude 等 TUI 工作中）。被控端去重时
+    /// 归一化此布尔判定，不让每帧抖动的 spinner 字形刷链路（K6）。
+    pub busy: bool,
+    /// 后台期间任一窗格有未读输出（控制端列表项小圆点）。
+    pub unseen: bool,
+    /// tab 内窗格数（>1 时控制端标「N 格」）。
+    pub pane_count: u32,
+}
+
+/// part3d 窗格(pane)初始快照（[`SubscriptionStarted`](RemoteFrame::SubscriptionStarted) 元素）。
+/// **无 `pane_index` 字段**——渲染顺序即所在 `panes` 数组下标（D1：下标仅渲染序、绝不做路由/
+/// 缓存键）；路由键是 [`Self::session_id`]。`snapshot` 是整屏等效 VT 字节（控制端喂全新镜像
+/// `Terminal::advance` 即复现该屏），随后续 [`OutputWithId`](RemoteFrame::OutputWithId) 增量推进。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSnapshot {
+    /// 窗格 id（路由键，跨增删稳定）。
+    pub session_id: SessionId,
+    /// 行数。
+    pub rows: u16,
+    /// 列数。
+    pub cols: u16,
+    /// 整屏等效 VT 字节（`remote_mirror::screen_snapshot_vt` 产物；base64，见 [`b64`]）。
+    #[serde(with = "b64")]
+    pub snapshot: Vec<u8>,
+    /// 最旧保留行绝对行号（历史回看下界；对齐 [`HistoryBounds`](RemoteFrame::HistoryBounds)）。
+    pub base: u64,
+    /// 可视区首行绝对行号（历史回看锚点）。
+    pub screen_top: u64,
+    /// 窗格自定义名（用户重命名；app 级、不在 VT 流里，故显式带；`None` 走默认标题）。
+    pub custom_title: Option<String>,
+}
+
+/// part3d 远程会话增删操作（[`NewTab`](RemoteFrame::NewTab) / [`CloseTab`](RemoteFrame::CloseTab)）
+/// 的失败原因（机器可读，控制端本地化提示；风格同 [`FsErr`] / [`DenyReason`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteOpErr {
+    /// 会话数已达 [`REMOTE_MAX_SESSIONS`]，拒绝新建（[`NewTab`](RemoteFrame::NewTab)）。
+    LimitReached,
+    /// 目标会话 id 不存在（[`CloseTab`](RemoteFrame::CloseTab) 目标已关 / 从未存在）。
+    NotFound,
+    /// 其它失败（spawn shell 失败等，粗粒度兜底）。
+    Io,
 }
 
 /// 文件系统操作错误（机器可读，控制端本地化提示；风格同 [`DenyReason`] / [`EndReason`]）。
@@ -450,6 +648,12 @@ pub const LIST_DIR_RECURSIVE_MAX_ENTRIES: u32 = 10_000;
 /// 递归列目录最大深度（根目录深度 1；`0` 视作无穷大）。防符号链接环 / 病态深树；常见「复制项目树」
 /// 远不及此。深层相对路径还会撞 Windows `MAX_PATH=260`，descriptor 端对超 259 的项另行剔除。
 pub const LIST_DIR_RECURSIVE_MAX_DEPTH: u32 = 20;
+
+/// part3d 远程可创建会话(tab)总数上限（[`RemoteFrame::NewTab`] 超限回
+/// [`RemoteOpErr::LimitReached`]）：防控制端反复 [`NewTab`](RemoteFrame::NewTab) 在被控端 fork
+/// 出无界 shell（资源耗尽）。32 对真实多会话使用绰绰有余；满载 [`TabListSnapshot`]
+/// （32 × ~600 B）≈ 19 KB << 4 MiB 单帧上限。
+pub const REMOTE_MAX_SESSIONS: u32 = 32;
 
 /// 文件块字节在 JSON 里的 base64 编解码（`#[serde(with = "b64")]`）。原始 `Vec<u8>` 经 serde
 /// 会序列化成 JSON 数字数组（每字节形如 `123,` ≈ 4 字符）、膨胀约 4 倍；base64 仅膨胀 ~1.33x，
@@ -905,5 +1109,180 @@ mod tests {
         };
         assert_eq!(inner, cv);
         assert_eq!(RemoteFrame::from_value(&inner).expect("还原"), chunk);
+    }
+
+    #[test]
+    fn part3d_多会话多窗格帧经value往返() {
+        // part3d 全部新变体的 value 往返（会话列表/状态 + 订阅 + 双 id 内容 + 增删 + 结果）。
+        let frames = vec![
+            RemoteFrame::TabListSnapshot {
+                tabs: vec![
+                    TabState {
+                        id: 0,
+                        name: "会话 1".into(),
+                        path: Some("C:\\proj".into()),
+                        busy: false,
+                        unseen: true,
+                        pane_count: 1,
+                    },
+                    TabState {
+                        id: 3,
+                        name: "build".into(),
+                        path: None,
+                        busy: true,
+                        unseen: false,
+                        pane_count: 4,
+                    },
+                ],
+            },
+            RemoteFrame::TabCreated {
+                tab: TabState {
+                    id: 5,
+                    name: "新会话".into(),
+                    path: None,
+                    busy: false,
+                    unseen: false,
+                    pane_count: 1,
+                },
+            },
+            RemoteFrame::TabClosed { tab_id: 3 },
+            RemoteFrame::TabUpdated {
+                tab: TabState {
+                    id: 0,
+                    name: "renamed".into(),
+                    path: Some("C:\\proj\\sub".into()),
+                    busy: true,
+                    unseen: false,
+                    pane_count: 2,
+                },
+            },
+            RemoteFrame::SubscribeSession { tab_id: 0 },
+            RemoteFrame::SubscriptionStarted {
+                tab_id: 0,
+                focused: 1,
+                panes: vec![
+                    PaneSnapshot {
+                        session_id: 10,
+                        rows: 40,
+                        cols: 120,
+                        snapshot: vec![0x1b, b'[', b'2', b'J'],
+                        base: 0,
+                        screen_top: 40,
+                        custom_title: None,
+                    },
+                    PaneSnapshot {
+                        session_id: 11,
+                        rows: 40,
+                        cols: 120,
+                        snapshot: vec![0x1b, b'[', b'H', b'h', b'i'],
+                        base: 5,
+                        screen_top: 100,
+                        custom_title: Some("日志".into()),
+                    },
+                ],
+                // 2 窗格 → 网格 [2]（一排两列）；用精确 f32（0.5/1.0）确保 PartialEq 往返。
+                row_weights: vec![1.0],
+                col_weights: vec![vec![0.5, 0.5]],
+                maximized: None,
+            },
+            RemoteFrame::OutputWithId {
+                tab_id: 0,
+                session_id: 11,
+                data: vec![0, 255, 13, 10, 0x1b],
+            },
+            RemoteFrame::ResizeWithId {
+                tab_id: 0,
+                session_id: 11,
+                rows: 50,
+                cols: 200,
+            },
+            RemoteFrame::NewTab { req_id: 1 },
+            RemoteFrame::NewTabResult {
+                req_id: 1,
+                tab_id: Some(7),
+                err: None,
+            },
+            RemoteFrame::NewTabResult {
+                req_id: 2,
+                tab_id: None,
+                err: Some(RemoteOpErr::LimitReached),
+            },
+            RemoteFrame::CloseTab { req_id: 3, tab_id: 7 },
+            RemoteFrame::CloseTabResult {
+                req_id: 3,
+                tab_id: 7,
+                err: None,
+            },
+            RemoteFrame::CloseTabResult {
+                req_id: 4,
+                tab_id: 99,
+                err: Some(RemoteOpErr::NotFound),
+            },
+        ];
+        for frame in frames {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
+    }
+
+    #[test]
+    fn part3d_订阅快照满载单帧不超上限() {
+        // 最坏：一个会话 MAX_PANES(=6，镜像 app session::MAX_PANES) 个窗格，每格整屏快照 256 KiB
+        // （远超真实满彩屏 ~80 KB）。base64 ~1.33x，6 格 ~2 MiB，应 < server 4 MiB 单帧上限。
+        const MAX_PANES: usize = 6;
+        const PANE_SNAP: usize = 256 * 1024;
+        let panes: Vec<PaneSnapshot> = (0..MAX_PANES)
+            .map(|i| PaneSnapshot {
+                session_id: i as u64,
+                rows: 60,
+                cols: 200,
+                snapshot: vec![b'x'; PANE_SNAP],
+                base: 0,
+                screen_top: 60,
+                custom_title: Some(format!("pane{i}")),
+            })
+            .collect();
+        let frame = RemoteFrame::SubscriptionStarted {
+            tab_id: 0,
+            focused: 0,
+            panes,
+            // 6 窗格 → 网格 [3,3]（上下两排各三列）。
+            row_weights: vec![0.5, 0.5],
+            col_weights: vec![vec![1.0 / 3.0; 3], vec![1.0 / 3.0; 3]],
+            maximized: None,
+        };
+        let v = frame.to_value().expect("to_value");
+        let json = serde_json::to_string(&v).expect("序列化");
+        assert!(
+            json.len() < 4 * 1024 * 1024,
+            "满载 {MAX_PANES} 窗格 × {PANE_SNAP} B 快照 → JSON {} 字节，超 4 MiB 帧上限",
+            json.len()
+        );
+    }
+
+    #[test]
+    fn part3d_会话列表满载单帧不超上限() {
+        // 上限自洽：REMOTE_MAX_SESSIONS 个会话（名 / 路径取长串）序列化后远小于 4 MiB 单帧上限。
+        let tabs: Vec<TabState> = (0..REMOTE_MAX_SESSIONS)
+            .map(|i| TabState {
+                id: u64::from(i),
+                name: format!("会话名字够长够长够长够长够长够长 {i}"),
+                path: Some(format!(
+                    "C:\\some\\deeply\\nested\\working\\directory\\path\\number\\{i}"
+                )),
+                busy: i % 2 == 0,
+                unseen: i % 3 == 0,
+                pane_count: (i % 6) + 1,
+            })
+            .collect();
+        let frame = RemoteFrame::TabListSnapshot { tabs };
+        let v = frame.to_value().expect("to_value");
+        let json = serde_json::to_string(&v).expect("序列化");
+        assert!(
+            json.len() < 4 * 1024 * 1024,
+            "满载 {REMOTE_MAX_SESSIONS} 会话 JSON {} 字节，超 4 MiB 帧上限",
+            json.len()
+        );
     }
 }

@@ -29,9 +29,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PutConflict, PutOverwrite,
-    PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteS2C, Role, FETCH_MAX_LEN,
-    FETCH_WINDOW, FILE_CHUNK, LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneSnapshot, PutConflict,
+    PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr, RemoteS2C,
+    Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
 use tungstenite::stream::MaybeTlsStream;
@@ -155,6 +156,10 @@ pub enum Notice {
     },
     /// 片8：远程目录递归枚举失败（权限 / 路径不存在 / 空目录 / 会话断）。
     ClipDirFailed,
+    /// part3d Phase 2：远程新建会话失败（超 [`REMOTE_MAX_SESSIONS`](lumen_protocol::remote::REMOTE_MAX_SESSIONS) 等）。
+    RemoteNewTabFailed(RemoteOpErr),
+    /// part3d Phase 2：远程关闭会话失败（拒关被控端最后一个 / 目标不存在等）。
+    RemoteCloseTabFailed(RemoteOpErr),
 }
 
 /// 后台线程 → 主线程事件。
@@ -197,6 +202,34 @@ pub struct RemoteWs {
     hist_version: u64,
     /// 被控端：待应答的历史行请求 `(top, count)`（main 从焦点窗格 term 序列化后应答）。
     pending_history: Vec<(u64, u16)>,
+    // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP：列表 + 订阅，单 mirror 只读）──────────
+    /// 控制端：被控端推来的会话(tab)列表 + 概览状态（远程视图侧栏渲染源；来源
+    /// [`RemoteFrame::TabListSnapshot`] / `TabCreated` / `TabClosed` / `TabUpdated`）。
+    remote_tabs: Vec<TabState>,
+    /// 控制端：当前订阅查看的会话 id（点击远程列表项切换；`None` = 未订阅）。镜像内容
+    /// 来自该会话（被控端按订阅推，被控端焦点不动）。K5：同一时刻只订阅 1 个。
+    subscribed_tab: Option<TabId>,
+    /// 控制端：订阅会话**焦点窗格**的 session_id（来源 `SubscriptionStarted.panes[focused]`）。
+    /// Phase 3 前单 mirror 只复现焦点窗格——被控端虽 tee 全部窗格，控制端按此 id 过滤
+    /// `OutputWithId`/`ResizeWithId`，只喂焦点窗格那一路，避免多窗格输出串进同一 mirror。
+    /// 多窗格全量渲染（per-pane Terminal）于 Phase 3c。
+    mirror_focus_sid: Option<SessionId>,
+    /// 被控端：控制端订阅查看的会话 id（来源 [`RemoteFrame::SubscribeSession`]）。被控端据此
+    /// 把该会话焦点窗格快照 + 实时输出推给控制端，**与被控端自身焦点解耦**（需求 c/e）。
+    sub_target: Option<TabId>,
+    /// 被控端：订阅目标本帧刚变化（收到 `SubscribeSession`，含重订同一会话）——main 取走后
+    /// 复位 `mirror_src` 强制重发 `SubscriptionStarted`（否则重订同一会话因窗格 key 未变不重发、
+    /// 控制端镜像空白）。
+    sub_dirty: bool,
+    /// 被控端：上次推给控制端的会话列表（K6 去重基线；归一化后与本帧比对，变化才发
+    /// `TabListSnapshot`，免布局浮点 / spinner 标题每帧抖动刷爆链路）。
+    last_tab_states: Vec<TabState>,
+    /// 被控端：待执行的远程新建会话请求 `req_id`（来源 [`RemoteFrame::NewTab`]；main 取走后
+    /// spawn 新 tab 并回 [`RemoteFrame::NewTabResult`]，Phase 2 需求 d）。
+    pending_new_tab: Vec<u64>,
+    /// 被控端：待执行的远程关闭会话请求 `(req_id, tab_id)`（来源 [`RemoteFrame::CloseTab`]；
+    /// main 取走后关 tab 并回 [`RemoteFrame::CloseTabResult`]）。
+    pending_close_tab: Vec<(u64, TabId)>,
     /// M5.3 part4b 控制端镜像选区（作用于**当前显示**的镜像终端：跟随=mirror，回看=
     /// hist_term；按绝对行号定位，与渲染/取文本同坐标系）。右键有选区→复制本地剪贴板。
     mirror_selection: Option<Selection>,
@@ -1043,6 +1076,7 @@ impl RemoteWs {
         self.pending_viewport = None;
         self.pending_history.clear();
         self.reset_history();
+        self.reset_multi_session();
         // 先 clear（其内排空 svc_rx 丢弃在途回包）再断 svc 通道——否则 svc_rx 已 None
         // 时排空成死代码（与 end_session/Disconnected 路径行为不一致）。
         self.clear_remote_filetree();
@@ -1063,6 +1097,45 @@ impl RemoteWs {
         // 显示坐标系换源/会话变更：选区作废。
         self.mirror_selection = None;
         self.mirror_selecting = false;
+    }
+
+    /// part3d：复位多会话镜像态（会话起止 / 断线 / 被取代时调）。控制端清远程列表 + 订阅；
+    /// 被控端清订阅目标 + 列表去重基线。与 [`Self::reset_history`] 互补（后者管单 mirror 回看态）。
+    fn reset_multi_session(&mut self) {
+        self.remote_tabs.clear();
+        self.subscribed_tab = None;
+        self.mirror_focus_sid = None;
+        self.sub_target = None;
+        self.sub_dirty = false;
+        self.last_tab_states.clear();
+        self.pending_new_tab.clear();
+        self.pending_close_tab.clear();
+    }
+
+    /// 控制端：订阅会话已不在远程列表（被关）→ **按位置回退到邻位**（右邻顶上原位、无右邻取
+    /// 末位，与被控端 `close_tab` 切邻位一致；D6 按排序非 HashMap 迭代序），列表空则清订阅 + 清镜像。
+    /// 仍在列表则无操作。`old_idx` = 被订阅会话在**变更前**列表中的下标（调用方在 mutate 前算好）。
+    fn fallback_subscription(&mut self, old_idx: Option<usize>) {
+        let Some(sub) = self.subscribed_tab else {
+            return;
+        };
+        if self.remote_tabs.iter().any(|t| t.id == sub) {
+            return;
+        }
+        // 删除会令后继会话左移一位，故「旧下标」处现在正是右邻；越界则取末位。
+        let target = old_idx
+            .filter(|_| !self.remote_tabs.is_empty())
+            .map(|i| self.remote_tabs[i.min(self.remote_tabs.len() - 1)].id)
+            .or_else(|| self.remote_tabs.first().map(|t| t.id));
+        match target {
+            Some(id) => self.subscribe_tab(id),
+            None => {
+                self.subscribed_tab = None;
+                self.mirror_focus_sid = None;
+                self.mirror = None;
+                self.reset_history();
+            }
+        }
     }
 
     /// 是否已登录并在维持连接（后台线程在跑）。
@@ -1126,38 +1199,27 @@ impl RemoteWs {
         self.pending_viewport = None;
         self.pending_history.clear();
         self.reset_history();
+        self.reset_multi_session();
         self.clear_remote_filetree();
     }
 
-    /// 被控端：转发焦点窗格 PTY 输出字节给控制端（含会话起始的整屏快照重放）。
-    pub fn send_output(&self, bytes: &[u8]) {
-        self.send_frame(&RemoteFrame::Output(bytes.to_vec()));
-    }
+    // part3d（K2）：无 id 的 `send_output`/`send_resize`（旧单焦点镜像）已移除，被控端改用
+    // `send_subscription_started` + `send_output_with_id`（带双 id）。控制端 `apply_relay` 仍保留
+    // `Output`/`Resize` 收处理臂，但版本门已挡住会发旧帧的 v1 对端，故休眠无害。
 
-    /// 被控端：告知控制端镜像终端尺寸（会话起始 + 窗格 resize 时发；须在对应
-    /// 尺寸的 `Output` 之前）。
-    pub fn send_resize(&self, rows: u16, cols: u16) {
-        self.send_frame(&RemoteFrame::Resize { rows, cols });
-    }
-
-    /// 控制端：把用户输入的 VT 字节转发给被控端（part4）。
+    /// 控制端：把用户输入的 VT 字节转发给被控端（所有按键 / Ctrl+C / win32 / IME / 粘贴的收口）。
     ///
-    /// 转发输入即把镜像 **snap 回跟随实时底部**（标准终端「输入即滚到底」）——否则
-    /// 回看历史时打字会看不到自己输入的回显。是所有控制端→被控端输入（按键 / Ctrl+C /
-    /// win32 / IME / 粘贴）的收口，故在此统一 snap。
+    /// **part3d Phase 1–3：纯只读，本方法不发送任何输入**——多会话模型下若沿用旧 part4a 逻辑，
+    /// 输入会落到被控端**当前激活会话**（而非控制端订阅查看的会话），既违背「只读」又会误改
+    /// 被控端正在用的别处 shell（海风哥两机实测确认）。Phase 4 恢复发送，并按 `(tab_id, session_id)`
+    /// 路由到**订阅窗格**、配合本地输入优先仲裁。当前直接吞掉输入（不发、不动回看态）。
     pub fn send_input(&mut self, bytes: &[u8]) {
-        if self.hist_top.is_some() {
-            self.hist_top = None;
-            self.mirror_selection = None;
-            self.mirror_selecting = false;
-        }
-        self.send_frame(&RemoteFrame::Input(bytes.to_vec()));
+        let _ = bytes; // Phase 4 起按订阅窗格路由转发。
     }
 
-    /// 控制端：请求被控端焦点窗格 resize 到控制端视图尺寸（SSH 式跟随）。
-    pub fn send_viewport_resize(&self, rows: u16, cols: u16) {
-        self.send_frame(&RemoteFrame::ViewportResize { rows, cols });
-    }
+    // part3d：控制端 SSH 式视口跟随已移除（多会话模型下被控端焦点不动、订阅会话可为后台
+    // tab，不强制其 resize）。被控端侧 `ViewportResize` 收处理 + `take_viewport` 暂保留休眠，
+    // 留待 Phase 3/4 若需「订阅=被控端焦点 tab」时的 1:1 满屏渲染再启用。
 
     /// 被控端：取走待应用的远程视口尺寸（main 把焦点窗格 resize 到它）。
     pub fn take_viewport(&mut self) -> Option<(u16, u16)> {
@@ -1182,6 +1244,140 @@ impl RemoteWs {
     /// 被控端：广播当前历史边界（会话起始随整屏快照发，控制端首次回看前即知可滚范围）。
     pub fn send_history_bounds(&self, base: u64, screen_top: u64) {
         self.send_frame(&RemoteFrame::HistoryBounds { base, screen_top });
+    }
+
+    // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP）收发 ───────────────────────────
+
+    /// 控制端：远程会话列表（远程视图侧栏渲染源）。
+    #[must_use]
+    pub fn remote_tabs(&self) -> &[TabState] {
+        &self.remote_tabs
+    }
+
+    /// 控制端：当前订阅查看的会话 id（`None` = 未订阅）。
+    #[must_use]
+    pub fn subscribed_tab(&self) -> Option<TabId> {
+        self.subscribed_tab
+    }
+
+    /// 控制端：订阅查看某会话（点击远程列表项）。发 [`RemoteFrame::SubscribeSession`]，记下
+    /// 订阅目标；镜像由被控端随后的 [`RemoteFrame::SubscriptionStarted`] 重建（含初始快照）。
+    /// K5：新订阅隐式取代旧的。回看态复位（换源后绝对行号体系变）。
+    pub fn subscribe_tab(&mut self, tab_id: TabId) {
+        if !self.is_controlling() {
+            return;
+        }
+        self.subscribed_tab = Some(tab_id);
+        self.reset_history();
+        self.send_frame(&RemoteFrame::SubscribeSession { tab_id });
+    }
+
+    /// 被控端：控制端当前订阅查看的会话 id（main 据此推该会话快照 + 实时输出）。
+    #[must_use]
+    pub fn sub_target(&self) -> Option<TabId> {
+        self.sub_target
+    }
+
+    /// 被控端：取走「订阅目标刚变化」标志（main 据此复位 `mirror_src` 强制重发快照）。
+    pub fn take_sub_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.sub_dirty)
+    }
+
+    /// 被控端：推会话列表给控制端（K6 去重：归一化后与上次一致则不发）。会话增删 / 改名 /
+    /// cwd 变 / 忙闲翻转 / 未读变 / 窗格增删都会改变 `tabs`，自然触发；高频抖动字段已在
+    /// [`TabState`] 构造侧归一化（`busy` 是布尔判定、不含 spinner 字形），不刷链路。
+    pub fn push_tab_list(&mut self, tabs: Vec<TabState>) {
+        if tabs == self.last_tab_states {
+            return;
+        }
+        self.last_tab_states = tabs.clone();
+        self.send_frame(&RemoteFrame::TabListSnapshot { tabs });
+    }
+
+    /// 被控端：发订阅会话的初始整屏快照（先于任何 [`RemoteFrame::OutputWithId`]，D3 保序）。
+    /// Phase 3 起回**全部窗格 + 布局**（`row_weights`/`col_weights`/`maximized`），控制端据此复刻
+    /// 多窗格几何。`panes` 渲染顺序 = 下标，`focused` 为焦点窗格下标。
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_subscription_started(
+        &self,
+        tab_id: TabId,
+        focused: u32,
+        panes: Vec<PaneSnapshot>,
+        row_weights: Vec<f32>,
+        col_weights: Vec<Vec<f32>>,
+        maximized: Option<u32>,
+    ) {
+        self.send_frame(&RemoteFrame::SubscriptionStarted {
+            tab_id,
+            focused,
+            panes,
+            row_weights,
+            col_weights,
+            maximized,
+        });
+    }
+
+    /// 被控端：转发订阅会话某窗格的实时 PTY 输出（带双 id；替代无 id 的 `Output`）。
+    pub fn send_output_with_id(&self, tab_id: TabId, session_id: SessionId, bytes: &[u8]) {
+        self.send_frame(&RemoteFrame::OutputWithId {
+            tab_id,
+            session_id,
+            data: bytes.to_vec(),
+        });
+    }
+
+    // 被控端 `send_resize_with_id`（带双 id 增量 resize）留待 Phase 3 per-pane 路由再加：
+    // MVP 单 mirror 下被控端订阅窗格 resize 即触发 mirror_src 变 → 整屏 SubscriptionStarted
+    // 重发（含新尺寸快照），无需独立 ResizeWithId。控制端 apply_relay 的 ResizeWithId 臂已就绪。
+
+    // ── part3d Phase 2 远程增删会话（需求 d）收发 ──────────────────────────────
+
+    /// 控制端：请被控端新建一个会话(tab)（侧栏「＋」）。被控端回 [`RemoteFrame::NewTabResult`]，
+    /// 成功则控制端自动订阅新会话（见 apply_relay）。
+    pub fn new_remote_tab(&mut self) {
+        if !self.is_controlling() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.send_frame(&RemoteFrame::NewTab { req_id });
+    }
+
+    /// 控制端：请被控端关闭指定会话(tab)（远程列表右键「关闭」）。被控端回
+    /// [`RemoteFrame::CloseTabResult`]，列表 / 订阅回退由后续 `TabListSnapshot` 驱动。
+    pub fn close_remote_tab(&mut self, tab_id: TabId) {
+        if !self.is_controlling() {
+            return;
+        }
+        let req_id = self.next_req_id();
+        self.send_frame(&RemoteFrame::CloseTab { req_id, tab_id });
+    }
+
+    /// 被控端：取走待执行的远程新建会话请求（main spawn 新 tab 后回 `NewTabResult`）。
+    pub fn take_new_tab_reqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_new_tab)
+    }
+
+    /// 被控端：取走待执行的远程关闭会话请求（main 关 tab 后回 `CloseTabResult`）。
+    pub fn take_close_tab_reqs(&mut self) -> Vec<(u64, TabId)> {
+        std::mem::take(&mut self.pending_close_tab)
+    }
+
+    /// 被控端：回 [`RemoteFrame::NewTabResult`]（`err` 优先于 `tab_id`）。
+    pub fn send_new_tab_result(&self, req_id: u64, tab_id: Option<TabId>, err: Option<RemoteOpErr>) {
+        self.send_frame(&RemoteFrame::NewTabResult {
+            req_id,
+            tab_id,
+            err,
+        });
+    }
+
+    /// 被控端：回 [`RemoteFrame::CloseTabResult`]（`err=None` 即已关）。
+    pub fn send_close_tab_result(&self, req_id: u64, tab_id: TabId, err: Option<RemoteOpErr>) {
+        self.send_frame(&RemoteFrame::CloseTabResult {
+            req_id,
+            tab_id,
+            err,
+        });
     }
 
     // ── part3c-2 Option B 目录树收发 ───────────────────────────────────────
@@ -3344,6 +3540,153 @@ impl RemoteWs {
                     self.upload_mkdir_result(req_id, path, err);
                 }
             }
+            // ── part3d 多会话 × 多窗格镜像（Phase 1 MVP：列表 + 订阅，单 mirror 只读）──────
+            RemoteFrame::TabListSnapshot { tabs } => {
+                // 仅控制端：整组替换远程会话列表（被控端按 K6 去重后才发，低频）。订阅会话若已不在
+                // 新列表（被关）→ 按位置回退到邻位（被控端走 Snapshot-on-change，关会话经此路径生效）。
+                if self.is_controlling() {
+                    let old_idx = self
+                        .subscribed_tab
+                        .and_then(|s| self.remote_tabs.iter().position(|t| t.id == s));
+                    self.remote_tabs = tabs;
+                    self.fallback_subscription(old_idx);
+                }
+            }
+            RemoteFrame::TabCreated { tab } => {
+                // 仅控制端：插入 / 更新单个会话（MVP 被控端走 Snapshot-on-change，此为健壮兜底）。
+                if self.is_controlling() {
+                    match self.remote_tabs.iter_mut().find(|t| t.id == tab.id) {
+                        Some(slot) => *slot = tab,
+                        None => self.remote_tabs.push(tab),
+                    }
+                }
+            }
+            RemoteFrame::TabUpdated { tab } => {
+                // 仅控制端：更新单个会话概览（不存在则插入，等价 TabCreated）。
+                if self.is_controlling() {
+                    match self.remote_tabs.iter_mut().find(|t| t.id == tab.id) {
+                        Some(slot) => *slot = tab,
+                        None => self.remote_tabs.push(tab),
+                    }
+                }
+            }
+            RemoteFrame::TabClosed { tab_id } => {
+                // 仅控制端：移除会话；正订阅它则按位置回退到邻近会话（D6）。
+                if self.is_controlling() {
+                    let old_idx = self
+                        .subscribed_tab
+                        .and_then(|s| self.remote_tabs.iter().position(|t| t.id == s));
+                    self.remote_tabs.retain(|t| t.id != tab_id);
+                    self.fallback_subscription(old_idx);
+                }
+            }
+            RemoteFrame::SubscribeSession { tab_id } => {
+                // 仅被控端：记下订阅目标 + 置脏（main 复位 mirror_src 强制重发快照）。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.sub_target = Some(tab_id);
+                    self.sub_dirty = true;
+                }
+            }
+            RemoteFrame::SubscriptionStarted {
+                tab_id,
+                focused,
+                panes,
+                .. // Phase 3c 才用 row_weights/col_weights/maximized 复刻多窗格几何。
+            } => {
+                // 仅控制端 且 与当前订阅目标一致（忽略换订阅在途的陈旧应答）。MVP：取焦点窗格
+                // （panes[focused]）喂单 mirror；快照内联、先于任何 OutputWithId（D3 保序）。
+                if self.is_controlling() && self.subscribed_tab == Some(tab_id) {
+                    if let Some(p) = panes.get(focused as usize).or_else(|| panes.first()) {
+                        let rows = usize::from(p.rows).max(1);
+                        let cols = usize::from(p.cols).max(1);
+                        let mut term = Terminal::new(rows, cols, MIRROR_SCROLLBACK);
+                        term.advance(&p.snapshot);
+                        let _ = term.take_responses(); // 镜像无 PTY，排空应答。
+                        let (base, screen_top) = (p.base, p.screen_top);
+                        self.mirror = Some(term);
+                        self.mirror_focus_sid = Some(p.session_id); // 仅认焦点窗格那一路增量。
+                        self.reset_history(); // 清旧回看态（会清 hist_bounds）。
+                        self.hist_bounds = Some((base, screen_top)); // 再设新边界。
+                    }
+                }
+            }
+            RemoteFrame::OutputWithId {
+                tab_id,
+                session_id,
+                data,
+            } => {
+                // 仅控制端 且 属当前订阅会话的**焦点窗格**（被控端 tee 全部窗格，单 mirror 只认焦点
+                // 那一路，避免多窗格输出串入同一 mirror；Phase 3c 起 per-pane 路由）。
+                if self.is_controlling()
+                    && self.subscribed_tab == Some(tab_id)
+                    && self.mirror_focus_sid == Some(session_id)
+                {
+                    if let Some(mirror) = self.mirror.as_mut() {
+                        mirror.advance(&data);
+                        let _ = mirror.take_responses();
+                    }
+                }
+            }
+            RemoteFrame::ResizeWithId {
+                tab_id,
+                session_id,
+                rows,
+                cols,
+            } => {
+                // 仅控制端 且 焦点窗格那一路：resize 单 mirror + 复位回看（列宽变，绝对行号体系换）。
+                if self.is_controlling()
+                    && self.subscribed_tab == Some(tab_id)
+                    && self.mirror_focus_sid == Some(session_id)
+                {
+                    if let Some(mirror) = self.mirror.as_mut() {
+                        mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                    }
+                    self.reset_history();
+                }
+            }
+            // ── part3d Phase 2 远程增删会话（需求 d）──────────────────────────────────
+            RemoteFrame::NewTab { req_id } => {
+                // 仅被控端：入队，main spawn 新 tab（不夺被控端焦点）后回 NewTabResult。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_new_tab.push(req_id);
+                }
+            }
+            RemoteFrame::CloseTab { req_id, tab_id } => {
+                // 仅被控端：入队，main 关 tab（拒绝关最后一个）后回 CloseTabResult。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_close_tab.push((req_id, tab_id));
+                }
+            }
+            RemoteFrame::NewTabResult {
+                req_id: _,
+                tab_id,
+                err,
+            } => {
+                // 仅控制端：成功则自动订阅查看新会话；失败弹 toast（如已达上限）。
+                if self.is_controlling() {
+                    match (tab_id, err) {
+                        (Some(id), None) => self.subscribe_tab(id),
+                        (_, Some(e)) => {
+                            log::warn!("远程新建会话失败: {e:?}");
+                            self.notices.push(Notice::RemoteNewTabFailed(e));
+                        }
+                        (None, None) => log::warn!("远程新建会话返回空（既无 id 也无错误）"),
+                    }
+                }
+            }
+            RemoteFrame::CloseTabResult {
+                req_id: _,
+                tab_id,
+                err,
+            } => {
+                // 仅控制端：失败弹 toast；成功则列表 / 订阅回退由后续 TabListSnapshot 驱动。
+                if self.is_controlling() {
+                    if let Some(e) = err {
+                        log::warn!("远程关闭会话 {tab_id} 失败: {e:?}");
+                        self.notices.push(Notice::RemoteCloseTabFailed(e));
+                    }
+                }
+            }
             RemoteFrame::Echo(_) => {}
         }
     }
@@ -3362,6 +3705,7 @@ impl RemoteWs {
                 self.pending_viewport = None;
                 self.pending_history.clear();
                 self.reset_history();
+                self.reset_multi_session();
                 self.clear_remote_filetree();
                 if self.session.take().is_some() {
                     self.notices.push(Notice::SessionEnded(EndReason::PeerDisconnected));
@@ -3374,7 +3718,28 @@ impl RemoteWs {
     /// 处理一条服务端协议消息，推进配对/会话状态机。
     fn apply_server(&mut self, msg: RemoteS2C) {
         match msg {
-            RemoteS2C::Welcome { .. } | RemoteS2C::Pong => {}
+            RemoteS2C::Welcome {
+                protocol_version,
+                min_supported_version,
+                ..
+            } => {
+                // K2 版本门：part3d 双 id 数据面与旧 v1 不兼容。本端协议版本低于服务端要求的
+                // 最低版本 → 本端过旧，远程镜像会因帧不识别而空白，须升级（两端须同为 ≥2）。
+                if lumen_protocol::PROTOCOL_VERSION < min_supported_version {
+                    log::warn!(
+                        "本端协议版本 {} 低于服务端要求的最低版本 {}，远程多会话镜像可能不可用，请升级",
+                        lumen_protocol::PROTOCOL_VERSION,
+                        min_supported_version
+                    );
+                } else if protocol_version < lumen_protocol::MIN_SUPPORTED_VERSION {
+                    log::warn!(
+                        "服务端协议版本 {} 低于本端要求的最低版本 {}，远程功能可能不可用",
+                        protocol_version,
+                        lumen_protocol::MIN_SUPPORTED_VERSION
+                    );
+                }
+            }
+            RemoteS2C::Pong => {}
             RemoteS2C::ControlRequested {
                 controller_name,
                 pairing_code,
@@ -3438,6 +3803,7 @@ impl RemoteWs {
                 self.pending_viewport = None;
                 self.pending_history.clear();
                 self.reset_history();
+                self.reset_multi_session();
                 self.clear_remote_filetree();
                 self.notices.push(Notice::SessionEnded(reason));
             }
