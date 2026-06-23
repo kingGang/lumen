@@ -496,6 +496,35 @@ pub enum RemoteFrame {
         /// 失败原因（已关成功为 `None`；如 `tab_id` 不存在回 [`RemoteOpErr::NotFound`]）。
         err: Option<RemoteOpErr>,
     },
+    /// 控制端 → 被控端：订阅会话各窗格的**目标网格尺寸**（控制端按自己均分布局 + 字号算出）。
+    /// 被控端据此 resize 该会话的窗格，使镜像在控制端 **1:1 无裁切**地忠实显示（part3d Phase 3
+    /// 尺寸同步）。**所有权规则**：仅当该会话在被控端为**后台 tab** 时生效（控制端定尺寸）；被控端
+    /// 把它切到**前台**时由被控端窗口尺寸接管（控制端那期间回到裁剪/留白的忠实显示），避免两端抢
+    /// resize。控制端尺寸变化（窗口 resize / 切订阅）才发，去重。
+    SubViewport {
+        /// 目标会话 id。
+        tab_id: TabId,
+        /// 各窗格目标尺寸（按 `session_id` 路由到被控端对应窗格）。
+        panes: Vec<PaneViewport>,
+    },
+    /// **双向**（控制端↔被控端）：同步订阅会话窗格布局的**相对比例**（行/列权重）。任一端拖分隔条
+    /// 改比例即发；对端把权重应用到该会话的 `PaneLayout`（控制端→镜像布局；被控端→其 tab 布局，
+    /// **前台后台均应用**——proportions 不抢绝对网格，故对被控端前台无侵扰，各端按自己窗口×权重出格）。
+    ///
+    /// 与 [`SubViewport`](RemoteFrame::SubViewport) **互补且正交**：`SubViewport` 同步**绝对网格**
+    /// （仅后台 tab，为控制端 1:1 无裁切）；`SubLayout` 同步**相对比例**（双向、不分前后台，解决「控制端
+    /// 拖了前台 tab 不生效」与「两端比例不一致」）。前者改 grid、后者改 weights，二者不冲突。
+    ///
+    /// **回声免疫**：收发两端各自维护「已发/已应用基线」（`RemoteWs::sub_layout_baseline`），收到即把
+    /// 基线更新为该权重——故「应用对端的比例」不会再被本端变更检测当成本地改动回发，连续拖动无回声打架。
+    SubLayout {
+        /// 目标会话 id。
+        tab_id: TabId,
+        /// 每排高度权重（归一化；长度 = 排数）。复刻 `PaneLayout::row_weights`。
+        row_weights: Vec<f32>,
+        /// 每排内各列宽度权重（外层 = 排数，内层 = 该排列数）。复刻 `PaneLayout::col_weights`。
+        col_weights: Vec<Vec<f32>>,
+    },
 }
 
 /// part3c-2 Option B 目录条目（被控端 `read_dir_worker` 产物，控制端只展示 + 原样回传）。
@@ -571,6 +600,18 @@ pub struct PaneSnapshot {
     pub screen_top: u64,
     /// 窗格自定义名（用户重命名；app 级、不在 VT 流里，故显式带；`None` 走默认标题）。
     pub custom_title: Option<String>,
+}
+
+/// part3d Phase 3 尺寸同步：[`SubViewport`](RemoteFrame::SubViewport) 的单窗格目标尺寸。
+/// 控制端按自己均分布局 + 字号算出每格能容纳的行列，被控端按 `session_id` 路由 resize 对应窗格。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneViewport {
+    /// 目标窗格 id（被控端路由键）。
+    pub session_id: SessionId,
+    /// 目标行数。
+    pub rows: u16,
+    /// 目标列数。
+    pub cols: u16,
 }
 
 /// part3d 远程会话增删操作（[`NewTab`](RemoteFrame::NewTab) / [`CloseTab`](RemoteFrame::CloseTab)）
@@ -829,6 +870,29 @@ mod tests {
         };
         let back = RemoteFrame::from_value(&relayed).expect("还原");
         assert_eq!(back, frame);
+    }
+
+    #[test]
+    fn part3d_尺寸与布局帧经value往返() {
+        // SubViewport（绝对网格）+ SubLayout（相对比例，双向）的 value 往返。
+        for frame in [
+            RemoteFrame::SubViewport {
+                tab_id: 7,
+                panes: vec![
+                    PaneViewport { session_id: 3, rows: 40, cols: 100 },
+                    PaneViewport { session_id: 5, rows: 40, cols: 60 },
+                ],
+            },
+            RemoteFrame::SubLayout {
+                tab_id: 7,
+                row_weights: vec![0.3, 0.7],
+                col_weights: vec![vec![0.5, 0.5], vec![0.4, 0.6]],
+            },
+        ] {
+            let v = frame.to_value().expect("to_value");
+            let back = RemoteFrame::from_value(&v).expect("from_value");
+            assert_eq!(back, frame);
+        }
     }
 
     #[test]
@@ -1217,6 +1281,21 @@ mod tests {
                 req_id: 4,
                 tab_id: 99,
                 err: Some(RemoteOpErr::NotFound),
+            },
+            RemoteFrame::SubViewport {
+                tab_id: 0,
+                panes: vec![
+                    PaneViewport {
+                        session_id: 10,
+                        rows: 40,
+                        cols: 120,
+                    },
+                    PaneViewport {
+                        session_id: 11,
+                        rows: 20,
+                        cols: 80,
+                    },
+                ],
             },
         ];
         for frame in frames {

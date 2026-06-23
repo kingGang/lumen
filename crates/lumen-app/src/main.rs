@@ -124,6 +124,12 @@ type MirrorSig = (
     Option<u32>,
 );
 
+/// part3d Phase 3c 多窗格镜像第 `i` 个窗格的离屏纹理保留 id：自 `MIRROR_OFFSCREEN_ID-1` 递减，
+/// 避开自增会话 id（小）与单 mirror 的 `MIRROR_OFFSCREEN_ID`（`u64::MAX`）。`i` 上限 = `MAX_PANES`。
+const fn mirror_pane_offscreen_id(i: usize) -> session::SessionId {
+    MIRROR_OFFSCREEN_ID - 1 - i as u64
+}
+
 /// 从 PNG 字节流解码并构造 winit 窗口图标。
 ///
 /// 解码失败（格式损坏、尺寸越界）时返回 `None` 并打印 warn，
@@ -646,6 +652,10 @@ struct AppState {
     /// M5.3 part3b 控制端镜像离屏纹理的 egui 句柄（`MIRROR_OFFSCREEN_ID`，首次控制时
     /// 注册、后续复用）。控制中每帧把镜像 Terminal 渲染进它，shell 以 Image 铺满终端区。
     mirror_texture: Option<egui::TextureId>,
+    /// M5.3 part3d Phase 3c 多窗格镜像各窗格离屏纹理的 egui 句柄（下标对齐
+    /// `remote_ws.mirror_panes()`，离屏 id 取 `mirror_pane_offscreen_id(i)`）。退出多窗格 / 非控制
+    /// 时整体释放（移入 `pending_tex_free` + drop 离屏）。
+    mirror_pane_textures: Vec<egui::TextureId>,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     /// 各窗格离屏纹理的 egui 句柄（键 = 会话 id；离屏重建后原地
@@ -1069,6 +1079,52 @@ impl AppState {
                         tab_id,
                         Some(lumen_protocol::remote::RemoteOpErr::NotFound),
                     );
+                }
+            }
+            // part3d Phase 3 尺寸同步：应用控制端请求的订阅会话各窗格目标尺寸——**仅当该会话在
+            // 被控端为后台 tab** 时 resize 其窗格（所有权规则：前台由被控端窗口接管，避免两端抢
+            // resize）。resize 后该 tab 的几何签名变 → 下方快照块重发 SubscriptionStarted（新尺寸），
+            // 控制端镜像随之 1:1。
+            if let Some((vp_tab, sizes)) = self.remote_ws.take_sub_viewport() {
+                if let Some(ti) = self.tabs.iter().position(|t| t.id == vp_tab) {
+                    if ti != self.active_tab {
+                        for (sid, rows, cols) in sizes {
+                            if let Some(pane) =
+                                self.tabs[ti].panes.iter_mut().find(|p| p.id == sid)
+                            {
+                                let (r, c) = (usize::from(rows).max(1), usize::from(cols).max(1));
+                                let g = pane.term.grid();
+                                if (g.rows(), g.cols()) != (r, c) {
+                                    pane.term.resize(r, c);
+                                    if let Err(e) = pane.pty.resize(rows.max(1), cols.max(1)) {
+                                        log::warn!("订阅会话窗格 {sid} PTY resize 失败: {e:#}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // part3d Phase 3 布局比例**双向**同步（被控端侧）：①应用控制端发来的比例到目标 tab 布局
+            // （前后台均应用——比例不抢绝对网格，被控端按自身窗口×权重出格：前台立即重排、后台静默存待
+            // 切前台）；②把被控端自身比例变化（用户拖了订阅 tab 的分隔条）发回控制端。回声由
+            // `sub_layout_baseline` 免疫（应用对端比例即更新基线，故不会当本地改动回发）。
+            if self.remote_ws.is_controlled() {
+                if let Some((lt, rw, cw)) = self.remote_ws.take_sub_layout() {
+                    if let Some(ti) = self.tabs.iter().position(|t| t.id == lt) {
+                        let n = self.tabs[ti].panes.len();
+                        if let Some(lay) = shell::layout::PaneLayout::from_weights(n, &rw, &cw) {
+                            self.tabs[ti].layout = lay;
+                        }
+                    }
+                    self.remote_ws.note_sub_layout_baseline(lt, rw, cw);
+                }
+                if let Some(sub_id) = self.remote_ws.sub_target() {
+                    if let Some(ti) = self.tabs.iter().position(|t| t.id == sub_id) {
+                        let rw = self.tabs[ti].layout.row_weights().to_vec();
+                        let cw = self.tabs[ti].layout.col_weights().to_vec();
+                        self.remote_ws.send_sub_layout_if_changed(sub_id, rw, cw);
+                    }
                 }
             }
             // part3d：推会话(tab)列表 + 概览状态（K6 去重，变化才发；busy 是布尔判定不含
@@ -3581,6 +3637,23 @@ fn local_copy_item(
     }
 }
 
+/// part3d Phase 3c：据多窗格镜像 Terminal 取窗格标题（cwd 尾目录名 > OSC 标题 > 「窗格 N」，
+/// 与本地窗格标题同源逻辑；镜像无 app 级 custom_title，故不取）。
+fn mirror_pane_title(term: &lumen_term::Terminal, idx: usize) -> String {
+    term.cwd()
+        .map(|c| {
+            c.file_name().map_or_else(
+                || c.display().to_string(),
+                |t| t.to_string_lossy().into_owned(),
+            )
+        })
+        .or_else(|| {
+            let t = term.title();
+            (!t.is_empty()).then(|| t.to_owned())
+        })
+        .unwrap_or_else(|| i18n::fmt1(i18n::strings().pane_default_name_fmt, idx + 1))
+}
+
 fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, String) {
     use lumen_protocol::remote::{DenyReason, EndReason, FsErr, PairingFailReason, Role};
     use remote_ws::Notice;
@@ -4120,6 +4193,7 @@ impl App {
             filetree_hovered: false,
             remote_viewport: None,
             mirror_texture: None,
+            mirror_pane_textures: Vec::new(),
             egui_state,
             egui_renderer,
             pane_textures: HashMap::new(),
@@ -6268,7 +6342,69 @@ impl ApplicationHandler<PtyWake> for App {
                 // renderer.render）每帧画入；尺寸变化时该块重绑 egui 纹理。退出控制/远程
                 // 视图时在 else 分支释放（仿 release_pane_resources，延后注销），再次控制
                 // 必重新注册全新纹理，杜绝悬挂句柄。
-                let remote_mirror_tex = if state.is_mirror_active() {
+                // M5.3 part3d Phase 3c：订阅**多窗格**会话时，按窗格数管理 per-pane 离屏纹理并构造
+                // shell 多窗格镜像数据；内容由下方多窗格镜像渲染段每帧画入。单窗格 / 非控制时释放。
+                let multi_active =
+                    state.is_mirror_active() && !state.remote_ws.mirror_panes().is_empty();
+                let remote_mirror_multi = if multi_active {
+                    let n = state.remote_ws.mirror_panes().len();
+                    // 窗格数减少：释放多余纹理 + 离屏（延后注销）。
+                    while state.mirror_pane_textures.len() > n {
+                        let i = state.mirror_pane_textures.len() - 1;
+                        state.renderer.drop_offscreen(mirror_pane_offscreen_id(i));
+                        if let Some(tex) = state.mirror_pane_textures.pop() {
+                            state.pending_tex_free.push(tex);
+                        }
+                    }
+                    // 窗格数增加 / 首次：注册缺失纹理（保留 id，后续复用、尺寸变时换绑）。
+                    while state.mirror_pane_textures.len() < n {
+                        let i = state.mirror_pane_textures.len();
+                        let oid = mirror_pane_offscreen_id(i);
+                        state.renderer.ensure_offscreen(oid, 1, 1);
+                        match state.renderer.offscreen_view(oid) {
+                            Some(view) => {
+                                let tex = state.egui_renderer.register_native_texture(
+                                    state.renderer.device(),
+                                    view,
+                                    wgpu::FilterMode::Nearest,
+                                );
+                                state.mirror_pane_textures.push(tex);
+                            }
+                            None => break,
+                        }
+                    }
+                    // 布局比例 / 焦点都不复刻被控端（缩放/分隔条/选中不同步）——只取最大化结构；
+                    // shell 按窗格数均分画 pane_rects、无焦点高亮。
+                    // 镜像比例布局（初始复刻被控端、控制端可拖；shell 据此画 pane_rects/分隔条）。
+                    // 多窗格时 mirror_layout 必为 Some（SubscriptionStarted 多窗格臂建），均分仅兜底。
+                    let (maximized, layout) = state.remote_ws.mirror_layout().map_or_else(
+                        || (None, shell::layout::PaneLayout::uniform(n)),
+                        |l| (l.maximized.map(|m| m as usize), l.layout.clone()),
+                    );
+                    let panes: Vec<shell::MirrorPaneView> = state
+                        .remote_ws
+                        .mirror_panes()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, mp)| {
+                            state.mirror_pane_textures.get(i).map(|&tex| shell::MirrorPaneView {
+                                tex,
+                                title: mirror_pane_title(&mp.term, i),
+                            })
+                        })
+                        .collect();
+                    Some(shell::MirrorMultiInput { panes, layout, maximized })
+                } else {
+                    // 退出多窗格：释放全部 per-pane 纹理 + 离屏（延后注销）。
+                    while let Some(tex) = state.mirror_pane_textures.pop() {
+                        let i = state.mirror_pane_textures.len();
+                        state.renderer.drop_offscreen(mirror_pane_offscreen_id(i));
+                        state.pending_tex_free.push(tex);
+                    }
+                    None
+                };
+                // 单窗格镜像离屏纹理（既有路径；多窗格时不画单 Image，置 None）。
+                let remote_mirror_tex = if state.is_mirror_active() && !multi_active {
                     if state.mirror_texture.is_none() {
                         state.renderer.ensure_offscreen(MIRROR_OFFSCREEN_ID, 1, 1);
                         if let Some(view) = state.renderer.offscreen_view(MIRROR_OFFSCREEN_ID) {
@@ -6282,8 +6418,7 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     state.mirror_texture
                 } else {
-                    // 退出控制/远程视图：释放镜像离屏 + egui 纹理（延后注销，本帧 shape
-                    // 不再引用它，因 remote_mirror_tex=None）。
+                    // 退出控制/远程视图 或 进入多窗格：释放单镜像离屏 + egui 纹理（延后注销）。
                     if let Some(tex) = state.mirror_texture.take() {
                         state.renderer.drop_offscreen(MIRROR_OFFSCREEN_ID);
                         state.pending_tex_free.push(tex);
@@ -6325,6 +6460,7 @@ impl ApplicationHandler<PtyWake> for App {
                     remote_incoming: state.remote_ws.incoming.as_ref(),
                     remote_session: state.remote_ws.session.as_ref(),
                     remote_mirror_tex,
+                    remote_mirror_multi,
                     // part3c-2：**远程视图（远程 tab）** 一律画远程树——未控制时 remote_filetree
                     // 为 None → 画「等待 cwd」占位，绝不回落本机树（修 #2：未连接设备时远程 tab
                     // 显示本地树）。注意用 view_mode（远程 tab 选中）而非 is_mirror_active
@@ -6989,16 +7125,69 @@ impl ApplicationHandler<PtyWake> for App {
                 if shell_out.end_remote_session {
                     state.remote_ws.end_session();
                 }
-                // M5.3 part3d：多会话模型下**不再做 SSH 式视口跟随**——订阅会话可能是被控端
-                // 后台 tab，强制其 resize 到控制端视图会扰动被控端正在用的别处 shell（违背
-                // 「被控端焦点不动」），且后台 tab 不在被控端每帧 resize 循环内、retarget 代价大。
-                // 改为镜像按被控端实际网格渲染、Image 缩放铺满（离屏尺寸取镜像自然像素，见镜像
-                // 渲染段）。此处仅记录镜像区物理像素矩形，供鼠标命中→镜像选区换算（part4b）。
+                // M5.3 part3d：记录镜像区物理像素矩形（鼠标命中→镜像选区换算，part4b）+ Phase 3
+                // 尺寸同步（控制端把订阅多窗格会话各格目标网格尺寸发给被控端，被控端 resize 后 1:1）。
                 if state.is_mirror_active() {
                     let ppp = state.egui_ctx.pixels_per_point();
                     let tr = shell_out.term_rect;
                     state.mirror_rect_px =
                         Some((tr.min.x * ppp, tr.min.y * ppp, tr.width() * ppp, tr.height() * ppp));
+                    // 多窗格：据各格内容矩形像素 + 控制端 cell 算 grid_size_for → SubViewport（去重）。
+                    // 单窗格走 mirror（hist 系统），不在此同步尺寸。
+                    if let Some(tab_id) = state.remote_ws.subscribed_tab() {
+                        if !state.remote_ws.mirror_panes().is_empty() {
+                            let sizes: Vec<(session::SessionId, u16, u16)> = state
+                                .remote_ws
+                                .mirror_panes()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, mp)| {
+                                    let rect = shell_out
+                                        .mirror_pane_rects
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(egui::Rect::NOTHING);
+                                    if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
+                                        return None;
+                                    }
+                                    let pw = (rect.width() * ppp).max(1.0) as u32;
+                                    let ph = (rect.height() * ppp).max(1.0) as u32;
+                                    let (rows, cols) = state.renderer.grid_size_for(pw, ph);
+                                    (rows > 0 && cols > 0)
+                                        .then_some((mp.session_id, rows as u16, cols as u16))
+                                })
+                                .collect();
+                            if !sizes.is_empty() {
+                                state.remote_ws.send_sub_viewport(tab_id, sizes);
+                            }
+                            // part3d Phase 3 布局比例**双向**同步（控制端侧）：①应用被控端发来的比例到
+                            // 镜像布局；②把控制端镜像比例变化（用户拖了镜像分隔条）发给被控端。回声由
+                            // `sub_layout_baseline` 免疫（应用对端比例即更新基线，不会当本地改动回发）。
+                            if let Some((lt, rw, cw)) = state.remote_ws.take_sub_layout() {
+                                if lt == tab_id {
+                                    if let Some(ml) = state.remote_ws.mirror_layout_mut() {
+                                        let n = ml.layout.pane_count();
+                                        if let Some(lay) =
+                                            shell::layout::PaneLayout::from_weights(n, &rw, &cw)
+                                        {
+                                            ml.layout = lay;
+                                        }
+                                    }
+                                    state.window.request_redraw();
+                                }
+                                state.remote_ws.note_sub_layout_baseline(lt, rw, cw);
+                            }
+                            let weights = state.remote_ws.mirror_layout().map(|ml| {
+                                (
+                                    ml.layout.row_weights().to_vec(),
+                                    ml.layout.col_weights().to_vec(),
+                                )
+                            });
+                            if let Some((rw, cw)) = weights {
+                                state.remote_ws.send_sub_layout_if_changed(tab_id, rw, cw);
+                            }
+                        }
+                    }
                 } else {
                     state.mirror_rect_px = None;
                 }
@@ -7232,6 +7421,35 @@ impl ApplicationHandler<PtyWake> for App {
                     log::debug!("分隔条拖动结束：落盘比例");
                     state.layout_dirty = false;
                     state.persist_sessions();
+                }
+
+                // —— M5.3 part3d Phase 3c：镜像分隔条拖动 → 调控制端镜像比例布局（同本地 API，但
+                // 作用于 remote_ws 镜像布局而非 tab）。下一帧 mirror_pane_rects 随比例变 →
+                // SubViewport 让**后台**被控端 resize 到此比例（1:1）；镜像布局不落盘（临时态）。
+                // 区域用镜像 area（= term_rect，与 shell 多窗格块算 rects 同源）。
+                if let Some(kind) = shell_out.mirror_divider_reset {
+                    if let Some(ml) = state.remote_ws.mirror_layout_mut() {
+                        let changed = match kind {
+                            DividerKind::Row(_) => ml.layout.reset_rows(),
+                            DividerKind::Col { row, .. } => ml.layout.reset_cols(row),
+                        };
+                        if changed {
+                            state.window.request_redraw();
+                        }
+                    }
+                } else if let Some((kind, pos)) = shell_out.mirror_divider_drag {
+                    let area = shell_out.term_rect;
+                    if let Some(ml) = state.remote_ws.mirror_layout_mut() {
+                        let changed = match kind {
+                            DividerKind::Row(idx) => ml.layout.drag_row_to(idx, pos.y, area),
+                            DividerKind::Col { row, idx } => {
+                                ml.layout.drag_col_to(row, idx, pos.x, area)
+                            }
+                        };
+                        if changed {
+                            state.window.request_redraw();
+                        }
+                    }
                 }
 
                 // —— 覆盖层（设置页/登录页）焦点路由：先处理关闭再处理
@@ -8215,6 +8433,56 @@ impl ApplicationHandler<PtyWake> for App {
                             state.renderer.render(MIRROR_OFFSCREEN_ID, term, sel, cur, None, None)
                         {
                             error!("镜像渲染失败: {e:#}");
+                        }
+                    }
+                }
+
+                // —— M5.3 part3d Phase 3c 多窗格镜像渲染：每窗格镜像 Terminal 画进各自离屏纹理
+                // （离屏尺寸取该窗格网格自然像素；shell 在 pane_rects 处缩放铺放）。光标仅焦点窗格显示。
+                if state.is_mirror_active() && !state.remote_ws.mirror_panes().is_empty() {
+                    let ppp = state.egui_ctx.pixels_per_point();
+                    let n = state.remote_ws.mirror_panes().len();
+                    for i in 0..n {
+                        // 离屏尺寸 = shell 回传的**该格内容矩形像素**（控制端 cell 大小渲染、1:1 贴图：
+                        // 文字恒定清晰不缩放）。被控端网格大于该格 → 渲染时自然裁右/下；小于 → 留白。
+                        let rect = shell_out
+                            .mirror_pane_rects
+                            .get(i)
+                            .copied()
+                            .unwrap_or(egui::Rect::NOTHING);
+                        if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
+                            continue; // 隐藏（最大化）/ 无效格不渲染。
+                        }
+                        let w = ((rect.width() * ppp).round() as u32).max(1);
+                        let h = ((rect.height() * ppp).round() as u32).max(1);
+                        let oid = mirror_pane_offscreen_id(i);
+                        let cur = {
+                            let g = state.remote_ws.mirror_panes()[i].term.grid();
+                            // 每格显示各自光标（焦点不同步，故不按焦点门控）。
+                            (g.cursor.row, g.cursor.col, g.cursor.visible)
+                        };
+                        if state.renderer.ensure_offscreen(oid, w, h) {
+                            if let (Some(view), Some(&tex)) = (
+                                state.renderer.offscreen_view(oid),
+                                state.mirror_pane_textures.get(i),
+                            ) {
+                                state.egui_renderer.update_egui_texture_from_wgpu_texture(
+                                    state.renderer.device(),
+                                    view,
+                                    wgpu::FilterMode::Nearest,
+                                    tex,
+                                );
+                            }
+                        }
+                        if let Err(e) = state.renderer.render(
+                            oid,
+                            &state.remote_ws.mirror_panes()[i].term,
+                            None,
+                            cur,
+                            None,
+                            None,
+                        ) {
+                            error!("多窗格镜像渲染失败: {e:#}");
                         }
                     }
                 }

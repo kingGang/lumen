@@ -29,12 +29,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::remote::{
-    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneSnapshot, PutConflict,
-    PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr, RemoteS2C,
-    Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
+    DenyReason, DirEntry, EndReason, FsErr, PairingFailReason, PaneSnapshot, PaneViewport,
+    PutConflict, PutOverwrite, PutStatus, RecursiveDirEntry, RemoteC2S, RemoteFrame, RemoteOpErr,
+    RemoteS2C, Role, SessionId, TabId, TabState, FETCH_MAX_LEN, FETCH_WINDOW, FILE_CHUNK,
     LIST_DIR_RECURSIVE_MAX_DEPTH, LIST_DIR_RECURSIVE_MAX_ENTRIES,
 };
 use lumen_term::{SelPoint, Selection, Terminal};
+
+use crate::shell::layout::PaneLayout;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use winit::event_loop::EventLoopProxy;
@@ -101,6 +103,51 @@ pub struct ActiveSession {
     pub peer_name: String,
     /// 本端角色（[`Role::Controller`] = 控制中；[`Role::Controlled`] = 被控中）。
     pub role: Role,
+}
+
+/// part3d Phase 3 尺寸同步：订阅会话各窗格的目标尺寸列表 `(session_id, rows, cols)`。
+type PaneSizes = Vec<(SessionId, u16, u16)>;
+/// 一次尺寸同步请求：`(tab_id, 各窗格目标尺寸)`。
+type SubViewportReq = (TabId, PaneSizes);
+/// part3d Phase 3 布局比例同步（[`RemoteFrame::SubLayout`]）：`(tab_id, 行权重, 各排列权重)`。
+type SubLayoutData = (TabId, Vec<f32>, Vec<Vec<f32>>);
+
+/// 两组布局权重是否近似相等（变更检测/回声免疫用；浮点按 `1e-4` 容差，避免归一化微抖动刷帧）。
+fn weights_approx_eq(a: &SubLayoutData, b: &SubLayoutData) -> bool {
+    const EPS: f32 = 1e-4;
+    let near = |x: f32, y: f32| (x - y).abs() <= EPS;
+    a.0 == b.0
+        && a.1.len() == b.1.len()
+        && a.1.iter().zip(&b.1).all(|(x, y)| near(*x, *y))
+        && a.2.len() == b.2.len()
+        && a.2
+            .iter()
+            .zip(&b.2)
+            .all(|(xc, yc)| xc.len() == yc.len() && xc.iter().zip(yc).all(|(x, y)| near(*x, *y)))
+}
+
+/// part3d Phase 3c 控制端多窗格镜像的单个窗格：被控端窗格 id + 无 PTY 的镜像 `Terminal`
+/// （喂入该窗格转发来的 [`RemoteFrame::OutputWithId`] 复现内容）。仅订阅会话 >1 窗格时存在
+/// （1 窗格走 [`RemoteWs::mirror`] 单 mirror，保 part3a/b 的回看 + 选区）。渲染顺序 = 在
+/// [`RemoteWs::mirror_panes`] 中的下标（复刻被控端 panes 顺序）。
+pub struct MirrorPane {
+    /// 被控端窗格 id（[`RemoteFrame::OutputWithId`] 路由键）。
+    pub session_id: SessionId,
+    /// 镜像终端（无 PTY，控制端主题就地解析颜色）。
+    pub term: Terminal,
+}
+
+/// part3d Phase 3c 控制端多窗格镜像的结构（比例布局 + 最大化）。**比例双向同步、但焦点不同步**：
+/// 任一端拖分隔条改比例都经 [`RemoteFrame::SubLayout`] 同步给对端（不分前后台），控制端按
+/// `layout` 画 `pane_rects` / 分隔条。`focused` 仍忽略（控制端不跟随被控端高亮焦点格；控制端
+/// 自己的窗格选中留待 Phase 4）。初始 `layout` 复刻被控端 `row_weights`/`col_weights`，之后的
+/// 同步走 `SubLayout`（回声免疫见 [`RemoteWs`] 的 `sub_layout_baseline`），不再读 `SubscriptionStarted`
+/// 的权重做增量采纳（那条路对连续拖动有回声打架）。
+pub struct MirrorLayout {
+    /// 控制端镜像窗格比例布局（初始复刻被控端权重；之后控制端拖动或被控端经 `SubLayout` 更新）。
+    pub layout: PaneLayout,
+    /// 最大化窗格下标（`Some` 时独占、其余隐藏）。
+    pub maximized: Option<u32>,
 }
 
 /// 一次性通知（main 循环 [`RemoteWs::take_notices`] 取走 → 弹 toast）。
@@ -210,10 +257,28 @@ pub struct RemoteWs {
     /// 来自该会话（被控端按订阅推，被控端焦点不动）。K5：同一时刻只订阅 1 个。
     subscribed_tab: Option<TabId>,
     /// 控制端：订阅会话**焦点窗格**的 session_id（来源 `SubscriptionStarted.panes[focused]`）。
-    /// Phase 3 前单 mirror 只复现焦点窗格——被控端虽 tee 全部窗格，控制端按此 id 过滤
-    /// `OutputWithId`/`ResizeWithId`，只喂焦点窗格那一路，避免多窗格输出串进同一 mirror。
-    /// 多窗格全量渲染（per-pane Terminal）于 Phase 3c。
+    /// **单窗格镜像**（`mirror_panes` 空）时按此 id 过滤 `OutputWithId`/`ResizeWithId`，只喂
+    /// 焦点窗格那一路。多窗格走 `mirror_panes` per-pane 路由。
     mirror_focus_sid: Option<SessionId>,
+    /// 控制端：part3d Phase 3c 多窗格镜像——订阅会话 >1 窗格时按渲染序存各窗格镜像 Terminal
+    /// （`OutputWithId` 按 session_id 路由）。空 = 单窗格模式（走 `mirror`）。
+    mirror_panes: Vec<MirrorPane>,
+    /// 控制端：多窗格镜像布局（复刻被控端 `PaneLayout`+焦点+最大化；`mirror_panes` 非空时有效）。
+    mirror_layout: Option<MirrorLayout>,
+    /// 控制端：上次发给被控端的订阅会话各窗格目标尺寸（Phase 3 尺寸同步去重；变化才发
+    /// [`RemoteFrame::SubViewport`]）。
+    last_sub_viewport: Option<SubViewportReq>,
+    /// 被控端：控制端请求的订阅会话各窗格目标尺寸（来源 [`RemoteFrame::SubViewport`]）；main 取走后
+    /// 在该会话为**后台 tab** 时 resize 其窗格（所有权规则：前台由被控端窗口接管）。
+    pending_sub_viewport: Option<SubViewportReq>,
+    /// 任一端：收到的对端 [`RemoteFrame::SubLayout`]（订阅会话窗格比例）。main 取走后应用到本端布局
+    /// （控制端→镜像布局；被控端→该 tab 布局，前后台均应用），并更新 `sub_layout_baseline` 免回声。
+    pending_sub_layout: Option<SubLayoutData>,
+    /// 任一端：布局比例同步的「已发/已应用基线」（回声免疫核心）。`send_sub_layout_if_changed` 仅当
+    /// 本端当前比例与此基线**不近似相等**才发 [`RemoteFrame::SubLayout`]；收到对端 SubLayout 后亦把基线
+    /// 更新为该比例——故应用对端比例不会被本端变更检测当成本地改动回发，连续拖动两向皆无回声打架。
+    /// 订阅目标/结构变化时复位为 `None`（首帧据当前比例建立同步）。
+    sub_layout_baseline: Option<SubLayoutData>,
     /// 被控端：控制端订阅查看的会话 id（来源 [`RemoteFrame::SubscribeSession`]）。被控端据此
     /// 把该会话焦点窗格快照 + 实时输出推给控制端，**与被控端自身焦点解耦**（需求 c/e）。
     sub_target: Option<TabId>,
@@ -1105,11 +1170,116 @@ impl RemoteWs {
         self.remote_tabs.clear();
         self.subscribed_tab = None;
         self.mirror_focus_sid = None;
+        self.mirror_panes.clear();
+        self.mirror_layout = None;
+        self.last_sub_viewport = None;
+        self.pending_sub_viewport = None;
+        self.pending_sub_layout = None;
+        self.sub_layout_baseline = None;
         self.sub_target = None;
         self.sub_dirty = false;
         self.last_tab_states.clear();
         self.pending_new_tab.clear();
         self.pending_close_tab.clear();
+    }
+
+    /// 控制端：多窗格镜像各窗格（渲染序）；空 = 单窗格模式（走 [`Self::mirror_render`]）。
+    #[must_use]
+    pub fn mirror_panes(&self) -> &[MirrorPane] {
+        &self.mirror_panes
+    }
+
+    /// 控制端：多窗格镜像布局（`mirror_panes` 非空时有效）。
+    #[must_use]
+    pub fn mirror_layout(&self) -> Option<&MirrorLayout> {
+        self.mirror_layout.as_ref()
+    }
+
+    /// 控制端：可变镜像布局——main 据 shell 回传的 `mirror_divider_drag` / `mirror_divider_reset`
+    /// 调 [`PaneLayout::drag_col_to`] / [`PaneLayout::reset_rows`] 等改比例（与本地窗格分隔条同一
+    /// 套 API），下一帧 `pane_rects` 变 → `SubViewport` 让后台被控端 resize 到此比例。
+    pub fn mirror_layout_mut(&mut self) -> Option<&mut MirrorLayout> {
+        self.mirror_layout.as_mut()
+    }
+
+    /// 控制端：发订阅会话各窗格目标尺寸给被控端（Phase 3 尺寸同步；与上次相同则不发）。被控端据此
+    /// resize 该会话窗格使镜像 1:1 忠实显示（仅其在被控端为后台 tab 时生效，见 `SubViewport` 规则）。
+    pub fn send_sub_viewport(&mut self, tab_id: TabId, panes: PaneSizes) {
+        if !self.is_controlling() {
+            return;
+        }
+        let key = (tab_id, panes);
+        if self.last_sub_viewport.as_ref() == Some(&key) {
+            return;
+        }
+        self.last_sub_viewport = Some(key.clone());
+        let panes = key
+            .1
+            .into_iter()
+            .map(|(session_id, rows, cols)| PaneViewport {
+                session_id,
+                rows,
+                cols,
+            })
+            .collect();
+        self.send_frame(&RemoteFrame::SubViewport {
+            tab_id: key.0,
+            panes,
+        });
+    }
+
+    /// 被控端：取走控制端请求的订阅会话各窗格目标尺寸（main 在该会话为后台 tab 时 resize 其窗格）。
+    pub fn take_sub_viewport(&mut self) -> Option<SubViewportReq> {
+        self.pending_sub_viewport.take()
+    }
+
+    /// 任一端：取走对端发来的订阅会话窗格比例（main 应用到本端布局后须调
+    /// [`Self::note_sub_layout_baseline`] 更新基线免回声）。
+    pub fn take_sub_layout(&mut self) -> Option<SubLayoutData> {
+        self.pending_sub_layout.take()
+    }
+
+    /// 任一端：把本端**当前**订阅会话窗格比例发给对端——仅当与「已发/已应用基线」不近似相等才发
+    /// （[`RemoteFrame::SubLayout`]，双向），并把基线推进到本次值。会话中（控制或被控）皆可发。
+    pub fn send_sub_layout_if_changed(
+        &mut self,
+        tab_id: TabId,
+        row_weights: Vec<f32>,
+        col_weights: Vec<Vec<f32>>,
+    ) {
+        if self.session.is_none() {
+            return;
+        }
+        let cur: SubLayoutData = (tab_id, row_weights, col_weights);
+        if self
+            .sub_layout_baseline
+            .as_ref()
+            .is_some_and(|base| weights_approx_eq(base, &cur))
+        {
+            return; // 与基线一致（含刚应用的对端比例）：不发，免回声。
+        }
+        self.sub_layout_baseline = Some(cur.clone());
+        self.send_frame(&RemoteFrame::SubLayout {
+            tab_id: cur.0,
+            row_weights: cur.1,
+            col_weights: cur.2,
+        });
+    }
+
+    /// 任一端：把比例同步基线设为给定值（main 应用完对端 [`RemoteFrame::SubLayout`] 后调用，
+    /// 使本端变更检测不再把「应用对端比例」当本地改动回发）。
+    pub fn note_sub_layout_baseline(
+        &mut self,
+        tab_id: TabId,
+        row_weights: Vec<f32>,
+        col_weights: Vec<Vec<f32>>,
+    ) {
+        self.sub_layout_baseline = Some((tab_id, row_weights, col_weights));
+    }
+
+    /// 控制端：复位比例同步基线（换订阅/结构变时调用，使下一帧据当前比例重新建立同步）。
+    pub fn reset_sub_layout_baseline(&mut self) {
+        self.sub_layout_baseline = None;
     }
 
     /// 控制端：订阅会话已不在远程列表（被关）→ **按位置回退到邻位**（右邻顶上原位、无右邻取
@@ -1133,6 +1303,8 @@ impl RemoteWs {
                 self.subscribed_tab = None;
                 self.mirror_focus_sid = None;
                 self.mirror = None;
+                self.mirror_panes.clear();
+                self.mirror_layout = None;
                 self.reset_history();
             }
         }
@@ -1268,6 +1440,8 @@ impl RemoteWs {
             return;
         }
         self.subscribed_tab = Some(tab_id);
+        self.last_sub_viewport = None; // 换订阅：强制为新会话重发目标尺寸。
+        self.reset_sub_layout_baseline(); // 换订阅：据新会话当前比例重建 SubLayout 双向同步。
         self.reset_history();
         self.send_frame(&RemoteFrame::SubscribeSession { tab_id });
     }
@@ -2976,6 +3150,12 @@ impl RemoteWs {
         matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller))
     }
 
+    /// 是否为被控端（被控中）：用于把 `SubLayout` 比例应用到本端 tab 布局（vs 控制端应用到镜像布局）。
+    #[must_use]
+    pub fn is_controlled(&self) -> bool {
+        matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled))
+    }
+
     /// 被控端：取走待执行的远程输入（main 仲裁后写焦点窗格 PTY）。
     pub fn take_input(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.pending_input)
@@ -3581,32 +3761,79 @@ impl RemoteWs {
                 }
             }
             RemoteFrame::SubscribeSession { tab_id } => {
-                // 仅被控端：记下订阅目标 + 置脏（main 复位 mirror_src 强制重发快照）。
+                // 仅被控端：记下订阅目标 + 置脏（main 复位 mirror_src 强制重发快照）。换订阅目标须复位
+                // 比例同步基线——否则残留旧会话基线会让换订阅后被控端首次拖分隔条在新旧比例恰好近似时
+                // 漏发 SubLayout（审计 BUG-1）。复位后据新会话当前比例重建双向同步。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    if self.sub_target != Some(tab_id) {
+                        self.reset_sub_layout_baseline();
+                    }
                     self.sub_target = Some(tab_id);
                     self.sub_dirty = true;
                 }
             }
             RemoteFrame::SubscriptionStarted {
                 tab_id,
-                focused,
                 panes,
-                .. // Phase 3c 才用 row_weights/col_weights/maximized 复刻多窗格几何。
+                row_weights,
+                col_weights,
+                maximized,
+                .. // focused 忽略：控制端不跟随被控端焦点高亮（海风哥需求，留待 Phase 4 控制端自选）。
             } => {
-                // 仅控制端 且 与当前订阅目标一致（忽略换订阅在途的陈旧应答）。MVP：取焦点窗格
-                // （panes[focused]）喂单 mirror；快照内联、先于任何 OutputWithId（D3 保序）。
+                // 仅控制端 且 与当前订阅目标一致（忽略换订阅在途的陈旧应答）。快照内联、先于任何
+                // OutputWithId（D3 保序）。**混合**：1 窗格走单 mirror（保回看/选区，1+2 已验收）；
+                // >1 窗格走 per-pane 镜像 Terminal + 布局（Phase 3c 多窗格渲染）。
                 if self.is_controlling() && self.subscribed_tab == Some(tab_id) {
-                    if let Some(p) = panes.get(focused as usize).or_else(|| panes.first()) {
-                        let rows = usize::from(p.rows).max(1);
-                        let cols = usize::from(p.cols).max(1);
-                        let mut term = Terminal::new(rows, cols, MIRROR_SCROLLBACK);
+                    let mk_term = |p: &PaneSnapshot| {
+                        let mut term = Terminal::new(
+                            usize::from(p.rows).max(1),
+                            usize::from(p.cols).max(1),
+                            MIRROR_SCROLLBACK,
+                        );
                         term.advance(&p.snapshot);
                         let _ = term.take_responses(); // 镜像无 PTY，排空应答。
-                        let (base, screen_top) = (p.base, p.screen_top);
-                        self.mirror = Some(term);
-                        self.mirror_focus_sid = Some(p.session_id); // 仅认焦点窗格那一路增量。
-                        self.reset_history(); // 清旧回看态（会清 hist_bounds）。
-                        self.hist_bounds = Some((base, screen_top)); // 再设新边界。
+                        term
+                    };
+                    if panes.len() <= 1 {
+                        self.mirror_panes.clear();
+                        self.mirror_layout = None;
+                        if let Some(p) = panes.first() {
+                            self.mirror = Some(mk_term(p));
+                            self.mirror_focus_sid = Some(p.session_id); // 仅认焦点窗格那一路增量。
+                            self.reset_history(); // 清旧回看态（会清 hist_bounds）。
+                            self.hist_bounds = Some((p.base, p.screen_top)); // 再设新边界。
+                        }
+                    } else {
+                        // 多窗格：清单 mirror + 回看态，建 per-pane 镜像 + 布局。
+                        self.mirror = None;
+                        self.mirror_focus_sid = None;
+                        self.reset_history();
+                        // 结构是否同上一份（窗格 id 顺序一致）——在重建 mirror_panes 之前比对旧的。
+                        let same_structure = self
+                            .mirror_panes
+                            .iter()
+                            .map(|mp| mp.session_id)
+                            .eq(panes.iter().map(|p| p.session_id));
+                        self.mirror_panes = panes
+                            .iter()
+                            .map(|p| MirrorPane {
+                                session_id: p.session_id,
+                                term: mk_term(p),
+                            })
+                            .collect();
+                        // 比例布局：**结构变（增删窗格）或首帧** → 据被控端权重重建布局并复位同步基线
+                        // （SubLayout 下一帧据此重建双向同步）；**结构同**（纯尺寸/内容重发）→ 保留控制端
+                        // 当前镜像比例（增量比例同步走 SubLayout，不在此读 SubscriptionStarted 权重，
+                        // 否则连续拖动会被自己的回送快照打架）。仅同步最大化结构。
+                        if !same_structure || self.mirror_layout.is_none() {
+                            let n = panes.len();
+                            let layout = PaneLayout::from_weights(n, &row_weights, &col_weights)
+                                .unwrap_or_else(|| PaneLayout::uniform(n));
+                            self.mirror_layout = Some(MirrorLayout { layout, maximized });
+                            self.sub_layout_baseline = None; // 据新结构当前比例重新建立 SubLayout 同步。
+                        } else if let Some(l) = self.mirror_layout.as_mut() {
+                            l.maximized = maximized; // 比例保留，仅同步最大化结构。
+                        }
                     }
                 }
             }
@@ -3615,15 +3842,19 @@ impl RemoteWs {
                 session_id,
                 data,
             } => {
-                // 仅控制端 且 属当前订阅会话的**焦点窗格**（被控端 tee 全部窗格，单 mirror 只认焦点
-                // 那一路，避免多窗格输出串入同一 mirror；Phase 3c 起 per-pane 路由）。
-                if self.is_controlling()
-                    && self.subscribed_tab == Some(tab_id)
-                    && self.mirror_focus_sid == Some(session_id)
-                {
-                    if let Some(mirror) = self.mirror.as_mut() {
-                        mirror.advance(&data);
-                        let _ = mirror.take_responses();
+                // 仅控制端 且 属当前订阅会话。多窗格按 session_id 路由到对应窗格镜像；单窗格只认
+                // 焦点窗格那一路（被控端 tee 全部窗格，避免非焦点输出串入单 mirror）。
+                if self.is_controlling() && self.subscribed_tab == Some(tab_id) {
+                    if let Some(mp) =
+                        self.mirror_panes.iter_mut().find(|mp| mp.session_id == session_id)
+                    {
+                        mp.term.advance(&data);
+                        let _ = mp.term.take_responses();
+                    } else if self.mirror_focus_sid == Some(session_id) {
+                        if let Some(mirror) = self.mirror.as_mut() {
+                            mirror.advance(&data);
+                            let _ = mirror.take_responses();
+                        }
                     }
                 }
             }
@@ -3633,15 +3864,20 @@ impl RemoteWs {
                 rows,
                 cols,
             } => {
-                // 仅控制端 且 焦点窗格那一路：resize 单 mirror + 复位回看（列宽变，绝对行号体系换）。
-                if self.is_controlling()
-                    && self.subscribed_tab == Some(tab_id)
-                    && self.mirror_focus_sid == Some(session_id)
-                {
-                    if let Some(mirror) = self.mirror.as_mut() {
-                        mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                // 仅控制端 且 属当前订阅会话：多窗格路由 resize 对应窗格；单窗格焦点那一路 + 复位回看。
+                // （被控端实际走 mirror_src 几何签名变 → 整屏 SubscriptionStarted 重发，此臂多为休眠兜底。）
+                if self.is_controlling() && self.subscribed_tab == Some(tab_id) {
+                    if let Some(mp) =
+                        self.mirror_panes.iter_mut().find(|mp| mp.session_id == session_id)
+                    {
+                        mp.term
+                            .resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                    } else if self.mirror_focus_sid == Some(session_id) {
+                        if let Some(mirror) = self.mirror.as_mut() {
+                            mirror.resize(usize::from(rows).max(1), usize::from(cols).max(1));
+                        }
+                        self.reset_history();
                     }
-                    self.reset_history();
                 }
             }
             // ── part3d Phase 2 远程增删会话（需求 d）──────────────────────────────────
@@ -3655,6 +3891,29 @@ impl RemoteWs {
                 // 仅被控端：入队，main 关 tab（拒绝关最后一个）后回 CloseTabResult。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
                     self.pending_close_tab.push((req_id, tab_id));
+                }
+            }
+            RemoteFrame::SubViewport { tab_id, panes } => {
+                // 仅被控端：记下控制端请求的各窗格目标尺寸；main 在该会话为后台 tab 时 resize 其窗格
+                // （Phase 3 尺寸同步；前台由被控端窗口接管）。只留最新一份。
+                if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controlled)) {
+                    self.pending_sub_viewport = Some((
+                        tab_id,
+                        panes
+                            .into_iter()
+                            .map(|p| (p.session_id, p.rows, p.cols))
+                            .collect(),
+                    ));
+                }
+            }
+            RemoteFrame::SubLayout {
+                tab_id,
+                row_weights,
+                col_weights,
+            } => {
+                // 任一端（会话中）：记下对端比例；main 取走后应用到本端布局并更新基线免回声。只留最新一份。
+                if self.session.is_some() {
+                    self.pending_sub_layout = Some((tab_id, row_weights, col_weights));
                 }
             }
             RemoteFrame::NewTabResult {
@@ -4603,6 +4862,62 @@ mod tests {
     }
 
     #[test]
+    fn weights_approx_eq_容差与形状() {
+        let a = (1u64, vec![0.5, 0.5], vec![vec![1.0]]);
+        // 微抖动（< 1e-4）视为相等：免归一化浮点抖动刷帧。
+        assert!(weights_approx_eq(&a, &(1, vec![0.50001, 0.49999], vec![vec![1.0]])));
+        // 超容差不等。
+        assert!(!weights_approx_eq(&a, &(1, vec![0.3, 0.7], vec![vec![1.0]])));
+        // tab_id 不同 / 形状不同 → 不等。
+        assert!(!weights_approx_eq(&a, &(2, vec![0.5, 0.5], vec![vec![1.0]])));
+        assert!(!weights_approx_eq(&a, &(1, vec![1.0], vec![vec![1.0]])));
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // 测试需直接挂 cmd_tx 捕获出站帧（无公开构造器）。
+    fn sublayout_双向比例_回声免疫与本地变更检测() {
+        // 核心正确性：应用对端比例后，本端「变更检测」不把它当本地改动回发（回声免疫）；
+        // 仅本地真改才发 SubLayout。用 cmd_tx channel 捕获实际出站帧验证。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut ws = RemoteWs::default();
+        ws.cmd_tx = Some(tx);
+        起会话(&mut ws, Role::Controlled);
+        let has_sublayout = |rx: &Receiver<RemoteC2S>| -> bool {
+            let mut found = false;
+            while let Ok(msg) = rx.try_recv() {
+                if let RemoteC2S::Relay(v) = msg {
+                    if matches!(RemoteFrame::from_value(&v), Ok(RemoteFrame::SubLayout { .. })) {
+                        found = true;
+                    }
+                }
+            }
+            found
+        };
+        let _ = has_sublayout(&rx); // 清起会话期间杂帧。
+        let rw = vec![0.3, 0.7];
+        let cw = vec![vec![1.0], vec![1.0]];
+        // 被控端收到控制端比例 → main 流程：取走 + 应用 + 记基线。
+        relay(
+            &mut ws,
+            &RemoteFrame::SubLayout {
+                tab_id: 9,
+                row_weights: rw.clone(),
+                col_weights: cw.clone(),
+            },
+        );
+        let got = ws.take_sub_layout().expect("有待应用比例");
+        assert_eq!(got.0, 9);
+        ws.note_sub_layout_baseline(got.0, got.1, got.2);
+        let _ = has_sublayout(&rx);
+        // 回声免疫：本端当前比例 == 刚应用的对端比例 → 不回发。
+        ws.send_sub_layout_if_changed(9, rw.clone(), cw.clone());
+        assert!(!has_sublayout(&rx), "应用对端比例后同值不回发（回声免疫）");
+        // 本地真改（被控端用户拖了分隔条）→ 比例变 → 回发一帧。
+        ws.send_sub_layout_if_changed(9, vec![0.5, 0.5], cw);
+        assert!(has_sublayout(&rx), "本地比例真变应发 SubLayout");
+    }
+
+    #[test]
     fn 回看锚定与跟随() {
         let mut ws = RemoteWs::default();
         起会话(&mut ws, Role::Controller); // 起镜像
@@ -4724,15 +5039,16 @@ mod tests {
     }
 
     #[test]
-    fn 转发输入回跟随底部() {
-        // part4c：回看态转发输入（打字/中文/粘贴）即 snap 回跟随，使用户看到回显。
+    fn 只读阶段不转发输入() {
+        // part3d Phase 1–3 纯只读：send_input 为 no-op——不发输入、不动回看态（避免误改被控端
+        // 当前激活会话，海风哥两机实测确认）。Phase 4 恢复发送并按订阅窗格 (tab_id,session_id) 路由。
         let mut ws = RemoteWs::default();
         起会话(&mut ws, Role::Controller);
         relay(&mut ws, &RemoteFrame::HistoryBounds { base: 0, screen_top: 100 });
         ws.scroll_mirror(5);
         assert_eq!(ws.hist_top, Some(95), "已进回看态");
         ws.send_input(b"x");
-        assert_eq!(ws.hist_top, None, "转发输入后回跟随实时底部");
+        assert_eq!(ws.hist_top, Some(95), "只读：send_input 为 no-op，回看态不变");
     }
 
     #[test]

@@ -117,6 +117,30 @@ pub struct BgImageInput {
     pub dim: f32,
 }
 
+/// M5.3 part3d Phase 3c：多窗格镜像单个窗格的渲染数据（main 按帧构造）。
+pub struct MirrorPaneView {
+    /// 该窗格镜像离屏纹理（main 已把镜像 Terminal 画入）。
+    pub tex: egui::TextureId,
+    /// 窗格标题（cwd 尾目录名 > OSC 标题 > 「窗格 N」，main 据镜像 Terminal 取）。
+    pub title: String,
+}
+
+/// M5.3 part3d Phase 3c：多窗格镜像整体输入（各窗格 + 比例布局 + 结构）。
+///
+/// **比例布局双向同步**（海风哥需求反转）：`layout` 初始复刻被控端 `row_weights`/`col_weights`，
+/// 控制端可拖分隔条改比例（产 `mirror_divider_*` 回 main → 改镜像布局 → `SubViewport` 让后台被控端
+/// resize），被控端前台拖分隔条经 `SubscriptionStarted` 回送时控制端采纳。**焦点仍不同步**——
+/// 各格标题栏一致、不高亮；控制端自己的窗格选中留待 Phase 4。
+pub struct MirrorMultiInput {
+    /// 各窗格（渲染顺序 = 下标：先上排自左向右、再下排，复刻被控端 panes 顺序）。
+    pub panes: Vec<MirrorPaneView>,
+    /// 镜像窗格比例布局（main 从 `remote_ws.mirror_layout().layout` 克隆传入；shell 据此画
+    /// `pane_rects` / 分隔条，分隔条可拖）。结构与窗格数不符时 shell 防御性退回均分。
+    pub layout: layout::PaneLayout,
+    /// 最大化窗格下标（`Some` 时独占满 area）。
+    pub maximized: Option<usize>,
+}
+
 /// 一帧外壳 UI 的输入（main.rs 按帧构造的状态快照）。
 pub struct ShellInput<'a> {
     /// 激活 tab 的窗格（布局顺序：先上排后下排、行内自左向右）。
@@ -165,9 +189,13 @@ pub struct ShellInput<'a> {
     pub remote_incoming: Option<&'a crate::remote_ws::IncomingControl>,
     /// M5.3 远程控制：活跃会话态（Some = 渲染「被控中 / 控制中」横幅）。
     pub remote_session: Option<&'a crate::remote_ws::ActiveSession>,
-    /// M5.3 part3b：控制端远程镜像离屏纹理（Some = 控制中+远程视图，终端工作区改画
-    /// 远端镜像；wgpu 上色，复用窗格渲染器）。
+    /// M5.3 part3b：控制端远程镜像离屏纹理（Some = 控制中+远程视图 且 订阅**单窗格**会话，
+    /// 终端工作区改画远端镜像；wgpu 上色，复用窗格渲染器）。多窗格时为 None、改走
+    /// [`Self::remote_mirror_multi`]。
     pub remote_mirror_tex: Option<egui::TextureId>,
+    /// M5.3 part3d Phase 3c：控制端订阅**多窗格**会话时的多窗格镜像（各窗格纹理 + 标题 + 布局）。
+    /// Some 时 shell 复刻 `pane_rects` 几何逐窗格绘制（与 `remote_mirror_tex` 互斥）。
+    pub remote_mirror_multi: Option<MirrorMultiInput>,
     /// M5.3 part3c-1：被控端推来的文件树快照（Some = 已收到首份快照）。
     pub remote_filetree: Option<&'a crate::remote_ws::RemoteFileTree>,
     /// M5.3 part3c-1：是否处于远程视图（控制中+远程视图，= `is_mirror_active`）。为真则
@@ -200,6 +228,11 @@ pub struct ShellOutput {
     /// 对齐物理像素；F7① 起不含顶部标题栏——标题栏上的鼠标事件不
     /// 进终端）。main.rs 据此重建离屏纹理 / resize / 路由鼠标与 IME。
     pub pane_rects: Vec<egui::Rect>,
+    /// M5.3 part3d Phase 3c：多窗格镜像各窗格的**内容矩形**（逻辑点，下标对齐
+    /// [`MirrorMultiInput::panes`]，已扣标题栏；隐藏/无效窗格为 `Rect::NOTHING`）。main 据此把
+    /// 各镜像离屏纹理按**该格像素尺寸**渲染（控制端 cell 大小、1:1 贴图，文字恒定清晰、不缩放）。
+    /// 非多窗格镜像帧为空。
+    pub mirror_pane_rects: Vec<egui::Rect>,
     /// 本帧用户点击了终端区（焦点交还终端）。
     pub term_clicked: bool,
     /// 点击了某个窗格（下标对应 [`ShellInput::panes`]；切换焦点窗格）。
@@ -275,6 +308,15 @@ pub struct ShellOutput {
     /// 各分隔条命中矩形（egui 逻辑坐标）。main 据此让 raw 鼠标路由
     /// 让位：按下不聚焦/不建选区/不交出终端焦点（拖动由 egui 处理）。
     pub divider_rects: Vec<egui::Rect>,
+    /// M5.3 part3d Phase 3c：**镜像**分隔条拖动中：(分隔条, 指针位置（逻辑点）)。语义同
+    /// [`Self::divider_drag`]，但作用于控制端镜像布局而非本地 tab——main 调
+    /// `remote_ws.mirror_layout_mut()` 改比例，下一帧矩形变 → `SubViewport` 让后台被控端 resize。
+    /// 多窗格镜像激活时本地分隔条交互被抑制，二者不同帧并存。
+    pub mirror_divider_drag: Option<(layout::DividerKind, egui::Pos2)>,
+    /// M5.3 part3d Phase 3c：镜像分隔条拖动本帧结束（镜像布局不落盘，main 仅可停止重绘节流）。
+    pub mirror_divider_drag_ended: bool,
+    /// M5.3 part3d Phase 3c：双击镜像分隔条 → 该方向恢复均分（作用于镜像布局）。
+    pub mirror_divider_reset: Option<layout::DividerKind>,
     /// 左侧会话栏本帧实际宽度（逻辑点；P10）。main 在指针松开且与
     /// 已存值有差时写入 settings.json（拖动中不写盘）。
     pub sidebar_width: f32,
@@ -411,6 +453,7 @@ pub fn show(
     let mut out = ShellOutput {
         term_rect: egui::Rect::NOTHING,
         pane_rects: Vec::new(),
+        mirror_pane_rects: Vec::new(),
         term_clicked: false,
         pane_clicked: None,
         pane_close: None,
@@ -441,6 +484,9 @@ pub fn show(
         divider_drag_ended: false,
         divider_reset: None,
         divider_rects: Vec::new(),
+        mirror_divider_drag: None,
+        mirror_divider_drag_ended: false,
+        mirror_divider_reset: None,
         sidebar_width: app_settings.layout.sidebar_width,
         filetree_width: None,
         panel_resize_rects: Vec::new(),
@@ -939,7 +985,124 @@ pub fn show(
             // M5.3 part3b：控制端镜像——终端工作区改画远端镜像纹理（Middle 层叠在本地
             // 窗格之上，铺满 area）。本地窗格仍在下方渲染，被遮盖即可。纹理内容由 main
             // 的窗格渲染段画好（wgpu 上色）；纹理已是终端尺寸，按 area 铺满。
-            if let Some(tex) = input.remote_mirror_tex {
+            if let Some(multi) = input.remote_mirror_multi.as_ref() {
+                // M5.3 part3d Phase 3c：多窗格镜像——按 `multi.layout` 比例画 pane_rects（初始复刻
+                // 被控端比例、控制端可拖分隔条调整），逐窗格画标题栏 + 内容纹理。最大化时仅画该窗格
+                // 满 area。纹理内容由 main 的多窗格镜像渲染段画好（每窗格独立离屏）。
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("lumen_remote_mirror_multi"),
+                ));
+                let n = multi.panes.len();
+                // 镜像比例布局（结构与窗格数不符——结构刚变的过渡帧——防御退回均分，同本地 lay）。
+                let uniform_fallback;
+                let lay = if multi.layout.pane_count() == n {
+                    &multi.layout
+                } else {
+                    uniform_fallback = layout::PaneLayout::uniform(n);
+                    &uniform_fallback
+                };
+                let rects: Vec<egui::Rect> = match multi.maximized.filter(|&m| m < n) {
+                    Some(m) => {
+                        let mut v = vec![egui::Rect::NOTHING; n];
+                        v[m] = area;
+                        v
+                    }
+                    None => lay.pane_rects(area),
+                };
+                let ppp = ui.pixels_per_point();
+                // 各窗格标题栏（一致样式、不高亮焦点）+ 内容纹理。内容矩形回传 main（下标对齐
+                // multi.panes，隐藏/无效格回 NOTHING），main 据此把离屏按该格像素尺寸渲染（1:1 清晰）。
+                for (i, pane) in multi.panes.iter().enumerate() {
+                    let rect = rects.get(i).copied().unwrap_or(egui::Rect::NOTHING);
+                    if !(rect.width() >= 1.0 && rect.height() >= 1.0) {
+                        out.mirror_pane_rects.push(egui::Rect::NOTHING); // 最大化态隐藏格。
+                        continue;
+                    }
+                    let title_h = PANE_TITLE_HEIGHT.min(rect.height() / 2.0);
+                    let title_rect =
+                        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), title_h));
+                    let content_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x, rect.min.y + title_h),
+                        rect.max,
+                    )
+                    .round_to_pixels(ppp);
+                    painter.rect_filled(title_rect, 0.0, pal.bg_dark);
+                    painter.text(
+                        egui::pos2(title_rect.min.x + 6.0, title_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &pane.title,
+                        egui::FontId::proportional(12.0),
+                        pal.fg_dim,
+                    );
+                    if content_rect.width() >= 1.0 && content_rect.height() >= 1.0 {
+                        painter.image(
+                            pane.tex,
+                            content_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    out.mirror_pane_rects.push(content_rect);
+                }
+                // 窗格分隔条：**可拖**——复刻本地分隔条交互（命中区加宽、拖动光标、双击复位），
+                // 但作用于镜像布局（产 mirror_divider_* 回 main → 改镜像比例 → SubViewport）。相邻格
+                // 共用一条 1 物理像素线、色取 bg_highlight；外边框由 central_panel_outline 统一画。
+                // 最大化态无分隔。本地分隔条交互在多窗格镜像激活时被抑制（见下方 dividers 闸门），
+                // 二者不并存、不抢拖动。
+                if multi.maximized.filter(|&m| m < n).is_none() {
+                    let hit_w = 8.0f32.max(6.0 / ppp);
+                    for (di, div) in lay.dividers(area).iter().enumerate() {
+                        let vertical = matches!(div.kind, layout::DividerKind::Col { .. });
+                        let hit = if vertical {
+                            div.rect
+                                .expand2(egui::vec2((hit_w - div.rect.width()).max(0.0) / 2.0, 0.0))
+                        } else {
+                            div.rect
+                                .expand2(egui::vec2(0.0, (hit_w - div.rect.height()).max(0.0) / 2.0))
+                        };
+                        let resp = ui.interact(
+                            hit,
+                            ui.id().with(("mirror_pane_divider", di)),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let icon = if vertical {
+                            egui::CursorIcon::ResizeHorizontal
+                        } else {
+                            egui::CursorIcon::ResizeVertical
+                        };
+                        if resp.hovered() || resp.dragged() {
+                            ui.ctx().set_cursor_icon(icon);
+                        }
+                        if resp.double_clicked() {
+                            out.mirror_divider_reset = Some(div.kind);
+                        } else if resp.dragged() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                out.mirror_divider_drag = Some((div.kind, p));
+                            }
+                        }
+                        if resp.drag_stopped() {
+                            out.mirror_divider_drag_ended = true;
+                        }
+                        let line = if vertical {
+                            egui::Rect::from_center_size(
+                                div.rect.center(),
+                                egui::vec2(1.0 / ppp, div.rect.height()),
+                            )
+                        } else {
+                            egui::Rect::from_center_size(
+                                div.rect.center(),
+                                egui::vec2(div.rect.width(), 1.0 / ppp),
+                            )
+                        };
+                        painter.rect_filled(line.round_to_pixels(ppp), 0.0, pal.bg_highlight);
+                        // 复用本地分隔条命中区让位：main 把它转成 divider_rects_px，
+                        // raw 鼠标按下时 mouse_on_pane_divider() 命中 → 镜像拖选让位（见
+                        // main.rs 5607 的 `!mouse_on_pane_divider()`），egui interact 才拿得到拖动。
+                        out.divider_rects.push(hit);
+                    }
+                }
+            } else if let Some(tex) = input.remote_mirror_tex {
                 let painter = ui.ctx().layer_painter(egui::LayerId::new(
                     egui::Order::Middle,
                     egui::Id::new("lumen_remote_mirror"),
@@ -1345,7 +1508,9 @@ pub fn show(
             // 鼠标路由的让位见 main.rs（divider_rects_px）。
             // 最大化期间分隔条不显示不可拖（P14：只剩一格，无比例可
             // 调；divider_rects 留空 = raw 鼠标无让位区）。
-            let dividers = if maximized.is_some() {
+            // 多窗格镜像激活时抑制本地分隔条交互：镜像叠在本地窗格之上、用自己的可拖分隔条
+            // （上方 remote_mirror_multi 块），本地分隔条若仍 interact 会在镜像下方抢拖动。
+            let dividers = if maximized.is_some() || input.remote_mirror_multi.is_some() {
                 Vec::new()
             } else {
                 lay.dividers(area)
