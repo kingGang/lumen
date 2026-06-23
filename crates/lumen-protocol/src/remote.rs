@@ -592,6 +592,11 @@ pub enum RemoteFrame {
         /// 阶段数据（JSON 字符串；内层结构 Phase 2 定）。
         payload: String,
     },
+    /// **P2P 直连数据面首帧**（M6 Phase 3）：QUIC 双向流建立后由发起方（Controller）`open_bi` 后
+    /// **立即写出**的第一帧——quinn 的 `open_bi` 是惰性的，发起方不写首字节，对端 `accept_bi` 会永久
+    /// 阻塞、流无法建立。本帧仅用于解除对端 `accept_bi` 阻塞 + 标记数据面流就绪，**收端 no-op**。
+    /// 走 QUIC 直连流（非中继），与其它数据面帧同 length-prefix 分帧。
+    P2pStreamHello,
 }
 
 /// part3d Phase 4 [`RemoteFrame::PaneOp`] 的操作种类。
@@ -1066,6 +1071,10 @@ mod tests {
             let back = RemoteFrame::from_value(&relayed).expect("from_value");
             assert_eq!(back, frame);
         }
+        // Phase 3 数据面首帧（走 QUIC 直连流，仍经 to_value/from_value 分帧）。
+        let hello = RemoteFrame::P2pStreamHello;
+        let v = hello.to_value().expect("to_value");
+        assert_eq!(RemoteFrame::from_value(&v).expect("from_value"), hello);
     }
 
     #[test]

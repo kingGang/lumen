@@ -3941,6 +3941,9 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
             };
             (ToastKind::Warn, text.to_string())
         }
+        // M6 Phase 3：数据面直连/回退状态（无声降级禁令——切换对用户可见）。
+        Notice::P2pDirect => (ToastKind::Info, s.remote_toast_p2p_direct.to_string()),
+        Notice::P2pRelay => (ToastKind::Info, s.remote_toast_p2p_relay.to_string()),
     }
 }
 

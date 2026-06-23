@@ -218,6 +218,10 @@ pub enum Notice {
     RemoteNewTabFailed(RemoteOpErr),
     /// part3d Phase 2：远程关闭会话失败（拒关被控端最后一个 / 目标不存在等）。
     RemoteCloseTabFailed(RemoteOpErr),
+    /// M6 Phase 3：数据面已切到 P2P 直连（绕开中继，更低延迟）。
+    P2pDirect,
+    /// M6 Phase 3：数据面已回退到中继转发（直连断开 / idle 超时）。
+    P2pRelay,
 }
 
 /// 后台线程 → 主线程事件。
@@ -375,10 +379,13 @@ pub struct RemoteWs {
     pending_viewport: Option<(u16, u16)>,
     /// 待消费的一次性通知（main 取走弹 toast）。
     notices: Vec<Notice>,
-    /// M6 P2P 直连引擎（会话期存在；QUIC 打洞 + mTLS 握手）。Phase 2 仅建链并发 Ready 信令，
-    /// **不切数据面**（数据面仍全走中继）；Phase 3 起据 `is_connected` 在 `send_frame` 选路。
-    /// 经 `reset_multi_session` 统一拆除（会话结束 / 断连）。
+    /// M6 P2P 直连引擎（会话期存在；QUIC 打洞 + mTLS 握手 + 数据面收发）。Phase 3：数据面就绪后
+    /// `send_frame` 选路到 QUIC 直连、入站经 `P2pEvent::DataFrame` 汇回 `apply_relay`；中继全程在线
+    /// 作信令通道 + 兜底。经 `reset_multi_session` 统一拆除（会话结束 / 断连）。
     p2p: Option<P2pEngine>,
+    /// 任一端：数据面是否已处于直连态（去重 `DataPlaneUp`/`Down` 事件，避免重复 toast / 重订阅风暴）。
+    /// 控制端据此重订阅重建镜像、被控端据此把输出切到 QUIC；两端各自维护。
+    p2p_data_active: bool,
     /// UI → 后台 出站命令发送端。
     cmd_tx: Option<Sender<RemoteC2S>>,
     /// 后台 → UI 事件接收端。
@@ -1212,8 +1219,9 @@ impl RemoteWs {
         self.last_tab_states.clear();
         self.pending_new_tab.clear();
         self.pending_close_tab.clear();
-        // M6：会话结束 / 断连 → 停 P2P 引擎（Drop 发停机信号 + join 后台线程）。
+        // M6：会话结束 / 断连 → 停 P2P 引擎（Drop 发停机信号）+ 复位直连态。
         self.p2p = None;
+        self.p2p_data_active = false;
     }
 
     /// 控制端：多窗格镜像各窗格（渲染序）；空 = 单窗格模式（走 [`Self::mirror_render`]）。
@@ -1400,17 +1408,42 @@ impl RemoteWs {
         changed || p2p_changed
     }
 
-    /// 处理一条 P2P 引擎事件：发信令（转 `send_frame(P2pSignal)`，经现有 Relay 通路盲转，服务端
-    /// 零改动）/ 直连建立提示（Phase 2 仅日志，数据面仍走中继）。
+    /// 处理一条 P2P 引擎事件：发信令（转 `send_frame`→中继盲转）/ 连接建立 / 数据面切换 / 入站数据帧。
     fn apply_p2p_event(&mut self, ev: P2pEvent) {
         match ev {
             P2pEvent::SendSignal { kind, payload } => match serde_json::to_string(&payload) {
+                // 信令必走中继（直连断时才能协商回退）；send_frame 内对 P2pSignal 强制走中继。
                 Ok(s) => self.send_frame(&RemoteFrame::P2pSignal { kind, payload: s }),
                 Err(e) => log::error!("P2pSignal payload 序列化失败: {e}"),
             },
-            P2pEvent::Connected => {
-                log::info!("P2P 直连已建立（Phase 2：数据面仍走中继，Phase 3 起切换）");
+            P2pEvent::Connected => log::info!("P2P 直连 QUIC 连接已建立"),
+            P2pEvent::DataPlaneUp => {
+                if !self.p2p_data_active {
+                    self.p2p_data_active = true;
+                    log::info!("P2P 数据面已切到直连");
+                    self.notices.push(Notice::P2pDirect);
+                    self.resubscribe_after_switch();
+                }
             }
+            P2pEvent::DataPlaneDown => {
+                if self.p2p_data_active {
+                    self.p2p_data_active = false;
+                    log::info!("P2P 数据面已回退中继");
+                    self.notices.push(Notice::P2pRelay);
+                    self.resubscribe_after_switch();
+                }
+            }
+            // 经 QUIC 直连收到的数据面帧：与中继帧汇入同一状态机入口（上层零改动）。
+            P2pEvent::DataFrame(v) => self.apply_relay(&v),
+        }
+    }
+
+    /// 切换（直连↔中继）后控制端补发一次订阅，触发被控端重发整屏快照重建镜像——消除切换瞬间可能的
+    /// VT 错位/丢失（被控端 `sub_dirty` 即使重订同一会话也强制重发 `SubscriptionStarted`）。被控端
+    /// `subscribed_tab` 恒为 `None`，此处自然 no-op。
+    fn resubscribe_after_switch(&mut self) {
+        if let Some(tab) = self.subscribed_tab {
+            self.subscribe_tab(tab);
         }
     }
 
@@ -3809,12 +3842,28 @@ impl RemoteWs {
         self.send_input(&payload);
     }
 
-    /// 把数据面帧序列化为不透明 `Relay` 投递（序列化失败仅记日志、不断连）。
+    /// 把数据面帧投出：M6 Phase 3 选路。**仅被控端→控制端「输出方向」走 QUIC 直连**（输出乱序由切换时
+    /// 的整屏快照重建自愈、文件块带 seq 重组，故走直连安全）；**控制端→被控端「输入方向」恒走中继**——
+    /// 输入若走 QUIC，切换瞬间 QUIC 帧可越过在飞的中继输入帧、致被控端 PTY 收到乱序字节且无快照可自愈
+    /// （审查发现，见 docs/M6 §5）。`P2pSignal` 信令亦必走中继（直连断时才能协商回退）。直连未就绪 /
+    /// 通道断则回退中继。序列化失败仅记日志、不断连。
     fn send_frame(&self, frame: &RemoteFrame) {
-        match frame.to_value() {
-            Ok(v) => self.send(RemoteC2S::Relay(v)),
-            Err(e) => log::error!("远程数据面帧序列化失败: {e}"),
+        let v = match frame.to_value() {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("远程数据面帧序列化失败: {e}");
+                return;
+            }
+        };
+        // 仅被控端的非信令数据帧（即输出方向）在直连就绪时走 QUIC；发送失败（通道断）回退中继。
+        if self.is_controlled() && !matches!(frame, RemoteFrame::P2pSignal { .. }) {
+            if let Some(p2p) = &self.p2p {
+                if p2p.is_data_ready() && p2p.try_send_frame(v.clone()) {
+                    return;
+                }
+            }
         }
+        self.send(RemoteC2S::Relay(v));
     }
 
     /// 投递一条出站命令（未连接则静默丢弃）。
@@ -4379,6 +4428,8 @@ impl RemoteWs {
                     }
                 }
             }
+            // P2P 直连数据面首帧（仅解除对端 accept_bi 阻塞 + 标记流就绪）：收端 no-op。
+            RemoteFrame::P2pStreamHello => {}
         }
     }
 

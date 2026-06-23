@@ -249,6 +249,8 @@ pub static STRINGS: Strings = Strings {
     remote_toast_controlling_fmt: "已開始控制「{}」",
     remote_toast_controlled_fmt: "「{}」已開始控制本機",
     remote_toast_session_ended: "遠端工作階段已結束",
+    remote_toast_p2p_direct: "已切換到 P2P 直連（更低延遲）",
+    remote_toast_p2p_relay: "已回退到中繼轉發",
     remote_denied_offline: "目標裝置已離線",
     remote_denied_busy: "目標裝置忙碌中",
     remote_denied_rejected: "對方拒絕了控制請求",

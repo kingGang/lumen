@@ -245,6 +245,8 @@ pub static STRINGS: Strings = Strings {
     remote_toast_controlling_fmt: "Now controlling “{}”",
     remote_toast_controlled_fmt: "“{}” is now controlling this device",
     remote_toast_session_ended: "Remote session ended",
+    remote_toast_p2p_direct: "Switched to P2P direct (lower latency)",
+    remote_toast_p2p_relay: "Fell back to relay forwarding",
     remote_denied_offline: "Target device is offline",
     remote_denied_busy: "Target device is busy",
     remote_denied_rejected: "Control request was declined",

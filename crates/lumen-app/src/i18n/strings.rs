@@ -451,6 +451,10 @@ pub struct Strings {
     pub remote_toast_controlled_fmt: &'static str,
     /// toast：会话已结束
     pub remote_toast_session_ended: &'static str,
+    /// toast：M6 P2P 已切换到直连（绕开中继）
+    pub remote_toast_p2p_direct: &'static str,
+    /// toast：M6 P2P 已回退到中继（直连断开）
+    pub remote_toast_p2p_relay: &'static str,
     /// toast：请求被拒——目标离线
     pub remote_denied_offline: &'static str,
     /// toast：请求被拒——对方忙（已被控/配对中）

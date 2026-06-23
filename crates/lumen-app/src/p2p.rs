@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lumen_protocol::remote::{P2pSignalKind, Role};
+use lumen_protocol::remote::{P2pSignalKind, RemoteFrame, Role};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -36,6 +36,14 @@ const ALPN: &[u8] = b"lumen-p2p";
 const SERVER_NAME: &str = "lumen-p2p";
 /// 单次打洞握手总超时（所有候选 + accept 竞速；超时即视作打洞失败、回退中继）。
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 数据面单帧字节上限（length-prefix 读取前的缓冲上限，防损坏/恶意长度导致 OOM）。**与中继 WS 的
+/// 4 MiB 帧上限对齐**——同一帧两条路（QUIC 直连 / 中继回退）大小判定一致，避免回退瞬间超限帧击穿 WS。
+/// 常规数据面帧远不及此（OutputWithId ≤8 KiB、FileChunk 256 KiB、递归列目录 <4 MiB 有单测保证）。
+const MAX_DATA_FRAME: usize = 4 * 1024 * 1024;
+/// 直连 QUIC keep-alive 间隔（< idle 超时；防终端会话空闲时被 idle 静默关连误触发回退）。
+const P2P_KEEPALIVE: Duration = Duration::from_secs(4);
+/// 直连 QUIC 最大空闲超时（超过即判链路丢失，触发回退中继）。
+const P2P_MAX_IDLE: Duration = Duration::from_secs(30);
 
 /// 开发期默认 STUN 服务器（公共）。**生产切自建 server UDP 反射**（国内可达性 + 自主可控，
 /// 见设计 §7）。host:port 形式，运行期 DNS 解析（`tokio::net::lookup_host`）。
@@ -71,18 +79,30 @@ pub enum P2pEvent {
         /// 阶段负载。
         payload: SignalPayload,
     },
-    /// 直连已建立（Phase 2 仅日志 / 提示；Phase 3 起据此切数据面）。
+    /// QUIC 连接已建立（信息性日志；数据面是否就绪另看 [`Self::DataPlaneUp`]）。
     Connected,
+    /// **数据面就绪**（收到对端 Ready 信令、双向切换点对齐）：主线程此后出站走 QUIC，并补发一次
+    /// 订阅触发整屏快照重建（消除切换瞬间的 VT 错位/丢失）。
+    DataPlaneUp,
+    /// **数据面失效**（QUIC 链路断 / idle 超时 / 流关）：主线程回退中继 + 补发订阅重建 + UI 标识。
+    DataPlaneDown,
+    /// 一条经 QUIC 直连收到的数据面帧（主线程喂回 `apply_relay`，与中继帧汇入同一状态机）。
+    DataFrame(serde_json::Value),
 }
 
 /// P2P 直连引擎句柄（主线程持有；与 `RemoteWs` 对称的启停 + poll 生命周期）。
 pub struct P2pEngine {
     /// 主线程 → P2P 线程命令端。
     cmd_tx: UnboundedSender<P2pCmd>,
+    /// 主线程 → P2P 线程**数据面**出站端（`send_frame` 选路到 QUIC 时投这里，写泵经 stream 发出）。
+    data_tx: UnboundedSender<serde_json::Value>,
     /// P2P 线程 → 主线程事件端。
     evt_rx: Receiver<P2pEvent>,
-    /// 直连已建立标志（P2P 线程握手成功置位；Phase 3 起主线程 `send_frame` 据此选路 P2P/中继）。
+    /// QUIC 连接已建立标志（打洞成功置位；信息性，数据面是否就绪看 `data_ready`）。
     connected: Arc<AtomicBool>,
+    /// **数据面就绪标志**（收到对端 Ready 置 true / 链路断置 false）。主线程 `send_frame` 据此选路：
+    /// true 走 QUIC、false 走中继。与 `connected` 解耦实现两端对齐的切换屏障。
+    data_ready: Arc<AtomicBool>,
     /// 停机标志（与 `Stop` 命令双保险）。
     stop: Arc<AtomicBool>,
     /// 后台线程句柄（stop / drop 时 join）。
@@ -96,19 +116,35 @@ impl P2pEngine {
     #[must_use]
     pub fn start(role: Role, stun_host: String) -> Self {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
         let connected = Arc::new(AtomicBool::new(false));
+        let data_ready = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let conn_thread = Arc::clone(&connected);
+        let data_thread = Arc::clone(&data_ready);
         let handle = thread::Builder::new()
             .name("lumen-p2p".into())
-            .spawn(move || run(role, stun_host, cmd_rx, &evt_tx, &stop_thread, &conn_thread))
+            .spawn(move || {
+                run(
+                    role,
+                    stun_host,
+                    cmd_rx,
+                    data_rx,
+                    &evt_tx,
+                    &stop_thread,
+                    &conn_thread,
+                    &data_thread,
+                )
+            })
             .ok();
         Self {
             cmd_tx,
+            data_tx,
             evt_rx,
             connected,
+            data_ready,
             stop,
             handle,
         }
@@ -117,6 +153,17 @@ impl P2pEngine {
     /// 把对端经信令通道发来的 P2pSignal 投给打洞状态机。
     pub fn peer_signal(&self, kind: P2pSignalKind, payload: SignalPayload) {
         let _ = self.cmd_tx.send(P2pCmd::PeerSignal { kind, payload });
+    }
+
+    /// 数据面是否就绪（主线程 `send_frame` 选路读此；true 走 QUIC、false 走中继）。
+    pub fn is_data_ready(&self) -> bool {
+        self.data_ready.load(Ordering::Acquire)
+    }
+
+    /// 把一条数据面帧（`frame.to_value()` 的 Value）投到 QUIC 出站写泵。返回 `false` = 通道已断
+    /// （调用方应回退中继）。
+    pub fn try_send_frame(&self, value: serde_json::Value) -> bool {
+        self.data_tx.send(value).is_ok()
     }
 
     /// 非阻塞排空 P2P 线程事件（主线程每帧调用）。
@@ -174,6 +221,7 @@ fn spawn_punch(
     peer: SignalPayload,
     res_tx: &UnboundedSender<quinn::Connection>,
     punching: &mut bool,
+    role: Role,
 ) {
     if *punching {
         return;
@@ -185,7 +233,7 @@ fn spawn_punch(
     let cands = peer.candidates;
     let tx = res_tx.clone();
     tokio::spawn(async move {
-        match punch(&ep, &cert, &peer_cert, &cands, PUNCH_TIMEOUT).await {
+        match punch(&ep, &cert, &peer_cert, &cands, PUNCH_TIMEOUT, role).await {
             Some(conn) => {
                 let _ = tx.send(conn);
             }
@@ -194,14 +242,17 @@ fn spawn_punch(
     });
 }
 
-/// P2P 后台线程主体：建 current-thread runtime，构建直连端点 + 跑打洞信令状态机。
+/// P2P 后台线程主体：建 current-thread runtime，构建直连端点 + 跑打洞信令状态机 + 数据面收发。
+#[allow(clippy::too_many_arguments)] // 与主线程共享的句柄/通道一组，拆结构体反更晦涩。
 fn run(
     role: Role,
     stun_host: String,
     mut cmd_rx: UnboundedReceiver<P2pCmd>,
+    data_rx: UnboundedReceiver<serde_json::Value>,
     evt_tx: &Sender<P2pEvent>,
     stop: &AtomicBool,
     connected: &AtomicBool,
+    data_ready: &Arc<AtomicBool>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -246,6 +297,7 @@ fn run(
         }
         let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<quinn::Connection>();
         let mut conn_keep: Option<quinn::Connection> = None;
+        let mut data_rx_opt = Some(data_rx);
         let mut punching = false;
         loop {
             tokio::select! {
@@ -257,23 +309,40 @@ fn run(
                                 kind: P2pSignalKind::Answer,
                                 payload: my_payload.clone(),
                             });
-                            spawn_punch(&de, payload, &res_tx, &mut punching);
+                            spawn_punch(&de, payload, &res_tx, &mut punching, role);
                         }
-                        P2pSignalKind::Answer => spawn_punch(&de, payload, &res_tx, &mut punching),
-                        P2pSignalKind::Ready => log::debug!("P2P 对端 Ready"),
+                        P2pSignalKind::Answer => {
+                            spawn_punch(&de, payload, &res_tx, &mut punching, role);
+                        }
+                        // data_ready 由 run_data_plane 在**本端数据面流真正建立**时置位（而非据对端 Ready），
+                        // 避免流失败/未建时误判已直连（审查 #4）。Ready 信令仅作诊断。
+                        P2pSignalKind::Ready => log::debug!("P2P 对端报告直连就绪"),
+                        // 打洞失败双端各自 5s 超时兜底；spawn_punch 失败暂不主动发 Fallback（审查 #5，
+                        // 影响极小，列为技术债）。此臂收对端可能的 Fallback 通告。
                         P2pSignalKind::Fallback => log::info!("P2P 对端宣告回退中继"),
                     },
                     Some(P2pCmd::Stop) | None => break,
                 },
                 Some(conn) = res_rx.recv() => {
-                    log::info!("P2P 直连已通 → {}（Phase 2 不切数据面，仍走中继）", conn.remote_address());
+                    log::info!("P2P 直连已通 → {}", conn.remote_address());
                     connected.store(true, Ordering::SeqCst);
                     let _ = evt_tx.send(P2pEvent::Connected);
+                    // 通告对端「我直连已通」（仅诊断；data_ready 由本端 run_data_plane 在流建立时置位）。
                     let _ = evt_tx.send(P2pEvent::SendSignal {
                         kind: P2pSignalKind::Ready,
                         payload: my_payload.clone(),
                     });
-                    conn_keep = Some(conn); // 保活直连（Phase 3 据此切数据面）。
+                    // 在此 conn 上建立数据面双向流（仅一次）。
+                    if let Some(drx) = data_rx_opt.take() {
+                        tokio::spawn(run_data_plane(
+                            conn.clone(),
+                            role,
+                            drx,
+                            evt_tx.clone(),
+                            Arc::clone(data_ready),
+                        ));
+                    }
+                    conn_keep = Some(conn); // 保活直连（其 drop 关连接）。
                 }
             }
             if stop.load(Ordering::SeqCst) {
@@ -282,6 +351,127 @@ fn run(
         }
         drop(conn_keep);
     });
+}
+
+/// 置数据面失效：清 `data_ready` + 通知主线程回退中继。可被多个泵/监视重复调用（幂等）。
+fn fail_data_plane(data_ready: &AtomicBool, evt_tx: &Sender<P2pEvent>) {
+    data_ready.store(false, Ordering::Release);
+    let _ = evt_tx.send(P2pEvent::DataPlaneDown);
+}
+
+/// 在已建立的 QUIC 连接上建数据面双向流并跑读/写泵 + 连接关闭监视。Controller `open_bi` 后**立即写
+/// 首帧 Hello**（解除对端 `accept_bi` 阻塞，quinn open_bi 惰性）；Controlled `accept_bi`。任一环节
+/// 出错即 `fail_data_plane`（主线程回退中继）。
+async fn run_data_plane(
+    conn: quinn::Connection,
+    role: Role,
+    mut data_rx: UnboundedReceiver<serde_json::Value>,
+    evt_tx: Sender<P2pEvent>,
+    data_ready: Arc<AtomicBool>,
+) {
+    let (mut send, recv) = match role {
+        Role::Controller => match conn.open_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("P2P open_bi 失败: {e}");
+                fail_data_plane(&data_ready, &evt_tx);
+                return;
+            }
+        },
+        Role::Controlled => match conn.accept_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("P2P accept_bi 失败: {e}");
+                fail_data_plane(&data_ready, &evt_tx);
+                return;
+            }
+        },
+    };
+    // Controller 必须先写一帧解除对端 accept_bi 阻塞（quinn open_bi 惰性，不写首字节对端永久等待）。
+    if matches!(role, Role::Controller) {
+        match RemoteFrame::P2pStreamHello.to_value() {
+            Ok(v) if write_value(&mut send, &v).await => {}
+            _ => {
+                fail_data_plane(&data_ready, &evt_tx);
+                return;
+            }
+        }
+    }
+    // 数据面流真正建立 → 置 data_ready + 通知主线程（被控端据此把输出走 QUIC；控制端据此补发订阅
+    // 重建镜像）。在此置位（而非据对端 Ready）确保流失败时不会误判已直连（审查 #4）。
+    data_ready.store(true, Ordering::Release);
+    let _ = evt_tx.send(P2pEvent::DataPlaneUp);
+    // 读泵（独立任务）。
+    {
+        let evt = evt_tx.clone();
+        let dr = Arc::clone(&data_ready);
+        tokio::spawn(async move { read_pump(recv, &evt, &dr).await });
+    }
+    // 连接关闭监视（idle 超时 / 对端关 / 链路丢 → 回退）。
+    {
+        let conn2 = conn.clone();
+        let evt = evt_tx.clone();
+        let dr = Arc::clone(&data_ready);
+        tokio::spawn(async move {
+            let reason = conn2.closed().await;
+            log::info!("P2P 连接关闭: {reason}");
+            fail_data_plane(&dr, &evt);
+        });
+    }
+    // 写泵（本任务）：排空主线程投来的数据帧，length-prefix 写出 QUIC 流。
+    while let Some(v) = data_rx.recv().await {
+        if !write_value(&mut send, &v).await {
+            break;
+        }
+    }
+    fail_data_plane(&data_ready, &evt_tx);
+}
+
+/// 数据面读泵：循环 read_exact(4 字节长度) → 校验上限 → read_exact(帧体) → 解析 Value → 投主线程。
+/// 链路断 / 干净 FIN / 长度非法即退出并 `fail_data_plane`。解析失败仅丢该帧、不断流。
+async fn read_pump(mut recv: quinn::RecvStream, evt_tx: &Sender<P2pEvent>, data_ready: &AtomicBool) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if recv.read_exact(&mut len_buf).await.is_err() {
+            break; // 链路断 / 干净 FIN
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_DATA_FRAME {
+            log::warn!("P2P 数据帧长度非法({len})，断流回退");
+            break;
+        }
+        let mut buf = vec![0u8; len];
+        if recv.read_exact(&mut buf).await.is_err() {
+            break;
+        }
+        match serde_json::from_slice::<serde_json::Value>(&buf) {
+            Ok(v) => {
+                if evt_tx.send(P2pEvent::DataFrame(v)).is_err() {
+                    break; // 主线程已收尾
+                }
+            }
+            Err(e) => log::debug!("P2P 数据帧解析失败，丢弃: {e}"),
+        }
+    }
+    fail_data_plane(data_ready, evt_tx);
+}
+
+/// length-prefix 写一条 Value 到 QUIC 发送流：u32 大端长度 + JSON 字节。序列化失败/超限仅跳过该帧
+/// （返回 `true` 不杀流）；写入失败（链路断）返回 `false`。
+async fn write_value(send: &mut quinn::SendStream, value: &serde_json::Value) -> bool {
+    let Ok(json) = serde_json::to_vec(value) else {
+        log::error!("P2P 数据帧序列化失败，跳过");
+        return true;
+    };
+    if json.len() > MAX_DATA_FRAME {
+        log::error!("P2P 数据帧过大({})，跳过", json.len());
+        return true;
+    }
+    let len = (json.len() as u32).to_be_bytes();
+    if send.write_all(&len).await.is_err() {
+        return false;
+    }
+    send.write_all(&json).await.is_ok()
 }
 
 /// 取本机出口网卡的 LAN 地址（connect-trick：UDP `connect` 到外部地址**不实际发包**，仅令内核选
@@ -509,6 +699,7 @@ pub async fn punch(
     peer_cert: &CertificateDer<'static>,
     peer_candidates: &[SocketAddr],
     timeout: Duration,
+    role: Role,
 ) -> Option<quinn::Connection> {
     // accept 侧（对端 connect 到我）：mTLS server 配置，client 证书 pinned 到对端。
     match make_server_config(own, peer_cert) {
@@ -526,32 +717,43 @@ pub async fn punch(
         }
     };
 
-    // 竞速：accept 任务 + 每候选一个 connect 任务，首个成功连接经 channel 胜出。
+    // 双向打洞开两端 NAT，但**按角色选定同一条连接**作数据面承载（否则两端各留各的连接、
+    // open_bi/accept_bi 不在同一连接上）：Controller 取自己 connect 出去的（A→B），Controlled 取自己
+    // accept 进来的（同为 A→B）。另一方向（B→A）仅用于开 NAT，连上即弃。
     let (tx, mut rx) = tokio::sync::mpsc::channel::<quinn::Connection>(4);
+    // accept 任务：Controlled 取首个 accept 作结果；Controller 的 accept 是冗余方向，连上即弃。
     {
         let ep = endpoint.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             while let Some(incoming) = ep.accept().await {
                 match incoming.accept() {
-                    Ok(connecting) => {
-                        if let Ok(conn) = connecting.await {
-                            let _ = tx.send(conn).await;
-                            break;
+                    Ok(connecting) => match connecting.await {
+                        Ok(conn) => {
+                            if matches!(role, Role::Controlled) {
+                                let _ = tx.send(conn).await;
+                                break;
+                            }
+                            // Controller：accept 到的是 B→A 冗余方向，弃（drop conn 即关）。
                         }
-                    }
+                        Err(e) => log::debug!("P2P accept 握手失败: {e}"),
+                    },
                     Err(e) => log::debug!("P2P accept 拒绝连入: {e}"),
                 }
             }
         });
     }
+    // connect 任务：Controller 取首个 connect 作结果；Controlled 的 connect 仅开自身 NAT，连上即弃。
     for cand in peer_candidates {
         match endpoint.connect_with(client_cfg.clone(), *cand, SERVER_NAME) {
             Ok(connecting) => {
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if let Ok(conn) = connecting.await {
-                        let _ = tx.send(conn).await;
+                        if matches!(role, Role::Controller) {
+                            let _ = tx.send(conn).await;
+                        }
+                        // Controlled：connect 仅为开 NAT，弃。
                     }
                 });
             }
@@ -586,7 +788,9 @@ fn make_client_config(
         .with_client_auth_cert(chain, key)?;
     rcfg.alpn_protocols = vec![ALPN.to_vec()];
     let qc = quinn::crypto::rustls::QuicClientConfig::try_from(rcfg)?;
-    Ok(quinn::ClientConfig::new(Arc::new(qc)))
+    let mut cc = quinn::ClientConfig::new(Arc::new(qc));
+    cc.transport_config(transport_config());
+    Ok(cc)
 }
 
 /// 构建 quinn server 配置：pinned client 验证器（mTLS，只认 `peer_cert`）+ 本端 server 证书。
@@ -608,7 +812,20 @@ fn make_server_config(
         .with_single_cert(chain, key)?;
     rcfg.alpn_protocols = vec![ALPN.to_vec()];
     let qs = quinn::crypto::rustls::QuicServerConfig::try_from(rcfg)?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(qs)))
+    let mut sc = quinn::ServerConfig::with_crypto(Arc::new(qs));
+    sc.transport_config(transport_config());
+    Ok(sc)
+}
+
+/// QUIC 传输参数：keep-alive + 最大空闲超时（防终端会话空闲被静默关连；两端各自设，取较小生效）。
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.keep_alive_interval(Some(P2P_KEEPALIVE));
+    // P2P_MAX_IDLE（30s）远在 IdleTimeout 合法区间内，转换不会失败。
+    if let Ok(idle) = quinn::IdleTimeout::try_from(P2P_MAX_IDLE) {
+        tc.max_idle_timeout(Some(idle));
+    }
+    Arc::new(tc)
 }
 
 /// 委托 ring provider 做 TLS1.2 证书签名校验（pinned 验证器只额外比对证书本体）。
@@ -908,12 +1125,12 @@ mod tests {
         let b_ep = b.endpoint.clone();
         let b_self = b.cert.clone();
         let ja = tokio::spawn(async move {
-            punch(&a_ep, &a_self, &b_cert, &[b_addr], Duration::from_secs(5))
+            punch(&a_ep, &a_self, &b_cert, &[b_addr], Duration::from_secs(5), Role::Controller)
                 .await
                 .is_some()
         });
         let jb = tokio::spawn(async move {
-            punch(&b_ep, &b_self, &a_cert, &[a_addr], Duration::from_secs(5))
+            punch(&b_ep, &b_self, &a_cert, &[a_addr], Duration::from_secs(5), Role::Controlled)
                 .await
                 .is_some()
         });
@@ -937,9 +1154,74 @@ mod tests {
         let b_ep = b.endpoint.clone();
         let b_self = b.cert.clone();
         let _jb = tokio::spawn(async move {
-            let _ = punch(&b_ep, &b_self, &a_cert, &[], Duration::from_secs(2)).await;
+            let _ = punch(&b_ep, &b_self, &a_cert, &[], Duration::from_secs(2), Role::Controlled).await;
         });
-        let got = punch(&a.endpoint, &a.cert, &fake_cert, &[b_addr], Duration::from_secs(2)).await;
+        let got =
+            punch(&a.endpoint, &a.cert, &fake_cert, &[b_addr], Duration::from_secs(2), Role::Controller).await;
         assert!(got.is_none(), "对端证书不匹配应握手失败");
+    }
+
+    /// loopback 数据面：建立直连后 Controller open_bi + 写 Hello 首帧 + 一帧 Output，Controlled
+    /// accept_bi + read_pump 解出两帧（验证 open_bi 惰性解除、length-prefix 分帧、读泵全链路）。
+    #[tokio::test]
+    async fn quic_数据面_单流_帧往返() {
+        let loop_bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");
+        let a = build_endpoint(loop_bind, None).await.expect("A endpoint");
+        let b = build_endpoint(loop_bind, None).await.expect("B endpoint");
+        let a_addr = a.endpoint.local_addr().expect("A 地址");
+        let b_addr = b.endpoint.local_addr().expect("B 地址");
+        let a_cert = CertificateDer::from(a.cert.cert_der.clone());
+        let b_cert = CertificateDer::from(b.cert.cert_der.clone());
+        let a_ep = a.endpoint.clone();
+        let a_self = a.cert.clone();
+        let b_ep = b.endpoint.clone();
+        let b_self = b.cert.clone();
+        let ja = tokio::spawn(async move {
+            punch(&a_ep, &a_self, &b_cert, &[b_addr], Duration::from_secs(5), Role::Controller).await
+        });
+        let jb = tokio::spawn(async move {
+            punch(&b_ep, &b_self, &a_cert, &[a_addr], Duration::from_secs(5), Role::Controlled).await
+        });
+        let conn_a = ja.await.expect("A 任务").expect("A 连接");
+        let conn_b = jb.await.expect("B 任务").expect("B 连接");
+
+        // Controller 侧：open_bi + 写 Hello 首帧（解除对端 accept_bi）+ 一帧 Output，然后 finish。
+        let writer = tokio::spawn(async move {
+            let (mut send, _r) = conn_a.open_bi().await.expect("open_bi");
+            let hello = RemoteFrame::P2pStreamHello.to_value().expect("hello value");
+            assert!(write_value(&mut send, &hello).await, "写 Hello");
+            let out = RemoteFrame::Output(b"hello-p2p".to_vec())
+                .to_value()
+                .expect("out value");
+            assert!(write_value(&mut send, &out).await, "写 Output");
+            let _ = send.finish();
+            tokio::time::sleep(Duration::from_millis(300)).await; // 保 conn_a 存活到对端读完
+            drop(conn_a);
+        });
+
+        // Controlled 侧：accept_bi + read_pump 读到流结束。
+        let (_sb, recv_b) = conn_b.accept_bi().await.expect("accept_bi");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dr = Arc::new(AtomicBool::new(true));
+        read_pump(recv_b, &tx, &dr).await;
+        writer.await.expect("writer");
+
+        let frames: Vec<serde_json::Value> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                P2pEvent::DataFrame(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames.len(), 2, "应收到 Hello + Output 两帧");
+        assert_eq!(
+            RemoteFrame::from_value(&frames[0]).expect("decode 0"),
+            RemoteFrame::P2pStreamHello
+        );
+        assert_eq!(
+            RemoteFrame::from_value(&frames[1]).expect("decode 1"),
+            RemoteFrame::Output(b"hello-p2p".to_vec())
+        );
+        assert!(!dr.load(Ordering::Acquire), "流结束后 data_ready 应被清");
     }
 }
