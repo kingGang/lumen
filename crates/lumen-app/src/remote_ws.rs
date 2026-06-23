@@ -3595,12 +3595,27 @@ impl RemoteWs {
         }
     }
 
+    /// 控制端：窗格 `sid` 当前**显示源**的可视区首行绝对行号——焦点窗格处于回看态时取 `hist_term`
+    /// 的 view_top（与渲染一致），否则取该窗格 live term 的 view_top。选区起点/终点据此换算 line，
+    /// 保证回看态坐标系与所画 `hist_term` 对齐（BUG-1：否则用 live 大绝对行号、高亮/复制错位）。
+    fn pane_view_top(&self, sid: SessionId) -> u64 {
+        if self.mirror_active_pane == Some(sid) && self.mirror_pane_in_hist() {
+            if let Some(ht) = self.hist_term.as_ref() {
+                return ht.grid().view_top_abs_line();
+            }
+        }
+        self.mirror_panes
+            .iter()
+            .find(|p| p.session_id == sid)
+            .map_or(0, |mp| mp.term.grid().view_top_abs_line())
+    }
+
     /// 控制端：多窗格在窗格 `sid` 的 `(row, col)` 起选（建空选区 + 进拖选态 + 清其它窗格选区，
     /// 保「一时刻一个选区源」复制无歧义）。`row/col` 为该窗格内容矩形内行列（调用方按窗格像素换算）。
     pub fn mirror_pane_sel_start(&mut self, sid: SessionId, row: usize, col: usize) {
+        let line = self.pane_view_top(sid) + row as u64; // 回看态对齐 hist_term 口径（BUG-1）。
         for mp in self.mirror_panes.iter_mut() {
             if mp.session_id == sid {
-                let line = mp.term.grid().view_top_abs_line() + row as u64;
                 let p = SelPoint { line, col };
                 mp.selection = Some(Selection { anchor: p, head: p });
             } else {
@@ -3615,11 +3630,11 @@ impl RemoteWs {
         let Some(sid) = self.mirror_pane_selecting else {
             return false;
         };
+        let head = SelPoint {
+            line: self.pane_view_top(sid) + row as u64, // 同 sel_start 口径（回看态对齐 hist_term）。
+            col,
+        };
         if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
-            let head = SelPoint {
-                line: mp.term.grid().view_top_abs_line() + row as u64,
-                col,
-            };
             if let Some(sel) = mp.selection.as_mut() {
                 if sel.head != head {
                     sel.head = head;
@@ -3662,13 +3677,19 @@ impl RemoteWs {
             .is_some_and(|mp| mp.selection.is_some_and(|s| !s.is_empty()))
     }
 
-    /// 控制端：取**焦点窗格**选区文本（复制到本地剪贴板；空选区 / 空文本返回 `None`）。
+    /// 控制端：取**焦点窗格**选区文本（复制到本地剪贴板；空选区 / 空文本返回 `None`）。回看态从所显示的
+    /// `hist_term` 取文本（与选区坐标系一致，BUG-1），跟随态从 live 窗格 term 取。
     #[must_use]
     pub fn copy_mirror_pane_selection(&self) -> Option<String> {
         let sid = self.mirror_active_pane?;
         let mp = self.mirror_panes.iter().find(|p| p.session_id == sid)?;
         let sel = mp.selection.filter(|s| !s.is_empty())?;
-        let text = mp.term.selection_text(&sel);
+        let term = if self.mirror_pane_in_hist() {
+            self.hist_term.as_ref().unwrap_or(&mp.term)
+        } else {
+            &mp.term
+        };
+        let text = term.selection_text(&sel);
         (!text.is_empty()).then_some(text)
     }
 
