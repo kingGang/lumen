@@ -45,10 +45,12 @@ ureq.workspace = true
 # M5.3 远程控制 WebSocket 客户端（同步，后台线程）。
 tungstenite.workspace = true
 # M6 P2P 直连（p2p.rs）：QUIC 打洞 + 中继回退。tokio current-thread runtime 隔离在
-# P2P 后台线程内驱动 quinn；rcgen 生成握手用自签证书。详见 Cargo.toml workspace deps。
+# P2P 后台线程内驱动 quinn；rcgen 生成握手用自签证书；rustls 自定义 pinned 证书验证器
+# （mTLS 双向认证 + 指纹信任锚）。详见 Cargo.toml workspace deps。
 tokio.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
+rustls.workspace = true
 
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]

@@ -1996,6 +1996,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rfd",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

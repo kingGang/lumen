@@ -157,6 +157,9 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # 自签证书（P2P 直连握手）：双方各生成临时自签证书，SPKI 指纹经已鉴权的信令通道交换
 # 校验（防 MITM）。用 ring 后端与 quinn/rustls 对齐，关 aws_lc_rs。
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# P2P 握手的自定义 pinned 证书验证器（指纹信任锚 + mTLS 双向认证）+ quinn Client/ServerConfig
+# 构造。版本与 quinn/tungstenite 同源（rustls 0.23 + ring），default-features=false 关 aws-lc-rs。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # 不开 LTO：本机 rustc 1.94/1.96 两个版本开 thin LTO（linker-plugin-lto）
 # 编译均随机崩溃（HEAP_CORRUPTION/ACCESS_VIOLATION），关闭后稳定通过。

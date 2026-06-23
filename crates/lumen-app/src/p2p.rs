@@ -25,7 +25,16 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+/// QUIC ALPN 协议标识（两端必须一致；隔离非 lumen 的 QUIC 流量）。
+const ALPN: &[u8] = b"lumen-p2p";
+/// connect 时的 server name（pinned 验证器忽略此名、只认证书，故用固定占位 DNS 名）。
+const SERVER_NAME: &str = "lumen-p2p";
+/// 单次打洞握手总超时（所有候选 + accept 竞速；超时即视作打洞失败、回退中继）。
+const PUNCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 开发期默认 STUN 服务器（公共）。**生产切自建 server UDP 反射**（国内可达性 + 自主可控，
 /// 见设计 §7）。host:port 形式，运行期 DNS 解析（`tokio::net::lookup_host`）。
@@ -315,8 +324,9 @@ fn decode_xor_mapped(val: &[u8]) -> Option<SocketAddr> {
     Some(SocketAddr::from((ip, port)))
 }
 
-/// 自签证书（P2P 直连握手用，Phase 2 接入）：DER 编码的证书 + PKCS#8 私钥。指纹经信令通道交换
-/// 校验作信任锚（防 MITM，见设计 §6）。
+/// 自签证书（P2P 直连握手用）：DER 编码的证书 + PKCS#8 私钥。证书 DER 本身经信令通道交换
+/// 校验作信任锚（防 MITM，见设计 §6）——比较完整证书 DER 等价于最强指纹。
+#[derive(Clone)]
 pub struct SelfSignedCert {
     /// 证书 DER。
     pub cert_der: Vec<u8>,
@@ -334,6 +344,320 @@ fn generate_self_signed() -> anyhow::Result<SelfSignedCert> {
         cert_der: ck.cert.der().to_vec(),
         key_der: ck.key_pair.serialize_der(),
     })
+}
+
+// ── Phase 2：QUIC 打洞 + mTLS 握手（指纹信任锚）──────────────────────────────────
+//    会话建立后双方经信令通道（[`super::RemoteFrame::P2pSignal`]）交换 [`SignalPayload`]
+//    （候选端点 + 自签证书），各自把 quinn Endpoint 既作 client（connect 对端候选）又作 server
+//    （accept 对端连入）打洞；**mTLS 双向认证** + pinned 验证器只认信令交换的对端证书（防 MITM）。
+//    Phase 2 仅建立连接 + 日志「直连已通」，**不切数据面**（数据面切换 + 中继回退是 Phase 3）。
+
+/// P2P 信令负载（[`super::RemoteFrame::P2pSignal`] 的 `payload` JSON 内层结构）。Offer / Answer
+/// 都携本端候选端点 + 自签证书 DER + nonce；Ready / Fallback 可仅用 nonce 关联本次打洞会话。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalPayload {
+    /// 本端候选端点（LAN + STUN 公网映射，**端口与下方 QUIC endpoint 同源**）。
+    pub candidates: Vec<SocketAddr>,
+    /// 本端自签证书 DER（对端 pinned 验证器据此认证，信任锚见设计 §6）。
+    pub cert_der: Vec<u8>,
+    /// 本次打洞会话随机数（防重放 / 区分并发打洞）。
+    pub nonce: u64,
+}
+
+/// 一个就绪的 QUIC 直连端点（绑定持久 UDP socket、自签证书、候选端点）。
+pub struct DirectEndpoint {
+    /// quinn 端点（既 connect 又 accept，打洞用）。
+    pub endpoint: quinn::Endpoint,
+    /// 本端自签证书。
+    pub cert: SelfSignedCert,
+    /// 本端候选端点（交给对端打洞）。
+    pub candidates: Vec<SocketAddr>,
+}
+
+/// 构建 QUIC 直连端点：绑持久 UDP socket → （可选）经**同一 socket** STUN 探公网映射端点（保证
+/// 公网端口 == QUIC 端口）→ 收集候选 → 用该 socket 建 quinn Endpoint。`bind` 形如 `0.0.0.0:0`
+/// （生产）或 `127.0.0.1:0`（loopback 测试）；`stun_host` 为 `None` 时仅用本地候选。
+///
+/// # Errors
+/// 绑定 / socket 转换 / endpoint 创建失败时返回。
+pub async fn build_endpoint(bind: SocketAddr, stun_host: Option<&str>) -> anyhow::Result<DirectEndpoint> {
+    let std_sock = std::net::UdpSocket::bind(bind)?;
+    std_sock.set_nonblocking(true)?;
+    let local_addr = std_sock.local_addr()?;
+    // 经同一 socket 探 STUN（async）；探完转回 std socket 交给 quinn（保 NAT 映射端口一致）。
+    let tokio_sock = tokio::net::UdpSocket::from_std(std_sock)?;
+    let mut candidates = vec![local_addr];
+    if let Some(ip) = local_lan_addr() {
+        let lan = SocketAddr::new(ip, local_addr.port());
+        if lan != local_addr {
+            candidates.push(lan);
+        }
+    }
+    if let Some(host) = stun_host {
+        if let Some(public) = stun_query(&tokio_sock, host, STUN_TIMEOUT).await {
+            candidates.push(public);
+        }
+    }
+    let std_back = tokio_sock.into_std()?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("无 tokio runtime"))?;
+    // server_config 此时未知对端证书，置 None；打洞时 set_server_config 注入 mTLS pinned 配置。
+    let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, std_back, runtime)?;
+    let cert = generate_self_signed()?;
+    Ok(DirectEndpoint {
+        endpoint,
+        cert,
+        candidates,
+    })
+}
+
+/// 经**已有** socket 发 STUN Binding（不 `connect`，留 socket 给 quinn 复用）：`send_to` 请求 →
+/// `recv_from` 应答 → 解析 XOR-MAPPED-ADDRESS。超时 / 失败返回 `None`。
+async fn stun_query(
+    sock: &tokio::net::UdpSocket,
+    stun_host: &str,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    let target = tokio::net::lookup_host(stun_host)
+        .await
+        .ok()?
+        .find(SocketAddr::is_ipv4)?;
+    let txn = new_txn_id();
+    let req = build_binding_request(&txn);
+    sock.send_to(&req, target).await.ok()?;
+    let mut buf = [0u8; 512];
+    let (n, _src) = tokio::time::timeout(timeout, sock.recv_from(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    parse_xor_mapped_addr(&buf[..n], &txn)
+}
+
+/// 打洞 + mTLS 握手：给定对端候选 + 对端证书，本端 endpoint 同时 connect 全部候选 + accept 连入，
+/// 取**首个成功建立**的 QUIC 连接（双向认证：connect 侧认证对端 server 证书、accept 侧认证对端
+/// client 证书，均 pinned 到信令交换的对端证书 → 防 MITM）。`PUNCH_TIMEOUT` 内无连接即 `None`
+/// （打洞失败，调用方回退中继）。
+pub async fn punch(
+    endpoint: &quinn::Endpoint,
+    own: &SelfSignedCert,
+    peer_cert: &CertificateDer<'static>,
+    peer_candidates: &[SocketAddr],
+    timeout: Duration,
+) -> Option<quinn::Connection> {
+    // accept 侧（对端 connect 到我）：mTLS server 配置，client 证书 pinned 到对端。
+    match make_server_config(own, peer_cert) {
+        Ok(scfg) => endpoint.set_server_config(Some(scfg)),
+        Err(e) => {
+            log::warn!("P2P server 配置构建失败: {e}");
+            return None;
+        }
+    }
+    let client_cfg = match make_client_config(own, peer_cert) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("P2P client 配置构建失败: {e}");
+            return None;
+        }
+    };
+
+    // 竞速：accept 任务 + 每候选一个 connect 任务，首个成功连接经 channel 胜出。
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<quinn::Connection>(4);
+    {
+        let ep = endpoint.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                match incoming.accept() {
+                    Ok(connecting) => {
+                        if let Ok(conn) = connecting.await {
+                            let _ = tx.send(conn).await;
+                            break;
+                        }
+                    }
+                    Err(e) => log::debug!("P2P accept 拒绝连入: {e}"),
+                }
+            }
+        });
+    }
+    for cand in peer_candidates {
+        match endpoint.connect_with(client_cfg.clone(), *cand, SERVER_NAME) {
+            Ok(connecting) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = connecting.await {
+                        let _ = tx.send(conn).await;
+                    }
+                });
+            }
+            Err(e) => log::debug!("P2P connect {cand} 发起失败: {e}"),
+        }
+    }
+    drop(tx); // 所有发送端 drop 后 recv 返回 None（全失败时不空等到超时）。
+    tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+}
+
+/// ring CryptoProvider（与 quinn/rustls 后端一致）。
+fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// 构建 quinn client 配置：pinned server 验证器（只认 `peer_cert`）+ 本端 client 证书（mTLS）。
+fn make_client_config(
+    own: &SelfSignedCert,
+    peer_cert: &CertificateDer<'static>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    let provider = ring_provider();
+    let verifier = Arc::new(PinnedServerVerifier {
+        expected: peer_cert.clone(),
+        provider: provider.clone(),
+    });
+    let chain = vec![CertificateDer::from(own.cert_der.clone())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.key_der.clone()));
+    let mut rcfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(chain, key)?;
+    rcfg.alpn_protocols = vec![ALPN.to_vec()];
+    let qc = quinn::crypto::rustls::QuicClientConfig::try_from(rcfg)?;
+    Ok(quinn::ClientConfig::new(Arc::new(qc)))
+}
+
+/// 构建 quinn server 配置：pinned client 验证器（mTLS，只认 `peer_cert`）+ 本端 server 证书。
+fn make_server_config(
+    own: &SelfSignedCert,
+    peer_cert: &CertificateDer<'static>,
+) -> anyhow::Result<quinn::ServerConfig> {
+    let provider = ring_provider();
+    let verifier = Arc::new(PinnedClientVerifier {
+        expected: peer_cert.clone(),
+        provider: provider.clone(),
+        roots: Vec::new(),
+    });
+    let chain = vec![CertificateDer::from(own.cert_der.clone())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.key_der.clone()));
+    let mut rcfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(chain, key)?;
+    rcfg.alpn_protocols = vec![ALPN.to_vec()];
+    let qs = quinn::crypto::rustls::QuicServerConfig::try_from(rcfg)?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(qs)))
+}
+
+/// 委托 ring provider 做 TLS1.2 证书签名校验（pinned 验证器只额外比对证书本体）。
+fn delegate_tls12(
+    provider: &rustls::crypto::CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    rustls::crypto::verify_tls12_signature(message, cert, dss, &provider.signature_verification_algorithms)
+}
+
+/// 委托 ring provider 做 TLS1.3 证书签名校验。
+fn delegate_tls13(
+    provider: &rustls::crypto::CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    rustls::crypto::verify_tls13_signature(message, cert, dss, &provider.signature_verification_algorithms)
+}
+
+/// client 侧验证对端 **server** 证书：只接受 == 信令交换的对端证书（防 MITM）。
+#[derive(Debug)]
+struct PinnedServerVerifier {
+    expected: CertificateDer<'static>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("P2P 对端证书不匹配（防 MITM）".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        delegate_tls12(&self.provider, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        delegate_tls13(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// server 侧验证对端 **client** 证书（mTLS）：只接受 == 信令交换的对端证书。
+#[derive(Debug)]
+struct PinnedClientVerifier {
+    expected: CertificateDer<'static>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    /// 空根提示集（自签 + pinned，不需 CA 根提示）。
+    roots: Vec<rustls::DistinguishedName>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.roots
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.expected.as_ref() {
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General("P2P 对端 client 证书不匹配（防 MITM）".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        delegate_tls12(&self.provider, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        delegate_tls13(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 #[cfg(test)]
@@ -477,5 +801,70 @@ mod tests {
         let addr = got.expect("应探到端点");
         assert!(addr.ip().is_loopback(), "源地址应为本机回环");
         assert_ne!(addr.port(), 0, "应得到具体端口");
+    }
+
+    #[test]
+    fn signal_payload_序列化往返() {
+        let p = SignalPayload {
+            candidates: vec!["192.168.1.5:50000".parse().expect("候选")],
+            cert_der: vec![1, 2, 3, 4],
+            nonce: 42,
+        };
+        let s = serde_json::to_string(&p).expect("序列化");
+        let back: SignalPayload = serde_json::from_str(&s).expect("反序列化");
+        assert_eq!(back.candidates, p.candidates);
+        assert_eq!(back.cert_der, p.cert_der);
+        assert_eq!(back.nonce, p.nonce);
+    }
+
+    /// loopback 双端：A↔B 各自打洞 + mTLS 双向认证，两端都应建立直连（QUIC 握手 + 证书 pinned 通过）。
+    #[tokio::test]
+    async fn quic_直连_双端互认握手() {
+        let loop_bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");
+        let a = build_endpoint(loop_bind, None).await.expect("A endpoint");
+        let b = build_endpoint(loop_bind, None).await.expect("B endpoint");
+        let a_addr = a.endpoint.local_addr().expect("A 地址");
+        let b_addr = b.endpoint.local_addr().expect("B 地址");
+        let a_cert = CertificateDer::from(a.cert.cert_der.clone());
+        let b_cert = CertificateDer::from(b.cert.cert_der.clone());
+
+        let a_ep = a.endpoint.clone();
+        let a_self = a.cert.clone();
+        let b_ep = b.endpoint.clone();
+        let b_self = b.cert.clone();
+        let ja = tokio::spawn(async move {
+            punch(&a_ep, &a_self, &b_cert, &[b_addr], Duration::from_secs(5))
+                .await
+                .is_some()
+        });
+        let jb = tokio::spawn(async move {
+            punch(&b_ep, &b_self, &a_cert, &[a_addr], Duration::from_secs(5))
+                .await
+                .is_some()
+        });
+        let ra = ja.await.expect("A 任务");
+        let rb = jb.await.expect("B 任务");
+        assert!(ra && rb, "双端应各自建立直连（A={ra} B={rb}）");
+    }
+
+    /// 伪造证书冒充对端：A 用一张与真 B 无关的证书作信任锚连真 B → mTLS 校验失败、握手不成（防 MITM）。
+    #[tokio::test]
+    async fn quic_直连_伪造证书被拒() {
+        let loop_bind: SocketAddr = "127.0.0.1:0".parse().expect("bind");
+        let a = build_endpoint(loop_bind, None).await.expect("A endpoint");
+        let b = build_endpoint(loop_bind, None).await.expect("B endpoint");
+        let b_addr = b.endpoint.local_addr().expect("B 地址");
+        let a_cert = CertificateDer::from(a.cert.cert_der.clone());
+        // 与真 B 无关的伪造证书。
+        let fake = generate_self_signed().expect("伪造证书");
+        let fake_cert = CertificateDer::from(fake.cert_der);
+        // 真 B 仅起 accept（认 A），让 A 的连接被真实握手。
+        let b_ep = b.endpoint.clone();
+        let b_self = b.cert.clone();
+        let _jb = tokio::spawn(async move {
+            let _ = punch(&b_ep, &b_self, &a_cert, &[], Duration::from_secs(2)).await;
+        });
+        let got = punch(&a.endpoint, &a.cert, &fake_cert, &[b_addr], Duration::from_secs(2)).await;
+        assert!(got.is_none(), "对端证书不匹配应握手失败");
     }
 }
