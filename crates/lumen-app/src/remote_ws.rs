@@ -876,6 +876,15 @@ pub struct ClipItem {
     pub is_dir: bool,
 }
 
+/// 状态栏数据面链路指示（[`RemoteWs::p2p_link_state`]）：当前走 P2P 直连还是中继。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum P2pLink {
+    /// 数据面走 P2P 直连（绕开中继，更低延迟）。
+    Direct,
+    /// 数据面走中继转发（无直连 / 直连断后回退）。
+    Relay,
+}
+
 /// 控制端状态栏文件传输进度聚合（每帧由 [`RemoteWs::transfer_status`] 算；空闲返回 `None`）。
 /// 下载（含双击打开）有 `written`/`total` → 聚合字节进度条；上传仅计数（控制端不集中跟踪上传
 /// 字节）。剪贴板流式拉取不计入（进度在资源管理器 IStream 侧）。
@@ -2579,6 +2588,19 @@ impl RemoteWs {
             down_done,
             down_total,
             names,
+        })
+    }
+
+    /// 当前会话数据面链路状态（状态栏持久指示用）。仅在 P2P 引擎存在（活跃远程会话且已启 P2P）
+    /// 时返回 `Some`：`p2p_data_active` → [`P2pLink::Direct`]，否则 [`P2pLink::Relay`]；无 P2P
+    /// 会话返回 `None`（状态栏不显示链路指示）。两端各自维护，控被两端均可显示。
+    #[must_use]
+    pub fn p2p_link_state(&self) -> Option<P2pLink> {
+        self.p2p.as_ref()?;
+        Some(if self.p2p_data_active {
+            P2pLink::Direct
+        } else {
+            P2pLink::Relay
         })
     }
 
@@ -5153,6 +5175,22 @@ mod tests {
             ws2.transfer_status().expect("有传输").down_ratio().is_none(),
             "total=0 应不定态"
         );
+    }
+
+    #[test]
+    fn p2p_link_state_门控引擎存在_按active分直连中继() {
+        let mut ws = RemoteWs::default();
+        assert!(ws.p2p_link_state().is_none(), "无 P2P 引擎应 None");
+        // 门控在引擎存在：无引擎即便 active 也 None。
+        ws.p2p_data_active = true;
+        assert!(ws.p2p_link_state().is_none(), "无引擎即便 active 也 None");
+        // 有引擎：active → Direct，否则 Relay。
+        ws.p2p = Some(P2pEngine::start(Role::Controller, String::new(), None, None, None));
+        ws.p2p_data_active = true;
+        assert_eq!(ws.p2p_link_state(), Some(P2pLink::Direct));
+        ws.p2p_data_active = false;
+        assert_eq!(ws.p2p_link_state(), Some(P2pLink::Relay));
+        // drop ws → P2pEngine Drop 停后台线程。
     }
 
     #[test]

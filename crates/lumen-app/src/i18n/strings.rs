@@ -455,6 +455,10 @@ pub struct Strings {
     pub remote_toast_p2p_direct: &'static str,
     /// toast：M6 P2P 已回退到中继（直连断开）
     pub remote_toast_p2p_relay: &'static str,
+    /// 状态栏链路指示：P2P 直连（短标签）
+    pub statusbar_link_direct: &'static str,
+    /// 状态栏链路指示：中继转发（短标签）
+    pub statusbar_link_relay: &'static str,
     /// toast：请求被拒——目标离线
     pub remote_denied_offline: &'static str,
     /// toast：请求被拒——对方忙（已被控/配对中）

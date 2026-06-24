@@ -6717,6 +6717,7 @@ impl ApplicationHandler<PtyWake> for App {
                     #[cfg(feature = "input-editor")]
                     force_fallback: state.force_fallback,
                     transfer: transfer_status.as_ref(),
+                    link: state.remote_ws.p2p_link_state(),
                     history_rows: &history_rows_owned,
                     #[cfg(feature = "input-editor")]
                     completion_view: completion_view_owned,

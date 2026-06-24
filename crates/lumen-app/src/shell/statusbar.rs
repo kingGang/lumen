@@ -54,6 +54,7 @@ pub struct StatusBarOutput {
 /// * `force_fallback` - 经典直通模式开关（决定右端按钮显示状态）。
 /// * `transfer` - 控制端活跃文件传输（Some 时中间区改画进度 ↓N↑M + 进度条 + 轮换文件名，
 ///   替代 cwd；None 时照常显示 cwd）。
+/// * `link` - 数据面链路状态（Some 时左区显示持久 ● 直连/中继 指示；None=非远程会话不显示）。
 /// * `pal` - 当前主题色板。
 ///
 /// # Errors
@@ -64,6 +65,7 @@ pub fn show(
     cwd: Option<&std::path::Path>,
     force_fallback: bool,
     transfer: Option<&crate::remote_ws::TransferStatus>,
+    link: Option<crate::remote_ws::P2pLink>,
     pal: &Palette,
 ) -> StatusBarOutput {
     let mut out = StatusBarOutput::default();
@@ -99,6 +101,21 @@ pub fn show(
             egui::Label::new(egui::RichText::new(mode_text).size(11.0).color(mode_color))
                 .selectable(false),
         );
+
+        // 链路指示（远程会话持久态）：● 直连（accent）/ ● 中继（dim）。
+        if let Some(link) = link {
+            ui.add_space(10.0);
+            let (txt, color) = match link {
+                crate::remote_ws::P2pLink::Direct => (s.statusbar_link_direct, pal.accent),
+                crate::remote_ws::P2pLink::Relay => (s.statusbar_link_relay, pal.fg_dim),
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("● {txt}")).size(11.0).color(color),
+                )
+                .selectable(false),
+            );
+        }
 
         ui.add_space(12.0);
 

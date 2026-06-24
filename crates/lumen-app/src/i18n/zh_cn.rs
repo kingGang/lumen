@@ -245,6 +245,8 @@ pub static STRINGS: Strings = Strings {
     remote_toast_session_ended: "远程会话已结束",
     remote_toast_p2p_direct: "已切换到 P2P 直连（更低延迟）",
     remote_toast_p2p_relay: "已回退到中继转发",
+    statusbar_link_direct: "直连",
+    statusbar_link_relay: "中继",
     remote_denied_offline: "目标设备已离线",
     remote_denied_busy: "目标设备正忙",
     remote_denied_rejected: "对方拒绝了控制请求",
