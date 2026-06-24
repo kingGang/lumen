@@ -78,6 +78,12 @@ const P2P_MAX_IDLE: Duration = Duration::from_secs(30);
 /// STUN 单次探测超时（无应答即视作该服务器不可达，回退/换源）。
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 对端信令负载候选端点数上限（防畸形/恶意负载致每候选一 `tokio::spawn` connect 的资源耗尽）。
+/// 真实候选 = LAN + STUN 公网 + 本地，≤3；16 为宽松上限，不误拒。
+const MAX_PEER_CANDIDATES: usize = 16;
+/// 对端信令负载证书 DER 字节上限（防超大 `cert_der` 内存耗尽）。rcgen 自签证书 <1 KiB；16 KiB 宽松。
+const MAX_PEER_CERT_DER: usize = 16 * 1024;
+
 /// RFC 5389 magic cookie（固定常量，区分 STUN 与其他 UDP 流量、参与 XOR 编码）。
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 
@@ -238,6 +244,13 @@ fn gen_nonce() -> u64 {
     nanos ^ (TXN_COUNTER.fetch_add(1, Ordering::Relaxed) << 32)
 }
 
+/// 对端信令负载在边界内（候选数 + 证书 DER 字节）。超界 = 畸形/恶意负载，拒绝打洞（安全审查：
+/// 防每候选一 `tokio::spawn` 的任务爆炸 / 超大证书内存耗尽）。信令虽走已鉴权中继，仍按跨解析
+/// 边界的不可信输入做硬卫。
+fn signal_payload_within_bounds(p: &SignalPayload) -> bool {
+    p.candidates.len() <= MAX_PEER_CANDIDATES && p.cert_der.len() <= MAX_PEER_CERT_DER
+}
+
 /// 对一条对端信令负载发起打洞（spawn 异步 punch；`punching` 守卫避免重复打洞）。成功的连接经
 /// `res_tx` 回主循环保活；失败/超时则经 `evt_tx` 主动通告对端 `Fallback`（`fallback`
 /// 为本端 `SignalPayload`，仅用 nonce 关联本次会话），让对端不必干等满 5s 超时即知回退中继。
@@ -253,6 +266,15 @@ fn spawn_punch(
     fallback: SignalPayload,
 ) {
     if *punching {
+        return;
+    }
+    // 边界校验先于置 punching：畸形/恶意负载不消费打洞守卫、不起任务，直接拒绝（回退中继）。
+    if !signal_payload_within_bounds(&peer) {
+        log::warn!(
+            "P2P 对端信令负载超界（候选 {} / 证书 {} 字节），拒绝打洞、走中继",
+            peer.candidates.len(),
+            peer.cert_der.len()
+        );
         return;
     }
     *punching = true;
@@ -568,14 +590,24 @@ fn local_lan_addr() -> Option<IpAddr> {
 /// STUN transaction id 发号器（进程级单调，混入时间——非密码学随机，端点发现足够区分应答）。
 static TXN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 生成一个 96-bit STUN transaction id（时间纳秒低 64 位 + 进程内计数器 32 位）。
+/// 生成一个 96-bit STUN transaction id。**优先 CSPRNG**（复用 ring provider 的 `secure_random`，
+/// 零新依赖）：合 RFC 5389「transaction id SHOULD 密码学随机」，杜绝旧「时间+计数器」可预测、致网络
+/// 第三方伪造 STUN Binding Success 应答投毒候选端点（安全审查；投毒最坏只逼回退中继，但仍应闭合）。
+/// CSPRNG 不可用（极罕见）回退时间纳秒 + 进程计数器，仍足以区分应答、不阻塞。
 fn new_txn_id() -> [u8; 12] {
+    let mut id = [0u8; 12];
+    if rustls::crypto::ring::default_provider()
+        .secure_random
+        .fill(&mut id)
+        .is_ok()
+    {
+        return id;
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let ctr = TXN_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
-    let mut id = [0u8; 12];
     id[0..8].copy_from_slice(&nanos.to_le_bytes());
     id[8..12].copy_from_slice(&ctr.to_le_bytes());
     id
@@ -1068,13 +1100,6 @@ mod tests {
     }
 
     #[test]
-    fn txn_id_单调不重复() {
-        let a = new_txn_id();
-        let b = new_txn_id();
-        assert_ne!(a, b, "连续两次 transaction id 应不同");
-    }
-
-    #[test]
     fn 本地_lan_地址_不panic() {
         // 仅验证不 panic（CI 无网卡时可能 None）。
         let _ = local_lan_addr();
@@ -1156,6 +1181,49 @@ mod tests {
         let addr = got.expect("应探到端点");
         assert!(addr.ip().is_loopback(), "源地址应为本机回环");
         assert_ne!(addr.port(), 0, "应得到具体端口");
+    }
+
+    #[test]
+    fn signal_payload_边界校验_超界拒绝() {
+        let addr: SocketAddr = "1.2.3.4:5".parse().expect("addr");
+        // 正常负载（候选 ≤16、证书 ≤16KiB）通过。
+        let ok = SignalPayload {
+            candidates: vec![addr; 3],
+            cert_der: vec![0u8; 800],
+            nonce: 1,
+        };
+        assert!(signal_payload_within_bounds(&ok));
+        // 候选超界。
+        let too_many = SignalPayload {
+            candidates: vec![addr; MAX_PEER_CANDIDATES + 1],
+            cert_der: vec![0u8; 10],
+            nonce: 1,
+        };
+        assert!(!signal_payload_within_bounds(&too_many), "候选超界应拒");
+        // 证书超界。
+        let big_cert = SignalPayload {
+            candidates: vec![],
+            cert_der: vec![0u8; MAX_PEER_CERT_DER + 1],
+            nonce: 1,
+        };
+        assert!(!signal_payload_within_bounds(&big_cert), "证书超界应拒");
+        // 边界值（恰等上限）通过。
+        let edge = SignalPayload {
+            candidates: vec![addr; MAX_PEER_CANDIDATES],
+            cert_der: vec![0u8; MAX_PEER_CERT_DER],
+            nonce: 1,
+        };
+        assert!(signal_payload_within_bounds(&edge), "恰等上限应通过");
+    }
+
+    #[test]
+    fn txn_id_csprng_随机且不重复() {
+        // CSPRNG 路径：两次 transaction id 以压倒概率不同（96-bit）。
+        let a = new_txn_id();
+        let b = new_txn_id();
+        assert_ne!(a, b, "CSPRNG transaction id 应不同");
+        // 不应全零（CSPRNG 填充成功的弱信号）。
+        assert_ne!(a, [0u8; 12], "不应全零");
     }
 
     #[test]
