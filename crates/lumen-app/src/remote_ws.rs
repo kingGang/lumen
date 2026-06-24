@@ -3478,6 +3478,17 @@ impl RemoteWs {
         self.hist_term.as_ref()
     }
 
+    /// 控制端：清理「被控端字节夹紧后未返回」的尾部缺口 inflight 行——从 `from` 起把**连续在途**行移出
+    /// `hist_inflight`，使下次 [`Self::fetch_history_window`] 扫描据缺口从 `from` 续请求（被控端再从此处
+    /// 继续字节夹紧、逐段推进），杜绝缺口行永久卡在 inflight 致回看永久空白。整段返回（无字节夹紧）时
+    /// `from` 通常已非在途、即时停手，无副作用；偶发与相邻在途请求重叠时仅多一次幂等重拉，不致错乱。
+    fn clear_inflight_gap(&mut self, from: u64) {
+        let mut a = from;
+        while self.hist_inflight.remove(&a) {
+            a = a.saturating_add(1);
+        }
+    }
+
     /// 控制端：为回看窗口 `[top, top+rows)` 拉取缺失历史行（上下各约一屏预取，减少滚动
     /// 抖动时的请求次数）。已缓存 / 在途的行不重复请求。
     fn fetch_history_window(&mut self, top: u64, rows: usize) {
@@ -3957,11 +3968,13 @@ impl RemoteWs {
                 // 仅控制端：刷新边界 + 把回带的行入缓存、销在途、提版本触发重建。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
                     self.hist_bounds = Some((base, screen_top));
+                    let n = lines.len() as u64;
                     for (i, bytes) in lines.into_iter().enumerate() {
                         let abs = top + i as u64;
                         self.hist_inflight.remove(&abs);
                         self.hist_cache.insert(abs, bytes);
                     }
+                    self.clear_inflight_gap(top + n);
                     self.hist_version = self.hist_version.wrapping_add(1);
                     self.trim_history_cache();
                 }
@@ -3979,11 +3992,13 @@ impl RemoteWs {
                     && self.mirror_active_pane == Some(session_id)
                 {
                     self.hist_bounds = Some((base, screen_top));
+                    let n = lines.len() as u64;
                     for (i, bytes) in lines.into_iter().enumerate() {
                         let abs = top + i as u64;
                         self.hist_inflight.remove(&abs);
                         self.hist_cache.insert(abs, bytes);
                     }
+                    self.clear_inflight_gap(top + n);
                     self.hist_version = self.hist_version.wrapping_add(1);
                     self.trim_history_cache();
                 }
@@ -5517,6 +5532,31 @@ mod tests {
         );
         assert!(ws.hist_inflight.is_empty(), "应答覆盖的在途行应全部销账");
         assert_eq!(ws.hist_cache.len(), 3);
+    }
+
+    #[test]
+    fn 历史短应答清缺口在途() {
+        // 字节夹紧：请求 [10,20) 在途，被控端只返 [10,13)（字节预算截断）。返回的 3 行入缓存销账，
+        // 未返的 [13,20) 缺口须经 clear_inflight_gap 移出 inflight，否则永久卡住、回看空白。
+        let mut ws = RemoteWs::default();
+        起会话(&mut ws, Role::Controller);
+        for a in 10..20 {
+            ws.hist_inflight.insert(a); // 模拟请求 [10,20) 在途
+        }
+        relay(
+            &mut ws,
+            &RemoteFrame::HistoryRows {
+                top: 10,
+                base: 0,
+                screen_top: 100,
+                lines: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()], // 仅返 [10,13)
+            },
+        );
+        assert_eq!(ws.hist_cache.len(), 3, "返回的 3 行入缓存");
+        assert!(
+            ws.hist_inflight.is_empty(),
+            "未返的缺口 [13,20) 应被清出 inflight 以便续请求（否则永久空白）"
+        );
     }
 
     #[test]

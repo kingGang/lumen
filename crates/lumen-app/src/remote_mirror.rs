@@ -90,12 +90,20 @@ pub fn serialize_row_vt(row: &Row, cols: usize) -> Vec<u8> {
     out
 }
 
+/// 单个 HistoryRows 帧的**原始字节预算**：`lines` 是 `Vec<Vec<u8>>`、serde 序列化成 JSON 数字
+/// 数组约 3.6x 膨胀，故按原始字节夹在 ~800 KiB → JSON 约 2.9 MiB，稳在中继/QUIC 4 MiB 单帧上限内。
+/// 防超宽终端满色彩（每 cell 都换 SGR）下单帧击穿 4 MiB（中继会断整条 WS、QUIC 会静默丢帧）。
+const HISTORY_VT_BYTES_BUDGET: usize = 800 * 1024;
+
 /// part3d：被控端按**绝对行号**序列化历史行 `[top, top + count)`，回带当前历史边界。
 ///
 /// 返回 `(lines, base, screen_top)`：`lines[i]` 是绝对行 `top + i` 的 VT 字节（空 `Vec`
-/// = 该行空白或越界，控制端渲染为空白），长度恒为 `count` 以与请求对齐；`base` =
-/// 最旧保留行绝对行号（`Grid::line_by_abs` 内部据 `dropped_lines` 换算），`screen_top`
-/// = 可视区首行绝对行号。控制端据此夹紧回看范围。
+/// = 该行空白或越界，控制端渲染为空白）；`base` = 最旧保留行绝对行号（`Grid::line_by_abs` 内部据
+/// `dropped_lines` 换算），`screen_top` = 可视区首行绝对行号。控制端据此夹紧回看范围。
+///
+/// **字节预算夹紧**：累计 VT 字节超 [`HISTORY_VT_BYTES_BUDGET`] 即提前停（返回 < `count` 行），
+/// 防单帧击穿 4 MiB 上限。未返的尾部行由控制端按缺口（`hist_inflight` 缺口清理）从 `top + 已返行数`
+/// 续请求——故返回长度**不再恒等于 `count`**。至少返 1 行保证进度（极端单行超预算亦先返该行）。
 #[must_use]
 pub fn history_rows_vt(term: &Terminal, top: u64, count: usize) -> (Vec<Vec<u8>>, u64, u64) {
     let grid = term.grid();
@@ -106,10 +114,16 @@ pub fn history_rows_vt(term: &Terminal, top: u64, count: usize) -> (Vec<Vec<u8>>
         .saturating_sub(grid.cursor.row as u64);
     let base = screen_top.saturating_sub(grid.scrollback_len() as u64);
     let mut lines = Vec::with_capacity(count);
+    let mut total = 0usize;
     for i in 0..count as u64 {
         let bytes = grid
             .line_by_abs(top + i)
             .map_or_else(Vec::new, |r| serialize_row_vt(r, cols));
+        // 至少返 1 行保进度；之后累计超预算即停（尾部行控制端续请求）。
+        if !lines.is_empty() && total.saturating_add(bytes.len()) > HISTORY_VT_BYTES_BUDGET {
+            break;
+        }
+        total += bytes.len();
         lines.push(bytes);
     }
     (lines, base, screen_top)
