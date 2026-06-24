@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lumen_protocol::DeviceRecord;
+use winit::event_loop::EventLoopProxy;
 
 use crate::cloud::{server_url, CloudClient};
+use crate::PtyWake;
 
 /// 心跳 + 列表轮询周期。
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -42,8 +44,16 @@ pub struct RemoteState {
 }
 
 impl RemoteState {
-    /// 登录后启动后台心跳 + 轮询线程（已在跑则先停旧的）。
-    pub fn start(&mut self, token: String, ctx: egui::Context) {
+    /// 登录后启动后台心跳 + 轮询线程（已在跑则先停旧的）。`proxy`/`wake_pending` 用于**唤醒空闲的
+    /// winit 事件循环**（`ControlFlow::Wait` 下 `ctx.request_repaint()` 单独叫不醒空闲循环——必须经
+    /// `PtyWake`，否则停在远程设备视图时 30s 轮询拉到新列表也不重绘、在线状态不刷新，海风哥实测踩坑）。
+    pub fn start(
+        &mut self,
+        token: String,
+        ctx: egui::Context,
+        proxy: EventLoopProxy<PtyWake>,
+        wake_pending: Arc<AtomicBool>,
+    ) {
         self.stop();
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -52,7 +62,7 @@ impl RemoteState {
         self.rx = Some(rx);
         self.stop = Some(stop.clone());
         self.refresh = Some(refresh.clone());
-        std::thread::spawn(move || worker(&token, &tx, &stop, &refresh, &ctx));
+        std::thread::spawn(move || worker(&token, &tx, &stop, &refresh, &ctx, &proxy, &wake_pending));
     }
 
     /// 登出：停止后台线程、清空缓存。
@@ -141,6 +151,8 @@ fn worker(
     stop: &Arc<AtomicBool>,
     refresh: &Arc<AtomicBool>,
     ctx: &egui::Context,
+    proxy: &EventLoopProxy<PtyWake>,
+    wake_pending: &Arc<AtomicBool>,
 ) {
     let client = CloudClient::new(server_url());
     let mut last = Instant::now()
@@ -165,8 +177,17 @@ fn worker(
                     let _ = tx.send(Event::Error(e.user_message()));
                 }
             }
-            ctx.request_repaint();
+            nudge(ctx, proxy, wake_pending);
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// 唤醒主线程重绘 + **唤醒空闲的 winit 事件循环**（`request_repaint` 在 `ControlFlow::Wait` 下不叫醒
+/// 空闲循环，必须发 `PtyWake`）。`wake_pending` 与主线程清标志配对去重（同 remote_ws / p2p 的 nudge）。
+fn nudge(ctx: &egui::Context, proxy: &EventLoopProxy<PtyWake>, wake_pending: &Arc<AtomicBool>) {
+    ctx.request_repaint();
+    if !wake_pending.swap(true, Ordering::SeqCst) {
+        let _ = proxy.send_event(PtyWake);
     }
 }

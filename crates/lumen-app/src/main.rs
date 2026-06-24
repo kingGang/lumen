@@ -6566,7 +6566,14 @@ impl ApplicationHandler<PtyWake> for App {
                 if !state.remote.is_running() {
                     if let Some(tok) = state.profile.as_ref().and_then(|p| p.token.clone()) {
                         let ctx = state.egui_ctx.clone();
-                        state.remote.start(tok, ctx);
+                        // 传 proxy + wake_pending：设备列表后台线程拉到新数据后须唤醒空闲 winit 循环
+                        // （否则停在远程视图时在线状态不自动刷新，要切 tab 才更新）。
+                        state.remote.start(
+                            tok,
+                            ctx,
+                            state.proxy.clone(),
+                            state.wake_pending.clone(),
+                        );
                     }
                 }
                 if !state.remote_ws.is_running() {
