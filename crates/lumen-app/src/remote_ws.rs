@@ -23,8 +23,8 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,6 +65,12 @@ pub const HISTORY_CHUNK_MAX: u16 = 1024;
 /// 严重卡顿（海风哥实测）；降到 5ms：发送延迟 ≤5ms（低于 8ms 合帧预算），空闲时仍睡在 read 系统调用、
 /// CPU 可忽略。要彻底零延迟需读写分线程（tungstenite 单 socket 不便拆，5ms 轮询是务实解）。
 const READ_TIMEOUT: Duration = Duration::from_millis(5);
+/// 被控端读目录服务常驻 worker 线程数（review MED-1）：固定小池替代「每请求起一线程」，慢盘
+/// 并发读不互相阻塞，又封顶线程数。Fetch/Put 大文件另有滑动窗口背压，不走此池。
+const DIR_SERVICE_WORKERS: usize = 4;
+/// 读目录任务有界队列容量：满即拒绝并回 `FsErr::Io`（控制端不空挂）。正常负载下控制端
+/// `has_listing`/`is_pending` 闸使每目录至多一次在途，远不及此；上限仅防慢盘大量展开堆积。
+const DIR_SERVICE_QUEUE_CAP: usize = 64;
 /// 应用层 Ping 周期（保活 + 刷新服务端 `last_seen`）。
 const PING_INTERVAL: Duration = Duration::from_secs(25);
 /// 断线后重连退避。
@@ -348,6 +354,9 @@ pub struct RemoteWs {
     svc_tx: Option<Sender<SvcReply>>,
     /// 被控端：文件服务回包接收端（main 在 `pump_remote` 经 [`Self::drain_service`] 排空发回）。
     svc_rx: Option<Receiver<SvcReply>>,
+    /// 被控端：读目录服务有界队列入口（[`Self::start`] 建，常驻 worker 池消费；`stop` 置 `None`
+    /// 即 drop sender → 队列关闭、worker 退出）。替代旧「每请求起一线程」（review MED-1）。
+    dir_job_tx: Option<SyncSender<DirJob>>,
     /// 控制端：在途 Fetch（接收方）：req_id → 落本地文件的任务（#5 打开 / #7 下载）。
     inflight_fetch: HashMap<u64, FetchJob>,
     /// 被控端：在途 Fetch 源（发送方）：req_id → 给 worker 发「可再发一块」许可的句柄
@@ -734,6 +743,23 @@ impl RemoteFileTree {
     }
 }
 
+/// 被控端读目录服务任务（主线程 [`RemoteWs::spawn_list_dir`]/`spawn_list_dir_recursive` 入有界
+/// 队列，常驻 worker 池消费）。Fetch/Put 大文件传输各有滑动窗口背压，不经此队列。
+enum DirJob {
+    /// 单层列目录（→ [`SvcReply::ListDir`]）。
+    List {
+        req_id: u64,
+        path: String,
+        show_hidden: bool,
+    },
+    /// 片8 递归列目录树（→ [`SvcReply::ListDirRecursive`]）。
+    Recursive {
+        req_id: u64,
+        path: String,
+        show_hidden: bool,
+    },
+}
+
 /// 被控端文件服务后台线程 → 主线程的回包（主线程在 `pump_remote` 排空后处理）。
 enum SvcReply {
     /// ListDir 读目录结果（主线程发回 [`RemoteFrame::ListDirResult`]）。
@@ -981,6 +1007,111 @@ fn io_err_to_fs(e: &std::io::Error) -> FsErr {
     }
 }
 
+/// 被控端读目录服务 worker（[`RemoteWs::start`] 起 `DIR_SERVICE_WORKERS` 个常驻线程）：从有界
+/// 队列取任务、读盘构造回包、经 `svc_tx` 回主线程 + nudge 唤醒。多 worker 共享 `Arc<Mutex<Receiver>>`：
+/// **仅在锁内 `recv`，取到立即解锁再读盘**（读盘不持锁，放并发）。`recv` 返回 `Err`（主线程 drop
+/// 队列 sender，即会话停止）即退出——无需 join。
+fn dir_service_worker(
+    job_rx: &Arc<Mutex<Receiver<DirJob>>>,
+    svc_tx: &Sender<SvcReply>,
+    nudge_h: &(egui::Context, EventLoopProxy<PtyWake>, Arc<AtomicBool>),
+) {
+    loop {
+        let job = {
+            // 仅在锁内 recv（不持锁读盘，放并发）。锁中毒（理论上持 guard 期间 panic——当前 recv
+            // 不 panic、build_* 在解锁后执行故不会毒化，此为防御）：recover 内层 Receiver 继续，
+            // 使一次 panic 不致经中毒锁连环拖垮整池，仅损一个 worker。
+            let guard = job_rx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.recv() {
+                Ok(j) => j,
+                Err(_) => return, // sender 全 drop（会话停止）→ 队列关闭，退出。
+            }
+        };
+        let reply = match job {
+            DirJob::List {
+                req_id,
+                path,
+                show_hidden,
+            } => build_list_dir_reply(req_id, path, show_hidden),
+            DirJob::Recursive {
+                req_id,
+                path,
+                show_hidden,
+            } => build_list_dir_recursive_reply(req_id, path, show_hidden),
+        };
+        // UI 先退出 / 会话停止时 svc 通道已关：发送失败即收尾退出。
+        if svc_tx.send(reply).is_err() {
+            return;
+        }
+        let (ctx, proxy, wake) = nudge_h;
+        nudge(ctx, proxy, wake);
+    }
+}
+
+/// 构造单层列目录回包（worker 内调，与旧 `spawn_list_dir` 逻辑等价）。
+fn build_list_dir_reply(req_id: u64, path: String, show_hidden: bool) -> SvcReply {
+    match crate::shell::filetree::list_dir_entries(std::path::Path::new(&path), show_hidden) {
+        Ok((entries, overflow)) => SvcReply::ListDir {
+            req_id,
+            path,
+            entries,
+            overflow: u32::try_from(overflow).unwrap_or(u32::MAX),
+            err: None,
+        },
+        Err(()) => SvcReply::ListDir {
+            req_id,
+            path,
+            entries: Vec::new(),
+            overflow: 0,
+            err: Some(FsErr::Io),
+        },
+    }
+}
+
+/// 构造片8 递归列目录树回包（worker 内调，与旧 `spawn_list_dir_recursive` 逻辑等价）：先探根
+/// 可读性（失败回 `err`），再 DFS 枚举，5s deadline 防慢盘长阻塞、超上限截断。
+fn build_list_dir_recursive_reply(req_id: u64, path: String, show_hidden: bool) -> SvcReply {
+    let reply = match std::fs::read_dir(&path) {
+        Err(e) => SvcReply::ListDirRecursive {
+            req_id,
+            path,
+            entries: Vec::new(),
+            truncated: false,
+            err: Some(io_err_to_fs(&e)),
+        },
+        Ok(_) => {
+            let deadline = Some(Instant::now() + Duration::from_secs(5));
+            let (entries, truncated) = crate::shell::filetree::list_dir_recursive(
+                std::path::Path::new(&path),
+                show_hidden,
+                LIST_DIR_RECURSIVE_MAX_DEPTH,
+                LIST_DIR_RECURSIVE_MAX_ENTRIES,
+                deadline,
+            );
+            SvcReply::ListDirRecursive {
+                req_id,
+                path,
+                entries,
+                truncated,
+                err: None,
+            }
+        }
+    };
+    if let SvcReply::ListDirRecursive {
+        entries,
+        truncated,
+        err,
+        ..
+    } = &reply
+    {
+        log::debug!(
+            "[片8] 被控端递归枚举完成: {} 项 truncated={truncated} err={err:?}",
+            entries.len()
+        );
+    }
+    reply
+}
+
 /// 被控端 Fetch 源后台线程：打开文件 → 发 `FileBegin` → 受许可（ACK 窗口）逐块读发
 /// `FileChunk` → `FileEnd`。出错发 `FileErr`。帧经 `cmd_tx` 直投 WS 出站（不经主线程，
 /// 避免每块一次主线程往返）；许可通道关闭（会话结束 / 主线程清 `inflight_fetch_src`）即中止。
@@ -1145,7 +1276,7 @@ impl RemoteWs {
         let stop = Arc::new(AtomicBool::new(false));
         self.cmd_tx = Some(cmd_tx);
         self.evt_rx = Some(evt_rx);
-        self.svc_tx = Some(svc_tx);
+        self.svc_tx = Some(svc_tx.clone());
         self.svc_rx = Some(svc_rx);
         self.stop = Some(stop.clone());
         // 存一套 nudge 句柄：被控端文件服务 worker（spawn_list_dir）读盘完成后唤醒主线程
@@ -1153,6 +1284,23 @@ impl RemoteWs {
         self.ctx = Some(ctx.clone());
         self.proxy = Some(proxy.clone());
         self.wake_pending = Some(wake_pending.clone());
+        // 读目录服务常驻 worker 池 + 有界队列（review MED-1）：替代旧「每请求起一线程、无上限」。
+        // 多 worker 共享 Arc<Mutex<Receiver>>；主线程 drop dir_job_tx（stop）即关队列、worker 退出。
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<DirJob>(DIR_SERVICE_QUEUE_CAP);
+        self.dir_job_tx = Some(job_tx);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let nudge_h = (ctx.clone(), proxy.clone(), wake_pending.clone());
+        for i in 0..DIR_SERVICE_WORKERS {
+            let job_rx = Arc::clone(&job_rx);
+            let svc_tx = svc_tx.clone();
+            let nudge_h = nudge_h.clone();
+            if let Err(e) = thread::Builder::new()
+                .name(format!("lumen-dir-svc-{i}"))
+                .spawn(move || dir_service_worker(&job_rx, &svc_tx, &nudge_h))
+            {
+                log::error!("启动读目录服务 worker {i} 失败: {e}");
+            }
+        }
         if let Err(e) = thread::Builder::new()
             .name("lumen-remote-ws".into())
             .spawn(move || worker(&token, &cmd_rx, &evt_tx, &stop, &ctx, &proxy, &wake_pending))
@@ -1181,6 +1329,8 @@ impl RemoteWs {
         // 先 clear（其内排空 svc_rx 丢弃在途回包）再断 svc 通道——否则 svc_rx 已 None
         // 时排空成死代码（与 end_session/Disconnected 路径行为不一致）。
         self.clear_remote_filetree();
+        // 先 drop 读目录队列入口：关 sync_channel → worker 的 recv 返回 Err 即退出（无需 join）。
+        self.dir_job_tx = None;
         self.svc_tx = None;
         self.svc_rx = None;
         self.notices.clear();
@@ -1870,111 +2020,73 @@ impl RemoteWs {
         std::mem::take(&mut self.pending_listdir_recursive)
     }
 
-    /// 被控端：后台线程读目录（绝不在主循环同步 IO——慢速网络盘会冻结整个应用），
-    /// 结果经 `svc_tx` 回主线程，由 [`Self::drain_service`] 发回控制端。
+    /// 被控端：把单层读目录请求投入有界服务队列（绝不在主循环同步 IO——慢速网络盘会冻结整个
+    /// 应用），worker 读完经 `svc_tx` 回主线程，由 [`Self::drain_service`] 发回控制端。
     ///
-    /// TODO(片3 文件服务统一)：当前每请求起一条 OS 线程、无并发上限（review MED-1）。正常
-    /// 负载下控制端的 `has_listing`/`is_pending` 闸使每目录至多请求一次、量极小；但慢速网络
-    /// 盘上大量展开会堆线程。片3 引入 Fetch/Put 大文件传输时，把读目录 / 读文件 / 写文件统
-    /// 一收敛为「常驻 service 线程 + 有界任务队列 + inflight 上限」，与历史服务的同步有界精神
-    /// 一致。威胁模型上控制端已是配对鉴权方（本可在被控端跑任意命令），不构成提权，故片2 不阻断。
+    /// review MED-1：已由「每请求起一线程、无上限」收敛为「常驻 worker 池 + 有界队列」
+    /// （见 [`Self::start`]）。队列满即回 `FsErr::Io`（控制端不空挂）。正常负载下控制端的
+    /// `has_listing`/`is_pending` 闸使每目录至多一次在途，远不及上限；威胁模型上控制端本就是配对
+    /// 鉴权方（可在被控端跑任意命令），队列仅防慢盘大量展开堆积，不构成提权阻断。
     pub fn spawn_list_dir(&self, req_id: u64, path: String, show_hidden: bool) {
-        let Some(tx) = self.svc_tx.clone() else {
-            return;
-        };
-        // nudge 句柄：读盘完成后唤醒主线程 drain_service 立即发回 ListDirResult。否则空闲被控端
-        // 的结果卡到下个偶发 user_event 才发出，控制端目录加载慢数秒（海风哥反馈 ~10s 的根因）。
-        let nudge_h = self.nudge_handle();
-        thread::spawn(move || {
-            let reply = match crate::shell::filetree::list_dir_entries(
-                std::path::Path::new(&path),
+        self.enqueue_dir_job(
+            DirJob::List {
+                req_id,
+                path: path.clone(),
                 show_hidden,
-            ) {
-                Ok((entries, overflow)) => SvcReply::ListDir {
-                    req_id,
-                    path,
-                    entries,
-                    overflow: u32::try_from(overflow).unwrap_or(u32::MAX),
-                    err: None,
-                },
-                Err(()) => SvcReply::ListDir {
-                    req_id,
-                    path,
-                    entries: Vec::new(),
-                    overflow: 0,
-                    err: Some(FsErr::Io),
-                },
-            };
-            // UI 先退出时通道已关：发送失败静默忽略。
-            let _ = tx.send(reply);
-            if let Some((ctx, proxy, wake)) = &nudge_h {
-                nudge(ctx, proxy, wake);
-            }
-        });
+            },
+            req_id,
+            path,
+            false,
+        );
     }
 
-    /// 被控端：后台线程递归读目录树（片8），结果经 `svc_tx` 回主线程发回控制端。同 [`Self::spawn_list_dir`]
-    /// 不阻塞主循环；先探测根可读性（失败回 `err`），再 DFS 枚举，5s deadline 防慢盘长阻塞、超上限截断。
+    /// 被控端：把片8 递归读目录树请求投入有界服务队列，worker 读完经 `svc_tx` 回主线程发回控制端。
+    /// 同 [`Self::spawn_list_dir`] 不阻塞主循环；worker 内先探根可读性（失败回 `err`），再 DFS 枚举，
+    /// 5s deadline 防慢盘长阻塞、超上限截断。
     pub fn spawn_list_dir_recursive(&self, req_id: u64, path: String, show_hidden: bool) {
-        let Some(tx) = self.svc_tx.clone() else {
-            return;
+        self.enqueue_dir_job(
+            DirJob::Recursive {
+                req_id,
+                path: path.clone(),
+                show_hidden,
+            },
+            req_id,
+            path,
+            true,
+        );
+    }
+
+    /// 被控端：把读目录任务投入有界队列（`try_send` 非阻塞——绝不阻塞主线程）。队列满 / 通道断时
+    /// 立即回 `FsErr::Io`（按 `recursive` 选回包类型），让控制端清 `is_pending`、显式失败，而非空挂。
+    fn enqueue_dir_job(&self, job: DirJob, req_id: u64, path: String, recursive: bool) {
+        let Some(tx) = self.dir_job_tx.as_ref() else {
+            return; // 会话未起 / 已停：静默（控制端会因断连整体复位）。
         };
-        let nudge_h = self.nudge_handle();
-        thread::spawn(move || {
-            let reply = match std::fs::read_dir(&path) {
-                Err(e) => SvcReply::ListDirRecursive {
-                    req_id,
-                    path,
-                    entries: Vec::new(),
-                    truncated: false,
-                    err: Some(io_err_to_fs(&e)),
-                },
-                Ok(_) => {
-                    let deadline = Some(Instant::now() + Duration::from_secs(5));
-                    let (entries, truncated) = crate::shell::filetree::list_dir_recursive(
-                        std::path::Path::new(&path),
-                        show_hidden,
-                        LIST_DIR_RECURSIVE_MAX_DEPTH,
-                        LIST_DIR_RECURSIVE_MAX_ENTRIES,
-                        deadline,
-                    );
+        // try_send 非阻塞：队列满（worker 全卡在慢盘）/ 通道断即回 err，绝不阻塞主线程。
+        if tx.try_send(job).is_err() {
+            log::warn!("被控端读目录队列已满，拒绝 req_id={req_id} path={path}");
+            // 经 svc_tx 回一条 err（drain_service 下帧发回控制端），让控制端清 is_pending、显式失败。
+            if let Some(svc) = self.svc_tx.as_ref() {
+                let reply = if recursive {
                     SvcReply::ListDirRecursive {
                         req_id,
                         path,
-                        entries,
-                        truncated,
-                        err: None,
+                        entries: Vec::new(),
+                        truncated: false,
+                        err: Some(FsErr::Io),
                     }
-                }
-            };
-            if let SvcReply::ListDirRecursive {
-                entries,
-                truncated,
-                err,
-                ..
-            } = &reply
-            {
-                log::debug!(
-                    "[片8] 被控端递归枚举完成: {} 项 truncated={truncated} err={err:?}",
-                    entries.len()
-                );
+                } else {
+                    SvcReply::ListDir {
+                        req_id,
+                        path,
+                        entries: Vec::new(),
+                        overflow: 0,
+                        err: Some(FsErr::Io),
+                    }
+                };
+                let _ = svc.send(reply);
             }
-            let _ = tx.send(reply);
-            if let Some((ctx, proxy, wake)) = &nudge_h {
-                nudge(ctx, proxy, wake);
-            }
-        });
-    }
-
-    /// 取一套 nudge 句柄（`start` 后存在）：供文件服务 worker 完成后唤醒主线程收包。
-    fn nudge_handle(
-        &self,
-    ) -> Option<(egui::Context, EventLoopProxy<PtyWake>, Arc<AtomicBool>)> {
-        Some((
-            self.ctx.clone()?,
-            self.proxy.clone()?,
-            self.wake_pending.clone()?,
-        ))
+        }
     }
 
     /// 被控端：排空文件服务后台回包（main 每帧 `pump_remote` 调）。先收齐释放 `svc_rx` 借用，
@@ -4783,6 +4895,73 @@ mod tests {
         // stop 在未启动时应安全（幂等）。
         ws.stop();
         assert!(!ws.is_running());
+    }
+
+    #[test]
+    fn 读目录队列满_回err不空挂() {
+        // review MED-1 有界队列：满即回 FsErr，控制端清 is_pending、显式失败，而非永久空挂。
+        let mut ws = RemoteWs::default();
+        // 容量 1、无 worker 消费：第 1 个填满，第 2 个必被拒。`_job_rx` 须存活（否则通道断）。
+        let (job_tx, _job_rx) = std::sync::mpsc::sync_channel::<DirJob>(1);
+        let (svc_tx, svc_rx) = std::sync::mpsc::channel();
+        ws.dir_job_tx = Some(job_tx);
+        ws.svc_tx = Some(svc_tx);
+        ws.spawn_list_dir(1, "/q".into(), false); // 入队（占满）
+        ws.spawn_list_dir(2, "/q".into(), false); // 队满 → 回 err
+        let replies: Vec<_> = svc_rx.try_iter().collect();
+        assert_eq!(replies.len(), 1, "仅被拒的第 2 个回 err");
+        match &replies[0] {
+            SvcReply::ListDir { req_id, err, entries, .. } => {
+                assert_eq!(*req_id, 2);
+                assert!(err.is_some(), "满队列回 FsErr");
+                assert!(entries.is_empty());
+            }
+            _ => panic!("应为 ListDir err"),
+        }
+    }
+
+    #[test]
+    fn build_list_dir_reply_可读目录与缺失路径() {
+        let base = std::env::temp_dir().join(format!("lumen_dirsvc_t_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::write(base.join("probe.txt"), b"x");
+        // 可读目录：无 err、能列到文件、req_id 透传。
+        let reply = build_list_dir_reply(11, base.to_string_lossy().into_owned(), false);
+        match reply {
+            SvcReply::ListDir { req_id, entries, err, .. } => {
+                assert_eq!(req_id, 11);
+                assert!(err.is_none(), "可读目录不应 err");
+                assert!(entries.iter().any(|e| e.name == "probe.txt"), "应列到 probe.txt");
+            }
+            _ => panic!("应为 ListDir"),
+        }
+        let missing = base.join("nope_sub");
+        let _ = std::fs::remove_dir_all(&base);
+        // 缺失路径：err。
+        let reply = build_list_dir_reply(12, missing.to_string_lossy().into_owned(), false);
+        match reply {
+            SvcReply::ListDir { req_id, entries, err, .. } => {
+                assert_eq!(req_id, 12);
+                assert!(err.is_some(), "缺失路径应 err");
+                assert!(entries.is_empty());
+            }
+            _ => panic!("应为 ListDir"),
+        }
+    }
+
+    #[test]
+    fn build_list_dir_recursive_reply_缺失路径回err() {
+        let missing = std::env::temp_dir().join("lumen_dirsvc_nonexistent_xyz_42");
+        let _ = std::fs::remove_dir_all(&missing); // 保证不存在
+        let reply = build_list_dir_recursive_reply(13, missing.to_string_lossy().into_owned(), false);
+        match reply {
+            SvcReply::ListDirRecursive { req_id, entries, truncated, err, .. } => {
+                assert_eq!(req_id, 13);
+                assert!(err.is_some(), "缺失路径 read_dir 失败应回 err");
+                assert!(entries.is_empty() && !truncated);
+            }
+            _ => panic!("应为 ListDirRecursive"),
+        }
     }
 
     #[test]
