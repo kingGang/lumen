@@ -16,6 +16,8 @@ use crate::state::AppState;
 
 /// 单次历史推送的最大条目数（超出拒绝，防批量灌库）。
 const MAX_HISTORY_BATCH: usize = 5000;
+/// 单次历史拉取返回的最大条目数（超出截断并置 `has_more`，客户端续拉）。
+const HISTORY_PULL_LIMIT: i64 = 5000;
 /// 偏好 blob 最大字节数（512 KiB）。
 const MAX_SETTINGS_BYTES: usize = 512 * 1024;
 /// 设备名最大长度（字节）。
@@ -302,7 +304,12 @@ pub struct HistorySince {
     pub since: i64,
 }
 
-/// `GET /sync/history?since=<ts_ms>`：拉取增量历史（按 `ts` 升序，单批上限 5000）。
+/// `GET /sync/history?since=<ts_ms>`：拉取增量历史（按 `ts` 升序，单批上限 `HISTORY_PULL_LIMIT`）。
+/// 多取 1 条精确判定 `has_more`：若查回 limit+1 条，则截回 limit 条并置 `has_more=true`，客户端
+/// 据此用新 `since=watermark` 续拉。
+///
+/// 注：水位线按 `ts`、续拉用严格 `ts > watermark`——理论上同一毫秒内 >limit 条会在批边界丢同 ts
+/// 尾条（需 `(ts,id)` 复合游标才完全杜绝），但单毫秒 5000 条历史不现实，故不为此引入 id 游标。
 pub async fn pull_history(
     State(state): State<AppState>,
     user: AuthUser,
@@ -311,13 +318,17 @@ pub async fn pull_history(
     let client = state.pool.get().await?;
     let rows = client
         .query(
-            "SELECT text, ts, cwd, exit_code FROM history_entries WHERE user_id=$1 AND ts > $2 ORDER BY ts ASC LIMIT 5000",
-            &[&user.user_id, &q.since],
+            "SELECT text, ts, cwd, exit_code FROM history_entries WHERE user_id=$1 AND ts > $2 ORDER BY ts ASC LIMIT $3",
+            &[&user.user_id, &q.since, &(HISTORY_PULL_LIMIT + 1)],
         )
         .await?;
+    // 多取的第 limit+1 条仅用于判定后续是否还有，不返回给客户端。
+    let has_more = rows.len() as i64 > HISTORY_PULL_LIMIT;
+    let take = rows.len().min(HISTORY_PULL_LIMIT as usize);
     let mut watermark = q.since;
     let entries: Vec<HistoryEntry> = rows
         .iter()
+        .take(take)
         .map(|row| {
             let ts: i64 = row.get(1);
             if ts > watermark {
@@ -331,7 +342,11 @@ pub async fn pull_history(
             }
         })
         .collect();
-    Ok(Json(HistoryPullResponse { entries, watermark }))
+    Ok(Json(HistoryPullResponse {
+        entries,
+        watermark,
+        has_more,
+    }))
 }
 
 /// `POST /sync/history`：推送历史，多设备来源按 `(user, text, ts)` 去重合并。

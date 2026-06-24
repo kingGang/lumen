@@ -206,6 +206,10 @@ pub struct HistoryPullResponse {
     pub entries: Vec<HistoryEntry>,
     /// 本批最大 `ts`（客户端存为下次 `since` 水位线；空批回传请求的 `since`）。
     pub watermark: i64,
+    /// 本批是否被单批上限截断、`watermark` 之后仍有更多——客户端应据此用新 `since=watermark`
+    /// 立即续拉，而非等下次周期同步。`#[serde(default)]` = 旧服务端缺该字段时按 `false` 处理。
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[cfg(test)]
@@ -262,5 +266,24 @@ mod tests {
         let json = serde_json::to_string(&e).expect("序列化");
         assert!(!json.contains("cwd"));
         assert!(!json.contains("exit_code"));
+    }
+
+    #[test]
+    fn 历史拉取响应_has_more_往返与默认() {
+        // 显式 has_more=true 往返保真。
+        let resp = HistoryPullResponse {
+            entries: vec![],
+            watermark: 99,
+            has_more: true,
+        };
+        let json = serde_json::to_string(&resp).expect("序列化");
+        let back: HistoryPullResponse = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.watermark, 99);
+        assert!(back.has_more);
+        // 旧服务端响应缺 has_more → serde(default) 落 false（混版本前向兼容）。
+        let legacy: HistoryPullResponse =
+            serde_json::from_str(r#"{"entries":[],"watermark":7}"#).expect("旧响应反序列化");
+        assert_eq!(legacy.watermark, 7);
+        assert!(!legacy.has_more, "缺字段应默认 false");
     }
 }
