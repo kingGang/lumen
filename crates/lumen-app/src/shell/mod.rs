@@ -2285,12 +2285,11 @@ fn remote_device_list_ui(
     }
     ui.add_space(2.0);
 
-    // 过滤掉本机（本机会话已在「本地」tab 显示，远程列表只列其他设备）；
-    // 排序：在线置顶、离线置底（各组内保持服务端 last_seen 倒序）。
-    let mut order: Vec<usize> = (0..devices.len())
-        .filter(|&i| !devices[i].is_self)
+    // 过滤掉本机（本机会话已在「本地」tab 显示）+ **离线设备**（海风哥要求：离线即从列表移除，
+    // 只列当前在线的其他设备；服务端按 last_seen 窗口判在线）。各组内保持服务端 last_seen 倒序。
+    let order: Vec<usize> = (0..devices.len())
+        .filter(|&i| !devices[i].is_self && devices[i].online)
         .collect();
-    order.sort_by_key(|&i| !devices[i].online);
 
     egui::ScrollArea::vertical()
         .id_salt("remote_device_scroll")

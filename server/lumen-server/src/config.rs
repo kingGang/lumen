@@ -43,10 +43,12 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(7 * 24 * 3600),
+            // 在线窗口：last_seen 在此秒内视为在线。45s ≈ 客户端 10s 心跳的 4 次容差——离线后约
+            // 45s 即被判离线、从控制端列表移除（120s 太久，海风哥反馈离线迟迟不消失）。
             online_window_secs: env::var("LUMEN_ONLINE_WINDOW_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(120),
+                .unwrap_or(45),
             stun_bind_addr: env::var("LUMEN_STUN_BIND_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:8788".to_string()),
         }

@@ -4584,6 +4584,13 @@ impl ApplicationHandler<PtyWake> for App {
         // 整屏快照转发。置于 PTY drain 之前，保证「快照先于实时增量」。
         state.pump_remote();
 
+        // M5.2 设备列表：后台 worker 拉到新列表后经 PtyWake 唤醒到此（ControlFlow::Wait 下
+        // request_repaint 单独叫不醒空闲循环）。**必须在此排空 + 重绘**——否则该 PtyWake 不带 PTY
+        // 数据，下方按需重绘不触发，设备在线/上下线永不刷新（要切 tab 才更新，海风哥实测踩坑）。
+        if state.remote.poll() {
+            state.window.request_redraw();
+        }
+
         // 片6 虚拟文件剪贴板：OLE 线程请求把远程文件下到临时文件（资源管理器粘贴远程虚拟文件
         // 触发）。先收齐释放 rx 借用，再逐个起 Clipboard Fetch（传完经 reply 回临时文件路径）。
         let clip_cmds: Vec<remote_ws::ClipFetchCmd> = state

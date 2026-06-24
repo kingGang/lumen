@@ -16,8 +16,9 @@ use winit::event_loop::EventLoopProxy;
 use crate::cloud::{server_url, CloudClient};
 use crate::PtyWake;
 
-/// 心跳 + 列表轮询周期。
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// 心跳 + 列表轮询周期。10s：上下线在列表里更及时反映（轻量 HTTP，几台设备开销可忽略）；
+/// 须 < 服务端在线窗口 `LUMEN_ONLINE_WINDOW_SECS`（默认 45s ≈ 4 次心跳容差），免误判离线。
+const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 后台线程 → 主线程的消息。
 enum Event {
