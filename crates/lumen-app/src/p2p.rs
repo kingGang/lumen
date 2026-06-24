@@ -239,13 +239,18 @@ fn gen_nonce() -> u64 {
 }
 
 /// 对一条对端信令负载发起打洞（spawn 异步 punch；`punching` 守卫避免重复打洞）。成功的连接经
-/// `res_tx` 回主循环保活。
+/// `res_tx` 回主循环保活；失败/超时则经 `evt_tx` 主动通告对端 `Fallback`（`fallback`
+/// 为本端 `SignalPayload`，仅用 nonce 关联本次会话），让对端不必干等满 5s 超时即知回退中继。
+#[allow(clippy::too_many_arguments)] // 与主循环共享的一组句柄/通道，拆结构体反更晦涩。
 fn spawn_punch(
     de: &DirectEndpoint,
     peer: SignalPayload,
     res_tx: &UnboundedSender<quinn::Connection>,
     punching: &mut bool,
     role: Role,
+    evt_tx: &Sender<P2pEvent>,
+    waker: &Option<Waker>,
+    fallback: SignalPayload,
 ) {
     if *punching {
         return;
@@ -256,12 +261,24 @@ fn spawn_punch(
     let peer_cert = CertificateDer::from(peer.cert_der);
     let cands = peer.candidates;
     let tx = res_tx.clone();
+    let evt = evt_tx.clone();
+    let wk = waker.clone();
     tokio::spawn(async move {
         match punch(&ep, &cert, &peer_cert, &cands, PUNCH_TIMEOUT, role).await {
             Some(conn) => {
                 let _ = tx.send(conn);
             }
-            None => log::info!("P2P 打洞失败/超时，继续走中继"),
+            None => {
+                log::info!("P2P 打洞失败/超时，主动通告对端回退中继");
+                emit(
+                    &evt,
+                    &wk,
+                    P2pEvent::SendSignal {
+                        kind: P2pSignalKind::Fallback,
+                        payload: fallback,
+                    },
+                );
+            }
         }
     });
 }
@@ -341,16 +358,34 @@ fn run(
                                     payload: my_payload.clone(),
                                 },
                             );
-                            spawn_punch(&de, payload, &res_tx, &mut punching, role);
+                            spawn_punch(
+                                &de,
+                                payload,
+                                &res_tx,
+                                &mut punching,
+                                role,
+                                evt_tx,
+                                &waker,
+                                my_payload.clone(),
+                            );
                         }
                         P2pSignalKind::Answer => {
-                            spawn_punch(&de, payload, &res_tx, &mut punching, role);
+                            spawn_punch(
+                                &de,
+                                payload,
+                                &res_tx,
+                                &mut punching,
+                                role,
+                                evt_tx,
+                                &waker,
+                                my_payload.clone(),
+                            );
                         }
                         // data_ready 由 run_data_plane 在**本端数据面流真正建立**时置位（而非据对端 Ready），
                         // 避免流失败/未建时误判已直连（审查 #4）。Ready 信令仅作诊断。
                         P2pSignalKind::Ready => log::debug!("P2P 对端报告直连就绪"),
-                        // 打洞失败双端各自 5s 超时兜底；spawn_punch 失败暂不主动发 Fallback（审查 #5，
-                        // 影响极小，列为技术债）。此臂收对端可能的 Fallback 通告。
+                        // 收对端打洞失败的主动 Fallback 通告（双端另各有 5s 超时兜底）。本端为中继优先、
+                        // P2P 仅叠加优化，此处无需改路由，记一条诊断即可。
                         P2pSignalKind::Fallback => log::info!("P2P 对端宣告回退中继"),
                     },
                     Some(P2pCmd::Stop) | None => break,
