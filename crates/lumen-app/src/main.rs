@@ -6689,6 +6689,9 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     None
                 };
+                // 状态栏文件传输进度（控制端活跃 Fetch/Put 聚合；空闲 None → 状态栏照常显示 cwd）。
+                // owned，借给 shell_input；须在其前算、生命周期覆盖本帧渲染。
+                let transfer_status = state.remote_ws.transfer_status();
                 let shell_input = shell::ShellInput {
                     panes: &panes_view,
                     layout: tab.layout.clone(),
@@ -6713,6 +6716,7 @@ impl ApplicationHandler<PtyWake> for App {
                     ),
                     #[cfg(feature = "input-editor")]
                     force_fallback: state.force_fallback,
+                    transfer: transfer_status.as_ref(),
                     history_rows: &history_rows_owned,
                     #[cfg(feature = "input-editor")]
                     completion_view: completion_view_owned,

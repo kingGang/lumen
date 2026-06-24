@@ -839,6 +839,9 @@ struct FetchJob {
     next_seq: u32,
     /// 已写入字节累计（控制端硬上限：超 [`FETCH_MAX_LEN`] 即中止，不轻信被控端的上限）。
     written: u64,
+    /// 文件总字节（`FileBegin.total_len`；状态栏下载进度分母，0=未知/未开始）。仅展示用，
+    /// finalize 仍以 `FileEnd` 为准（不轻信此值）。
+    total: u64,
     /// 上次收到块的时刻（停滞超时清理；`FileBegin` 与每块刷新）。
     last_at: Instant,
     /// 仅 `Clipboard`：把收到的分块 / 结束 / 失败喂给 OLE 线程 IStream 的下行端。
@@ -871,6 +874,30 @@ pub struct ClipItem {
     pub name: String,
     /// 是否目录（决定递归 vs 单文件）。
     pub is_dir: bool,
+}
+
+/// 控制端状态栏文件传输进度聚合（每帧由 [`RemoteWs::transfer_status`] 算；空闲返回 `None`）。
+/// 下载（含双击打开）有 `written`/`total` → 聚合字节进度条；上传仅计数（控制端不集中跟踪上传
+/// 字节）。剪贴板流式拉取不计入（进度在资源管理器 IStream 侧）。
+pub struct TransferStatus {
+    /// 活跃下载文件数（含双击打开）。
+    pub downloads: usize,
+    /// 活跃上传文件数。
+    pub uploads: usize,
+    /// 下载已传字节聚合（`sum(written)`）。
+    pub down_done: u64,
+    /// 下载总字节聚合（`sum(total)`；可能为 0 = 尚未收到 `FileBegin`，此时进度条画不定态）。
+    pub down_total: u64,
+    /// 在传文件名（下载 + 上传；状态栏按帧时间轮换展示其一）。
+    pub names: Vec<String>,
+}
+
+impl TransferStatus {
+    /// 下载聚合进度比 `[0,1]`；`down_total==0`（未知）时返回 `None`（状态栏画不定态）。
+    #[must_use]
+    pub fn down_ratio(&self) -> Option<f32> {
+        (self.down_total > 0).then(|| (self.down_done as f32 / self.down_total as f32).clamp(0.0, 1.0))
+    }
 }
 
 /// #7 下载编排（远程 → 本地）：控制端用 ListDir 递归走被控端目录树、Fetch 拉文件落到本地
@@ -2218,6 +2245,7 @@ impl RemoteWs {
                 file: None,
                 next_seq: 0,
                 written: 0,
+                total: 0,
                 last_at: Instant::now(),
                 clip_stream: None,
             },
@@ -2245,6 +2273,7 @@ impl RemoteWs {
                 file: None,
                 next_seq: 0,
                 written: 0,
+                total: 0,
                 last_at: Instant::now(),
                 clip_stream: Some(data_tx),
             },
@@ -2336,8 +2365,9 @@ impl RemoteWs {
     }
 
     /// 控制端：收 `FileBegin`。Open=临时目录 `{req_id}-名`；Download=目标路径（先 `create_dir_all`
-    /// 父目录）；Clipboard 流式**不落盘**，仅重置连续性计数。
-    fn fetch_begin(&mut self, req_id: u64) {
+    /// 父目录）；Clipboard 流式**不落盘**，仅重置连续性计数。`total_len` 存入 job 供状态栏进度
+    /// 展示（仅展示，finalize 仍以 `FileEnd` 为准）。
+    fn fetch_begin(&mut self, req_id: u64, total_len: u64) {
         let (kind, name, dest_opt) = {
             let Some(job) = self.inflight_fetch.get(&req_id) else {
                 return;
@@ -2349,6 +2379,7 @@ impl RemoteWs {
             if let Some(job) = self.inflight_fetch.get_mut(&req_id) {
                 job.next_seq = 0;
                 job.written = 0;
+                job.total = total_len;
                 job.last_at = Instant::now();
             }
             return;
@@ -2379,6 +2410,7 @@ impl RemoteWs {
                     job.dest = Some(target);
                     job.next_seq = 0; // 重置连续性计数（防异常重发 FileBegin 后误判乱序）。
                     job.written = 0;
+                    job.total = total_len;
                     job.last_at = Instant::now();
                 }
             }
@@ -2507,6 +2539,47 @@ impl RemoteWs {
             Some(FetchKind::Open) => self.notices.push(Notice::FetchFailed(err)),
             Some(FetchKind::Clipboard) | None => {}
         }
+    }
+
+    /// 控制端：聚合当前活跃文件传输供状态栏展示（main 每帧调）。无活跃传输返回 `None`
+    /// （状态栏照常显示 cwd）。下载（含双击打开）汇聚字节进度；上传仅计数；剪贴板流式不计入
+    /// （进度在资源管理器 IStream 侧）。
+    #[must_use]
+    pub fn transfer_status(&self) -> Option<TransferStatus> {
+        let mut downloads = 0usize;
+        let mut down_done = 0u64;
+        let mut down_total = 0u64;
+        let mut names: Vec<String> = Vec::new();
+        for job in self.inflight_fetch.values() {
+            if matches!(job.kind, FetchKind::Clipboard) {
+                continue; // 剪贴板流不落盘、进度在 OLE 侧，不计入状态栏。
+            }
+            downloads += 1;
+            down_done = down_done.saturating_add(job.written);
+            down_total = down_total.saturating_add(job.total);
+            if !job.name.is_empty() {
+                names.push(job.name.clone());
+            }
+        }
+        // 上传计数取活跃发送方（inflight_put_src）；名字经同 req_id 的 put_meta 取，与计数一致。
+        let uploads = self.inflight_put_src.len();
+        for req_id in self.inflight_put_src.keys() {
+            if let Some(meta) = self.inflight_put_meta.get(req_id) {
+                if !meta.name.is_empty() {
+                    names.push(meta.name.clone());
+                }
+            }
+        }
+        if downloads + uploads == 0 {
+            return None;
+        }
+        Some(TransferStatus {
+            downloads,
+            uploads,
+            down_done,
+            down_total,
+            names,
+        })
     }
 
     /// 控制端：清理停滞（超 [`FETCH_STALL_TIMEOUT`] 没收到新块）的在途 Fetch。
@@ -2710,11 +2783,12 @@ impl RemoteWs {
                 FetchJob {
                     kind: FetchKind::Download,
                     src_path: src.clone(),
-                    name: String::new(),
+                    name: last_path_segment(&src),
                     dest: Some(dest),
                     file: None,
                     next_seq: 0,
                     written: 0,
+                    total: 0,
                     last_at: Instant::now(),
                     clip_stream: None,
                 },
@@ -4254,10 +4328,10 @@ impl RemoteWs {
                     self.inflight_fetch_src.remove(&req_id);
                 }
             }
-            RemoteFrame::FileBegin { req_id, .. } => {
-                // 仅控制端：建临时落地文件。total_len 仅供进度，finalize 以 FileEnd 为准。
+            RemoteFrame::FileBegin { req_id, total_len } => {
+                // 仅控制端：建临时落地文件。total_len 存入 job 供状态栏进度，finalize 以 FileEnd 为准。
                 if matches!(self.session.as_ref().map(|s| s.role), Some(Role::Controller)) {
-                    self.fetch_begin(req_id);
+                    self.fetch_begin(req_id, total_len);
                 }
             }
             RemoteFrame::FileChunk { req_id, seq, data } => {
@@ -5036,6 +5110,52 @@ mod tests {
     }
 
     #[test]
+    fn transfer_status_聚合下载字节_排除剪贴板() {
+        let mk = |kind, name: &str, written, total| FetchJob {
+            kind,
+            src_path: "/x".into(),
+            name: name.into(),
+            dest: None,
+            file: None,
+            next_seq: 0,
+            written,
+            total,
+            last_at: Instant::now(),
+            clip_stream: None,
+        };
+        let mut ws = RemoteWs::default();
+        assert!(ws.transfer_status().is_none(), "无传输应 None");
+        ws.inflight_fetch
+            .insert(1, mk(FetchKind::Download, "a.bin", 50, 100));
+        ws.inflight_fetch
+            .insert(2, mk(FetchKind::Open, "b.bin", 30, 200));
+        // 剪贴板流：不计入下载、字节、名字轮换。
+        ws.inflight_fetch
+            .insert(3, mk(FetchKind::Clipboard, "c.bin", 999, 999));
+        let ts = ws.transfer_status().expect("有传输");
+        assert_eq!(ts.downloads, 2, "剪贴板不计入下载数");
+        assert_eq!(ts.uploads, 0);
+        assert_eq!(ts.down_done, 80, "50+30，剪贴板 999 不计");
+        assert_eq!(ts.down_total, 300, "100+200");
+        assert_eq!(ts.downloads + ts.uploads, 2);
+        let r = ts.down_ratio().expect("有总字节");
+        assert!((r - 80.0 / 300.0).abs() < 1e-6, "聚合比 = 80/300");
+        assert!(
+            ts.names.contains(&"a.bin".to_string()) && ts.names.contains(&"b.bin".to_string()),
+            "下载名入轮换"
+        );
+        assert!(!ts.names.contains(&"c.bin".to_string()), "剪贴板名不入轮换");
+        // 总字节未知（FileBegin 未到，total=0）→ 进度条不定态（ratio None）。
+        let mut ws2 = RemoteWs::default();
+        ws2.inflight_fetch
+            .insert(9, mk(FetchKind::Download, "d.bin", 10, 0));
+        assert!(
+            ws2.transfer_status().expect("有传输").down_ratio().is_none(),
+            "total=0 应不定态"
+        );
+    }
+
+    #[test]
     fn build_list_dir_recursive_reply_缺失路径回err() {
         let missing = std::env::temp_dir().join("lumen_dirsvc_nonexistent_xyz_42");
         let _ = std::fs::remove_dir_all(&missing); // 保证不存在
@@ -5176,7 +5296,7 @@ mod tests {
         let mut ws = RemoteWs::default();
         ws.start_fetch_open("/some/dir/a.txt".into()); // send_frame 无 cmd_tx → no-op
         let req = *ws.inflight_fetch.keys().next().expect("有在途 Fetch");
-        ws.fetch_begin(req);
+        ws.fetch_begin(req, 0);
         let tmp = ws
             .inflight_fetch
             .get(&req)
@@ -5224,7 +5344,7 @@ mod tests {
         );
         let req = *ws.inflight_fetch.keys().next().expect("有下载 fetch");
         // 模拟传输：begin（建目标文件）→ chunk → end（落地 + 计完成）。
-        ws.fetch_begin(req);
+        ws.fetch_begin(req, 0);
         ws.fetch_chunk(req, 0, b"hello");
         ws.fetch_end(req);
         let target = base.join("a.txt");

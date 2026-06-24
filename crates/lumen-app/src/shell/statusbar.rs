@@ -52,6 +52,8 @@ pub struct StatusBarOutput {
 /// * `mode` - 当前有效输入模式（每帧推导，不缓存）。
 /// * `cwd` - 焦点窗格的当前工作目录（None 时中央区域空白）。
 /// * `force_fallback` - 经典直通模式开关（决定右端按钮显示状态）。
+/// * `transfer` - 控制端活跃文件传输（Some 时中间区改画进度 ↓N↑M + 进度条 + 轮换文件名，
+///   替代 cwd；None 时照常显示 cwd）。
 /// * `pal` - 当前主题色板。
 ///
 /// # Errors
@@ -61,6 +63,7 @@ pub fn show(
     mode: InputMode,
     cwd: Option<&std::path::Path>,
     force_fallback: bool,
+    transfer: Option<&crate::remote_ws::TransferStatus>,
     pal: &Palette,
 ) -> StatusBarOutput {
     let mut out = StatusBarOutput::default();
@@ -118,35 +121,31 @@ pub fn show(
         let btn_w_approx = btn_text_w + 12.0 + 8.0;
         let cwd_w = (available_w - btn_w_approx - 8.0).max(10.0);
 
-        if let Some(path) = cwd {
+        // 中间区统一先占位拿矩形，再按「有活跃传输 → 画进度」/「否则 → 画 cwd」分支。
+        let (mid_rect, mid_resp) = ui.allocate_exact_size(
+            egui::vec2(cwd_w, ui.available_height()),
+            egui::Sense::hover(),
+        );
+        if let Some(t) = transfer {
+            // 活跃传输：方向计数 + 下载进度条 + 轮换在传文件名（替代 cwd）。
+            paint_transfer(ui, mid_rect, t, pal);
+        } else if let Some(path) = cwd {
             // cwd 显示：尾目录名（截断时可 hover 看全路径）
             let display = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
             let full_path = path.display().to_string();
-
-            let (_, cwd_resp) = ui.allocate_exact_size(
-                egui::vec2(cwd_w, ui.available_height()),
-                egui::Sense::hover(),
-            );
-            // 在分配的矩形内绘制截断文本
             ui.painter().text(
-                egui::pos2(cwd_resp.rect.min.x, cwd_resp.rect.center().y),
+                egui::pos2(mid_rect.min.x, mid_rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 &display,
                 egui::FontId::proportional(11.0),
                 pal.fg_dim,
             );
             if display != full_path {
-                cwd_resp.on_hover_text(full_path);
+                mid_resp.on_hover_text(full_path);
             }
-        } else {
-            // 无 cwd：占位留空（保持布局稳定）
-            ui.allocate_exact_size(
-                egui::vec2(cwd_w, ui.available_height()),
-                egui::Sense::hover(),
-            );
         }
 
         // ── 右：经典直通切换按钮（第十五轮：对齐 topbar 按钮语言）────────
@@ -225,6 +224,63 @@ pub fn show(
     });
 
     out
+}
+
+/// 在状态栏中间区 `rect` 内画文件传输进度（活跃传输时替代 cwd）：方向计数 `↓N ↑M` + 下载聚合
+/// 进度条（`down_total` 已知时）+ 轮换的在传文件名（每 ~2s 换一个）。painter 裁到 `rect`，
+/// 长文件名不溢出到右端按钮区。轮换 / 进度刷新靠每帧（传输期数据流持续重绘）+ 兜底 500ms 重绘。
+fn paint_transfer(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    t: &crate::remote_ws::TransferStatus,
+    pal: &Palette,
+) {
+    let painter = ui.painter_at(rect); // 裁到中间区，防长名溢出按钮区。
+    let cy = rect.center().y;
+    // 方向计数（active()>0 保证至少一向非零）。
+    let counts = match (t.downloads, t.uploads) {
+        (d, 0) => format!("↓{d}"),
+        (0, u) => format!("↑{u}"),
+        (d, u) => format!("↓{d} ↑{u}"),
+    };
+    let count_rect = painter.text(
+        egui::pos2(rect.min.x, cy),
+        egui::Align2::LEFT_CENTER,
+        &counts,
+        egui::FontId::proportional(11.0),
+        pal.accent,
+    );
+    let mut x = count_rect.max.x + 8.0;
+    // 下载进度条（仅 total 已知时；上传不集中跟踪字节，只计数）。
+    let bar_w = 60.0_f32;
+    if let Some(ratio) = t.down_ratio() {
+        if x + bar_w <= rect.max.x {
+            let bar_h = 4.0_f32;
+            let cr = egui::CornerRadius::same(2);
+            let track =
+                egui::Rect::from_min_size(egui::pos2(x, cy - bar_h / 2.0), egui::vec2(bar_w, bar_h));
+            painter.rect_filled(track, cr, pal.bg_highlight);
+            let fill =
+                egui::Rect::from_min_size(track.min, egui::vec2(bar_w * ratio, bar_h));
+            painter.rect_filled(fill, cr, pal.accent);
+            x += bar_w + 8.0;
+        }
+    }
+    // 轮换在传文件名（每 ~2s 一个；egui 时间驱动）。
+    if !t.names.is_empty() && x < rect.max.x {
+        let now = ui.input(|i| i.time);
+        let idx = ((now / 2.0) as usize) % t.names.len();
+        painter.text(
+            egui::pos2(x, cy),
+            egui::Align2::LEFT_CENTER,
+            &t.names[idx],
+            egui::FontId::proportional(11.0),
+            pal.fg_dim,
+        );
+    }
+    // 传输期保持轮播 / 进度平滑刷新（块间无其它重绘时兜底）。
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(500));
 }
 
 /// 按模式返回 (显示文字, 颜色)。

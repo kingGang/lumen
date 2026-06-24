@@ -177,6 +177,9 @@ pub struct ShellInput<'a> {
     /// 经典直通模式开关（M4.1 批E：状态栏右端按钮状态）。
     #[cfg(feature = "input-editor")]
     pub force_fallback: bool,
+    /// 控制端活跃文件传输（Some 时状态栏中间区改画传输进度，替代 cwd）。main 每帧由
+    /// `remote_ws.transfer_status()` 算后传入；无传输时 None。
+    pub transfer: Option<&'a crate::remote_ws::TransferStatus>,
     /// 历史搜索面板本帧展示的行（由 main 在 render 前计算；面板关闭时传空切片）。
     pub history_rows: &'a [history_search_ui::HistoryRow],
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
@@ -959,8 +962,14 @@ pub fn show(
                     .inner_margin(egui::Margin::symmetric(0, 0)),
             )
             .show_inside(root, |ui| {
-                let sb_out =
-                    statusbar::show(ui, input.input_mode, input.cwd, input.force_fallback, pal);
+                let sb_out = statusbar::show(
+                    ui,
+                    input.input_mode,
+                    input.cwd,
+                    input.force_fallback,
+                    input.transfer,
+                    pal,
+                );
                 if sb_out.toggle_fallback {
                     out.toggle_fallback = true;
                 }
