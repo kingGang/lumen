@@ -4537,8 +4537,15 @@ impl RemoteWs {
                     .then(|| Terminal::new(MIRROR_INIT_ROWS, MIRROR_INIT_COLS, MIRROR_SCROLLBACK));
                 self.session = Some(ActiveSession { peer_name, role });
                 // M6：会话建立 → 启动 P2P 打洞引擎（控制端发 Offer，被控端等 Offer 回 Answer）。
-                // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。
-                self.p2p = Some(P2pEngine::start(role, stun_host_from_server()));
+                // 中继不受影响：直连是叠加加速层，打洞失败/未切前一切走中继。传入主线程唤醒句柄——
+                // P2P 收到数据帧后须 nudge 主线程重绘（漏传则按需重绘 UI 回显延迟数秒）。
+                self.p2p = Some(P2pEngine::start(
+                    role,
+                    stun_host_from_server(),
+                    self.ctx.clone(),
+                    self.proxy.clone(),
+                    self.wake_pending.clone(),
+                ));
                 self.notices.push(Notice::SessionStarted { role, peer });
             }
             RemoteS2C::SessionEnded { reason } => {

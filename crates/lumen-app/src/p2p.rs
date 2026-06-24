@@ -29,6 +29,38 @@ use lumen_protocol::remote::{P2pSignalKind, RemoteFrame, Role};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use winit::event_loop::EventLoopProxy;
+
+use crate::PtyWake;
+
+/// 唤醒主线程重绘的句柄（与 remote_ws 的 WS 线程同款 nudge）。**P2P 数据帧/事件投递后必须 nudge**：
+/// Lumen UI 按需重绘，漏唤醒则 `DataFrame` 躺在 channel 里、要等下次偶发重绘才被 `poll` 出来处理，
+/// 表现为回显/目录树/快照延迟数秒~十几秒（Phase 3 实测踩坑）。
+#[derive(Clone)]
+struct Waker {
+    ctx: egui::Context,
+    proxy: EventLoopProxy<PtyWake>,
+    pending: Arc<AtomicBool>,
+}
+
+impl Waker {
+    fn nudge(&self) {
+        self.ctx.request_repaint();
+        // SeqCst 与主线程清标志配对（同 remote_ws::nudge），避免丢唤醒。
+        if !self.pending.swap(true, Ordering::SeqCst) {
+            let _ = self.proxy.send_event(PtyWake);
+        }
+    }
+}
+
+/// 发一条事件给主线程并 nudge 唤醒（漏 nudge 会让按需重绘的 UI 延迟处理，见 [`Waker`]）。
+fn emit(evt_tx: &Sender<P2pEvent>, waker: &Option<Waker>, ev: P2pEvent) {
+    if evt_tx.send(ev).is_ok() {
+        if let Some(w) = waker {
+            w.nudge();
+        }
+    }
+}
 
 /// QUIC ALPN 协议标识（两端必须一致；隔离非 lumen 的 QUIC 流量）。
 const ALPN: &[u8] = b"lumen-p2p";
@@ -113,8 +145,16 @@ impl P2pEngine {
     /// 启动 P2P 打洞引擎（线程内建 current-thread tokio runtime）。`role` 决定 Offer/Answer 流向
     /// （[`Role::Controller`] 主动发 Offer）；`stun_host` 为端点发现用的 STUN 服务器（host:port，
     /// 空串 = 不探 STUN、仅用 LAN 候选）。
+    /// `ctx`/`proxy`/`pending` 为主线程唤醒句柄（[`RemoteWs`] 持有的同一套）：P2P 收到数据帧/事件后
+    /// 用它 nudge 主线程重绘——**漏传则回显/目录树延迟数秒**（按需重绘 UI 不会及时 poll，见 [`Waker`]）。
     #[must_use]
-    pub fn start(role: Role, stun_host: String) -> Self {
+    pub fn start(
+        role: Role,
+        stun_host: String,
+        ctx: Option<egui::Context>,
+        proxy: Option<EventLoopProxy<PtyWake>>,
+        pending: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (data_tx, data_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = std::sync::mpsc::channel();
@@ -124,6 +164,14 @@ impl P2pEngine {
         let stop_thread = Arc::clone(&stop);
         let conn_thread = Arc::clone(&connected);
         let data_thread = Arc::clone(&data_ready);
+        let waker = match (ctx, proxy, pending) {
+            (Some(ctx), Some(proxy), Some(pending)) => Some(Waker {
+                ctx,
+                proxy,
+                pending,
+            }),
+            _ => None,
+        };
         let handle = thread::Builder::new()
             .name("lumen-p2p".into())
             .spawn(move || {
@@ -136,6 +184,7 @@ impl P2pEngine {
                     &stop_thread,
                     &conn_thread,
                     &data_thread,
+                    waker,
                 )
             })
             .ok();
@@ -253,6 +302,7 @@ fn run(
     stop: &AtomicBool,
     connected: &AtomicBool,
     data_ready: &Arc<AtomicBool>,
+    waker: Option<Waker>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -290,10 +340,14 @@ fn run(
         };
         // 控制端主动发 Offer；被控端收到 Offer 后回 Answer（见 PeerSignal 处理）。
         if role == Role::Controller {
-            let _ = evt_tx.send(P2pEvent::SendSignal {
-                kind: P2pSignalKind::Offer,
-                payload: my_payload.clone(),
-            });
+            emit(
+                evt_tx,
+                &waker,
+                P2pEvent::SendSignal {
+                    kind: P2pSignalKind::Offer,
+                    payload: my_payload.clone(),
+                },
+            );
         }
         let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<quinn::Connection>();
         let mut conn_keep: Option<quinn::Connection> = None;
@@ -305,10 +359,14 @@ fn run(
                     Some(P2pCmd::PeerSignal { kind, payload }) => match kind {
                         P2pSignalKind::Offer => {
                             // 被控端：回 Answer 并开始打洞。
-                            let _ = evt_tx.send(P2pEvent::SendSignal {
-                                kind: P2pSignalKind::Answer,
-                                payload: my_payload.clone(),
-                            });
+                            emit(
+                                evt_tx,
+                                &waker,
+                                P2pEvent::SendSignal {
+                                    kind: P2pSignalKind::Answer,
+                                    payload: my_payload.clone(),
+                                },
+                            );
                             spawn_punch(&de, payload, &res_tx, &mut punching, role);
                         }
                         P2pSignalKind::Answer => {
@@ -326,12 +384,16 @@ fn run(
                 Some(conn) = res_rx.recv() => {
                     log::info!("P2P 直连已通 → {}", conn.remote_address());
                     connected.store(true, Ordering::SeqCst);
-                    let _ = evt_tx.send(P2pEvent::Connected);
+                    emit(evt_tx, &waker, P2pEvent::Connected);
                     // 通告对端「我直连已通」（仅诊断；data_ready 由本端 run_data_plane 在流建立时置位）。
-                    let _ = evt_tx.send(P2pEvent::SendSignal {
-                        kind: P2pSignalKind::Ready,
-                        payload: my_payload.clone(),
-                    });
+                    emit(
+                        evt_tx,
+                        &waker,
+                        P2pEvent::SendSignal {
+                            kind: P2pSignalKind::Ready,
+                            payload: my_payload.clone(),
+                        },
+                    );
                     // 在此 conn 上建立数据面双向流（仅一次）。
                     if let Some(drx) = data_rx_opt.take() {
                         tokio::spawn(run_data_plane(
@@ -340,6 +402,7 @@ fn run(
                             drx,
                             evt_tx.clone(),
                             Arc::clone(data_ready),
+                            waker.clone(),
                         ));
                     }
                     conn_keep = Some(conn); // 保活直连（其 drop 关连接）。
@@ -353,10 +416,10 @@ fn run(
     });
 }
 
-/// 置数据面失效：清 `data_ready` + 通知主线程回退中继。可被多个泵/监视重复调用（幂等）。
-fn fail_data_plane(data_ready: &AtomicBool, evt_tx: &Sender<P2pEvent>) {
+/// 置数据面失效：清 `data_ready` + 通知主线程回退中继（带 nudge）。可被多个泵/监视重复调用（幂等）。
+fn fail_data_plane(data_ready: &AtomicBool, evt_tx: &Sender<P2pEvent>, waker: &Option<Waker>) {
     data_ready.store(false, Ordering::Release);
-    let _ = evt_tx.send(P2pEvent::DataPlaneDown);
+    emit(evt_tx, waker, P2pEvent::DataPlaneDown);
 }
 
 /// 在已建立的 QUIC 连接上建数据面双向流并跑读/写泵 + 连接关闭监视。Controller `open_bi` 后**立即写
@@ -368,13 +431,14 @@ async fn run_data_plane(
     mut data_rx: UnboundedReceiver<serde_json::Value>,
     evt_tx: Sender<P2pEvent>,
     data_ready: Arc<AtomicBool>,
+    waker: Option<Waker>,
 ) {
     let (mut send, recv) = match role {
         Role::Controller => match conn.open_bi().await {
             Ok(s) => s,
             Err(e) => {
                 log::warn!("P2P open_bi 失败: {e}");
-                fail_data_plane(&data_ready, &evt_tx);
+                fail_data_plane(&data_ready, &evt_tx, &waker);
                 return;
             }
         },
@@ -382,7 +446,7 @@ async fn run_data_plane(
             Ok(s) => s,
             Err(e) => {
                 log::warn!("P2P accept_bi 失败: {e}");
-                fail_data_plane(&data_ready, &evt_tx);
+                fail_data_plane(&data_ready, &evt_tx, &waker);
                 return;
             }
         },
@@ -392,7 +456,7 @@ async fn run_data_plane(
         match RemoteFrame::P2pStreamHello.to_value() {
             Ok(v) if write_value(&mut send, &v).await => {}
             _ => {
-                fail_data_plane(&data_ready, &evt_tx);
+                fail_data_plane(&data_ready, &evt_tx, &waker);
                 return;
             }
         }
@@ -400,22 +464,24 @@ async fn run_data_plane(
     // 数据面流真正建立 → 置 data_ready + 通知主线程（被控端据此把输出走 QUIC；控制端据此补发订阅
     // 重建镜像）。在此置位（而非据对端 Ready）确保流失败时不会误判已直连（审查 #4）。
     data_ready.store(true, Ordering::Release);
-    let _ = evt_tx.send(P2pEvent::DataPlaneUp);
+    emit(&evt_tx, &waker, P2pEvent::DataPlaneUp);
     // 读泵（独立任务）。
     {
         let evt = evt_tx.clone();
         let dr = Arc::clone(&data_ready);
-        tokio::spawn(async move { read_pump(recv, &evt, &dr).await });
+        let wk = waker.clone();
+        tokio::spawn(async move { read_pump(recv, &evt, &dr, &wk).await });
     }
     // 连接关闭监视（idle 超时 / 对端关 / 链路丢 → 回退）。
     {
         let conn2 = conn.clone();
         let evt = evt_tx.clone();
         let dr = Arc::clone(&data_ready);
+        let wk = waker.clone();
         tokio::spawn(async move {
             let reason = conn2.closed().await;
             log::info!("P2P 连接关闭: {reason}");
-            fail_data_plane(&dr, &evt);
+            fail_data_plane(&dr, &evt, &wk);
         });
     }
     // 写泵（本任务）：排空主线程投来的数据帧，length-prefix 写出 QUIC 流。
@@ -424,12 +490,17 @@ async fn run_data_plane(
             break;
         }
     }
-    fail_data_plane(&data_ready, &evt_tx);
+    fail_data_plane(&data_ready, &evt_tx, &waker);
 }
 
 /// 数据面读泵：循环 read_exact(4 字节长度) → 校验上限 → read_exact(帧体) → 解析 Value → 投主线程。
 /// 链路断 / 干净 FIN / 长度非法即退出并 `fail_data_plane`。解析失败仅丢该帧、不断流。
-async fn read_pump(mut recv: quinn::RecvStream, evt_tx: &Sender<P2pEvent>, data_ready: &AtomicBool) {
+async fn read_pump(
+    mut recv: quinn::RecvStream,
+    evt_tx: &Sender<P2pEvent>,
+    data_ready: &AtomicBool,
+    waker: &Option<Waker>,
+) {
     loop {
         let mut len_buf = [0u8; 4];
         if recv.read_exact(&mut len_buf).await.is_err() {
@@ -449,11 +520,15 @@ async fn read_pump(mut recv: quinn::RecvStream, evt_tx: &Sender<P2pEvent>, data_
                 if evt_tx.send(P2pEvent::DataFrame(v)).is_err() {
                     break; // 主线程已收尾
                 }
+                // **关键**：唤醒主线程及时 poll 出该帧（漏 nudge → 回显延迟数秒，见 Waker）。
+                if let Some(w) = waker {
+                    w.nudge();
+                }
             }
             Err(e) => log::debug!("P2P 数据帧解析失败，丢弃: {e}"),
         }
     }
-    fail_data_plane(data_ready, evt_tx);
+    fail_data_plane(data_ready, evt_tx, waker);
 }
 
 /// length-prefix 写一条 Value 到 QUIC 发送流：u32 大端长度 + JSON 字节。序列化失败/超限仅跳过该帧
@@ -1029,8 +1104,8 @@ mod tests {
 
     #[test]
     fn 引擎启停_不panic() {
-        // 空 STUN → 不联网；仅验证起线程 + 停机不 panic（无对端信令故不会握手）。
-        let mut eng = P2pEngine::start(Role::Controller, String::new());
+        // 空 STUN → 不联网；仅验证起线程 + 停机不 panic（无对端信令故不会握手）。无唤醒句柄（测试态）。
+        let mut eng = P2pEngine::start(Role::Controller, String::new(), None, None, None);
         assert!(!eng.is_connected(), "未握手前不应已连接");
         eng.peer_signal(
             P2pSignalKind::Fallback,
@@ -1203,7 +1278,7 @@ mod tests {
         let (_sb, recv_b) = conn_b.accept_bi().await.expect("accept_bi");
         let (tx, rx) = std::sync::mpsc::channel();
         let dr = Arc::new(AtomicBool::new(true));
-        read_pump(recv_b, &tx, &dr).await;
+        read_pump(recv_b, &tx, &dr, &None).await;
         writer.await.expect("writer");
 
         let frames: Vec<serde_json::Value> = rx
