@@ -2080,8 +2080,9 @@ enum RemoteMenuAction {
     Copy(String, String, bool, u64),
     /// 粘贴到此远程目录（上传目标）：dir path。
     Paste(String),
-    /// 进入文件夹（= 翻转展开，与点击目录同效）：dir 节点 id。
-    Enter(usize),
+    /// 进入文件夹：(dir 节点 id, 当前是否已展开)。总是选中该目录（可见反馈），未展开则展开
+    /// （已展开不折叠——「进入」语义）。
+    Enter(usize, bool),
     /// 新建文件夹：在此远程目录下（开对话框）。
     NewDir(String),
     /// 新建文件：在此远程目录下（开对话框）。
@@ -2278,7 +2279,10 @@ fn remote_panel_ui(
                                 egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.filetree_menu_enter_dir).clicked() {
-                                        *menu.borrow_mut() = Some(RemoteMenuAction::Enter(row.id));
+                                        // 「进入」= 选中该目录（任何情况下都有可见反馈）+ 未展开则展开。
+                                        // 不折叠已展开的（避免点了反而收起、看似无效/相反）。
+                                        *menu.borrow_mut() =
+                                            Some(RemoteMenuAction::Enter(row.id, open));
                                         ui.close();
                                     }
                                     ui.separator();
@@ -2427,7 +2431,13 @@ fn remote_panel_ui(
             out.copy_files = Some((path, name, is_dir, size));
         }
         Some(RemoteMenuAction::Paste(dir)) => out.paste_into = Some(dir),
-        Some(RemoteMenuAction::Enter(id)) => out.dir_clicks.push(id),
+        Some(RemoteMenuAction::Enter(id, open)) => {
+            // 选中给出可见反馈；仅未展开时压入 dir_clicks（下游是 toggle，已展开再压会折叠）。
+            out.select = Some(id);
+            if !open {
+                out.dir_clicks.push(id);
+            }
+        }
         Some(RemoteMenuAction::NewDir(dir)) => out.new_dir_req = Some(dir),
         Some(RemoteMenuAction::NewFile(dir)) => out.new_file_req = Some(dir),
         Some(RemoteMenuAction::Delete(path, name, is_dir)) => {
