@@ -2049,7 +2049,11 @@ fn remote_panel_ui(
     } else {
         s.remote_not_connected
     };
-    // 工具条：树根名（basename，悬停看全路径）+ 「显示隐藏项」勾选。
+    // 右键菜单经 RefCell 收口，循环后写入 out（与本地树 MenuAction 同款；context_menu 闭包里直接
+    // 借 &mut out 会导致菜单不触发）。**提到工具条前**：根目录标签也要挂右键菜单（粘贴到树根 =
+    // 上传到被控端 cwd，修复「右键根目录无『粘贴』、看似不能上传」）。
+    let menu: RefCell<Option<RemoteMenuAction>> = RefCell::new(None);
+    // 工具条：树根名（basename，悬停看全路径，右键可粘贴上传到根）+ 「显示隐藏项」勾选。
     ui.horizontal(|ui| {
         let label = root_label.map_or_else(
             || placeholder.to_string(),
@@ -2060,8 +2064,28 @@ fn remote_panel_ui(
                     .to_string()
             },
         );
-        ui.add(egui::Label::new(egui::RichText::new(label).strong().color(pal.fg)).truncate())
+        let root_resp = ui
+            .add(
+                egui::Label::new(egui::RichText::new(label).strong().color(pal.fg))
+                    .truncate()
+                    .sense(egui::Sense::click()),
+            )
             .on_hover_text(root_label.unwrap_or(""));
+        // 根目录右键：粘贴到树根（上传到被控端 cwd）。仅在树已就绪（root_label 有值）+ 可粘贴时。
+        if let Some(root) = root_label {
+            let root = root.to_string();
+            egui::Popup::context_menu(&root_resp).show(|ui| {
+                ui.set_min_width(150.0);
+                if can_paste {
+                    if ui.button(s.remote_menu_paste).clicked() {
+                        *menu.borrow_mut() = Some(RemoteMenuAction::Paste(root.clone()));
+                        ui.close();
+                    }
+                } else {
+                    ui.add_enabled(false, egui::Button::new(s.remote_menu_paste));
+                }
+            });
+        }
     });
     // 树未到：占位，不画树（绝不回落本机树）。
     let Some(ft) = ft.filter(|f| f.root_label().is_some()) else {
@@ -2078,9 +2102,7 @@ fn remote_panel_ui(
         out.toggle_hidden = Some(show_hidden);
     }
     ui.add_space(2.0);
-    // 右键菜单经 RefCell 收口，循环后写入 out——与本地树 MenuAction 同款；直接在 context_menu
-    // 闭包里借 &mut out 会导致菜单不触发（复制/粘贴失效）。
-    let menu: RefCell<Option<RemoteMenuAction>> = RefCell::new(None);
+    // （menu RefCell 已在工具条前声明，供根目录 + 行内右键共用。）
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .show(ui, |ui| {

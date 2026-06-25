@@ -3128,13 +3128,24 @@ impl RemoteWs {
     /// 仅一个上传）。撞名首发用 `Probe`（除非已 `policy==Some(true)` 用 Force），被控端探得已存在
     /// 时弹覆盖模态一次性决策、套用整次递归。
     pub fn start_upload(&mut self, items: Vec<ClipItem>, remote_dir: String) {
-        if items.is_empty() || !self.is_controlling() {
+        // 诊断日志（对标 start_download 透明度）：上传不工作时一眼看出卡在哪个守卫。
+        if items.is_empty() {
+            log::info!("[上传] 无可上传项，忽略");
+            return;
+        }
+        if !self.is_controlling() {
+            log::warn!("[上传] 非控制端态，忽略（需先发起对设备的控制）");
             return;
         }
         if self.upload.is_some() || self.download.is_some() {
-            log::debug!("已有传输进行中，忽略新的粘贴上传请求");
+            log::warn!(
+                "[上传] 已有传输进行中（upload={} download={}），忽略本次",
+                self.upload.is_some(),
+                self.download.is_some()
+            );
             return;
         }
+        log::info!("[上传] 启动：{} 项 → 被控端目录 {remote_dir}", items.len());
         self.upload = Some(UploadWalk {
             remote_root: remote_dir.clone(),
             policy: None,
