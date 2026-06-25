@@ -136,6 +136,7 @@ pub static STRINGS: Strings = Strings {
     remote_session_limit: "远程会话数已达上限",
     remote_close_last: "无法关闭被控端最后一个会话",
     remote_op_failed: "远程会话操作失败",
+    remote_cd_no_terminal: "请先进入一个远程终端，再用「进入文件夹」",
     local_copy_started: "开始复制…",
     local_copy_done_fmt: "复制完成：{0} 个，跳过 {1}，出错 {2}",
     local_copy_busy: "复制进行中，请稍候",

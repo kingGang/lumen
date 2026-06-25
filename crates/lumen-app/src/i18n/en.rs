@@ -138,6 +138,7 @@ pub static STRINGS: Strings = Strings {
     remote_session_limit: "Remote session limit reached",
     remote_close_last: "Cannot close the last remote session",
     remote_op_failed: "Remote session operation failed",
+    remote_cd_no_terminal: "Open a remote terminal first, then use \"Enter folder\"",
     local_copy_started: "Copying…",
     local_copy_done_fmt: "Copied {0}, skipped {1}, errors {2}",
     local_copy_busy: "Copy in progress, please wait",

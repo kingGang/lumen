@@ -142,6 +142,7 @@ pub static STRINGS: Strings = Strings {
     remote_session_limit: "遠端工作階段數已達上限",
     remote_close_last: "無法關閉被控端最後一個工作階段",
     remote_op_failed: "遠端工作階段操作失敗",
+    remote_cd_no_terminal: "請先進入一個遠端終端機，再用「進入資料夾」",
     local_copy_started: "開始複製…",
     local_copy_done_fmt: "複製完成：{0} 個，跳過 {1}，出錯 {2}",
     local_copy_busy: "複製進行中，請稍候",

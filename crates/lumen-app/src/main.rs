@@ -8328,6 +8328,23 @@ impl ApplicationHandler<PtyWake> for App {
                     state.remote_ws.remote_delete(path, is_dir);
                     state.window.request_redraw();
                 }
+                // 远程菜单「进入文件夹」= 命令行 cd：注入 `cd '<被控端路径>'` 到远程会话
+                // （与本地一致，走 send_input → InputWithId → 被控端 PTY）。未在镜像某个
+                // 远程终端时无处注入 → 提示而非静默无效。控制字符路径被 cd_command_raw 拒。
+                if let Some(dir) = shell_out.remote_cd {
+                    let cmd = shell::filetree::cd_command_raw(&dir);
+                    if !cmd.is_empty() {
+                        if state.remote_ws.send_input(&cmd) {
+                            state.terminal_focused = true;
+                        } else {
+                            state.shell_state.toast.push(
+                                shell::toast::ToastKind::Info,
+                                i18n::strings().remote_cd_no_terminal.to_string(),
+                            );
+                        }
+                        state.window.request_redraw();
+                    }
+                }
 
                 // —— 窗格矩形（物理像素）变化 → 逐窗格重建离屏 + resize ——
                 // 对各边按 epaint 同款语义取整后求宽高：分数 DPI（如

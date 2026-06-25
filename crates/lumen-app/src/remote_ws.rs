@@ -1752,12 +1752,16 @@ impl RemoteWs {
     /// 发给被控端，被控端按双 id 路由到对应窗格 PTY（与被控端焦点解耦，需求 e）。目标窗格 = 多窗格镜像
     /// 取 `mirror_active_pane`（控制端自选），单窗格镜像取 `mirror_focus_sid`。未订阅 / 无焦点窗格则丢弃
     /// （不发，杜绝旧 part4a「落到被控端激活会话」的缺陷）。回看态下转发即 snap 回跟随底部，使用户看到回显。
-    pub fn send_input(&mut self, bytes: &[u8]) {
+    ///
+    /// 返回是否真正发出：未在控制态 / 未订阅 tab / 无目标窗格 / 空字节时返回 `false`
+    /// （键盘路径忽略返回值即可；文件树「进入文件夹」cd 注入据此判定能否送达、
+    /// 否则给用户提示而非静默无效）。
+    pub fn send_input(&mut self, bytes: &[u8]) -> bool {
         if !self.is_controlling() || bytes.is_empty() {
-            return;
+            return false;
         }
         let Some(tab_id) = self.subscribed_tab else {
-            return;
+            return false;
         };
         let target = if self.mirror_panes.is_empty() {
             self.mirror_focus_sid
@@ -1765,7 +1769,7 @@ impl RemoteWs {
             self.mirror_active_pane
         };
         let Some(session_id) = target else {
-            return;
+            return false;
         };
         self.hist_top = None; // 转发输入 → 回跟随实时底部（看到回显）。
         self.send_frame(&RemoteFrame::InputWithId {
@@ -1773,6 +1777,7 @@ impl RemoteWs {
             session_id,
             data: bytes.to_vec(),
         });
+        true
     }
 
     // part3d：控制端 SSH 式视口跟随已移除（多会话模型下被控端焦点不动、订阅会话可为后台

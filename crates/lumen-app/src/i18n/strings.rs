@@ -276,6 +276,8 @@ pub struct Strings {
     pub remote_close_last: &'static str,
     /// part3d Phase 2：远程会话增删操作失败的通用兜底（如目标不存在）。
     pub remote_op_failed: &'static str,
+    /// 远程菜单「进入文件夹」：当前没有正在镜像的远程终端，cd 无处注入时的提示。
+    pub remote_cd_no_terminal: &'static str,
     /// 本机复制粘贴（local→local）开始的 toast。
     pub local_copy_started: &'static str,
     /// 本机复制粘贴完成的 toast（`{0}` 完成 / `{1}` 跳过 / `{2}` 出错；走 fmt3，须用索引占位）。

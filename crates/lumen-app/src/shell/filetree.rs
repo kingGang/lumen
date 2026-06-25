@@ -2011,6 +2011,9 @@ pub struct RemoteFileTreeOutput {
     pub remote_delete: Option<(String, bool)>,
     /// 远程对话框本帧关闭（main 把键盘焦点交还）。
     pub dialog_closed: bool,
+    /// 菜单「进入文件夹」：被控端目录绝对路径——main 据此向远程会话注入 `cd '<path>'`
+    /// （与本地 [`FileTreeOutput::cd_dir`] 同语义，但目标是被控端 PTY、路径为不透明 String）。
+    pub cd_dir: Option<String>,
 }
 
 /// 远程文件树的新建 / 删除对话框（与本地 [`Dialog`] 同构，但路径为不透明远程 String、提交走协议
@@ -2080,9 +2083,9 @@ enum RemoteMenuAction {
     Copy(String, String, bool, u64),
     /// 粘贴到此远程目录（上传目标）：dir path。
     Paste(String),
-    /// 进入文件夹：(dir 节点 id, 当前是否已展开)。总是选中该目录（可见反馈），未展开则展开
-    /// （已展开不折叠——「进入」语义）。
-    Enter(usize, bool),
+    /// 进入文件夹 = 命令行 `cd` 进该目录：被控端目录绝对路径（与本地「进入文件夹」一致，
+    /// 往被控端会话注入 `cd '<path>'`，不是 UI 展开）。
+    Cd(String),
     /// 新建文件夹：在此远程目录下（开对话框）。
     NewDir(String),
     /// 新建文件：在此远程目录下（开对话框）。
@@ -2279,10 +2282,11 @@ fn remote_panel_ui(
                                 egui::Popup::context_menu(&row_resp).show(|ui| {
                                     ui.set_min_width(150.0);
                                     if ui.button(s.filetree_menu_enter_dir).clicked() {
-                                        // 「进入」= 选中该目录（任何情况下都有可见反馈）+ 未展开则展开。
-                                        // 不折叠已展开的（避免点了反而收起、看似无效/相反）。
+                                        // 「进入文件夹」= 命令行 cd 进该目录（与本地一致）：注入
+                                        // `cd '<被控端路径>'` 到远程会话，不是 UI 展开。展开仍用
+                                        // 点名字/三角。
                                         *menu.borrow_mut() =
-                                            Some(RemoteMenuAction::Enter(row.id, open));
+                                            Some(RemoteMenuAction::Cd(row.path.clone()));
                                         ui.close();
                                     }
                                     ui.separator();
@@ -2431,13 +2435,7 @@ fn remote_panel_ui(
             out.copy_files = Some((path, name, is_dir, size));
         }
         Some(RemoteMenuAction::Paste(dir)) => out.paste_into = Some(dir),
-        Some(RemoteMenuAction::Enter(id, open)) => {
-            // 选中给出可见反馈；仅未展开时压入 dir_clicks（下游是 toggle，已展开再压会折叠）。
-            out.select = Some(id);
-            if !open {
-                out.dir_clicks.push(id);
-            }
-        }
+        Some(RemoteMenuAction::Cd(path)) => out.cd_dir = Some(path),
         Some(RemoteMenuAction::NewDir(dir)) => out.new_dir_req = Some(dir),
         Some(RemoteMenuAction::NewFile(dir)) => out.new_file_req = Some(dir),
         Some(RemoteMenuAction::Delete(path, name, is_dir)) => {
@@ -2732,12 +2730,20 @@ fn escape_powershell_single_quotes(raw: &str) -> String {
 /// 引号）的路径直接返回空字节串拒绝注入；上游 UI（目录激活分支）
 /// 已先行拦截，这里是纵深防御。
 pub fn cd_command(path: &Path) -> Vec<u8> {
-    let raw = path.display().to_string();
+    cd_command_raw(&path.display().to_string())
+}
+
+/// 由「原始路径字符串」生成 cd 命令字节（远程「进入文件夹」用：被控端路径是不透明 String，
+/// 不经本机 [`Path`] 语义、避免跨机路径被本地化）。转义/控制字符防御与 [`cd_command`] 同一套。
+///
+/// 含 ASCII 控制字符的路径返回空字节串拒绝注入（纵深防御）。被控端 shell 与本机一致为
+/// PowerShell，故复用同款单引号转义。
+pub fn cd_command_raw(raw: &str) -> Vec<u8> {
     if raw.chars().any(char::is_control) {
-        log::warn!("目录名含控制字符，拒绝生成 cd 命令: {}", path.display());
+        log::warn!("目录名含控制字符，拒绝生成 cd 命令: {raw}");
         return Vec::new();
     }
-    format!("cd '{}'\r", escape_powershell_single_quotes(&raw)).into_bytes()
+    format!("cd '{}'\r", escape_powershell_single_quotes(raw)).into_bytes()
 }
 
 /// 拖放到终端区时插入命令行的路径文本（**不带回车**，用户接着编辑）。
@@ -3015,6 +3021,27 @@ mod tests {
         assert!(cd_command(Path::new("C:\\a\rb")).is_empty());
         assert!(cd_command(Path::new("C:\\a\x1bb")).is_empty());
         assert!(cd_command(Path::new("C:\\a\tb")).is_empty());
+    }
+
+    #[test]
+    fn cd命令_raw远程路径_与本地同款转义() {
+        // 远程「进入文件夹」走 cd_command_raw（被控端路径是不透明 String）：
+        // 普通/弯引号同形字翻倍/控制字符拒绝必须与本地 cd_command 完全一致
+        // （同一注入防御，跨机不能放松）。
+        assert_eq!(cd_command_raw(r"C:\proj"), b"cd 'C:\\proj'\r".to_vec());
+        assert_eq!(
+            cd_command_raw("C:\\proj\u{2019}; calc; \u{2018}x"),
+            "cd 'C:\\proj\u{2019}\u{2019}; calc; \u{2018}\u{2018}x'\r"
+                .as_bytes()
+                .to_vec()
+        );
+        assert!(cd_command_raw("C:\\a\nb").is_empty());
+        assert!(cd_command_raw("C:\\a\rb").is_empty());
+        // 与本地 Path 入口对普通路径产出一致。
+        assert_eq!(
+            cd_command_raw(r"C:\Program Files\工具"),
+            cd_command(Path::new(r"C:\Program Files\工具"))
+        );
     }
 
     #[test]

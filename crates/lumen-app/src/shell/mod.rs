@@ -398,6 +398,8 @@ pub struct ShellOutput {
     pub remote_create: Option<(String, String, bool)>,
     /// 远程文件树：删除确认 (远程 path, 是否目录) → main 调 `remote_ws.remote_delete`。
     pub remote_delete: Option<(String, bool)>,
+    /// 远程文件树：菜单「进入文件夹」目标目录（被控端绝对路径）→ main 注入 `cd` 到远程会话。
+    pub remote_cd: Option<String>,
     /// 设置页本帧被打开（main 把终端焦点交给 egui）。
     pub settings_opened: bool,
     /// 设置页本帧被关闭（main 把焦点交还终端，IME 复位链路照旧）。
@@ -537,6 +539,7 @@ pub fn show(
         filetree_dialog_closed: false,
         remote_create: None,
         remote_delete: None,
+        remote_cd: None,
         settings_opened: false,
         settings_closed: false,
         settings_font_changed: false,
@@ -884,6 +887,8 @@ pub fn show(
         out.copy_text = rout.copy_text;
         out.remote_create = rout.remote_create;
         out.remote_delete = rout.remote_delete;
+        // 菜单「进入文件夹」→ main 往远程会话注入 cd。
+        out.remote_cd = rout.cd_dir;
         if rout.dialog_closed {
             out.filetree_dialog_closed = true;
         }
