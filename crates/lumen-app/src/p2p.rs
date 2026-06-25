@@ -75,6 +75,11 @@ const P2P_KEEPALIVE: Duration = Duration::from_secs(4);
 /// 直连 QUIC 最大空闲超时（超过即判链路丢失，触发回退中继）。
 const P2P_MAX_IDLE: Duration = Duration::from_secs(30);
 
+/// 直连断后自动重连：最多重试打洞次数（超则放弃直连、纯中继兜底）。成功重连 / 新信令交换后归零。
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// 直连断后重连退避（固定）：断开到下次重新打洞的间隔。两端同此值，重连打洞窗口大致对齐。
+const P2P_RECONNECT_BACKOFF: Duration = Duration::from_secs(3);
+
 /// STUN 单次探测超时（无应答即视作该服务器不可达，回退/换源）。
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -203,10 +208,13 @@ impl P2pEngine {
         self.data_ready.load(Ordering::Acquire)
     }
 
-    /// 把一条数据面帧（`frame.to_value()` 的 Value）投到 QUIC 出站写泵。返回 `false` = 通道已断
-    /// （调用方应回退中继）。
+    /// 把一条数据面帧（`frame.to_value()` 的 Value）投到 QUIC 出站写泵。返回 `false` = **直连未就绪/
+    /// 已断**（调用方应回退中继）。**复查 `is_data_ready`**（与主线程 `send_frame` 的 `is_data_ready`
+    /// 检查配对的二次确认）：会话期 `data_tx` 长存、`send` 恒成功，若不复查则断连瞬间帧会被 run() 转发
+    /// 时静默丢弃（`cur_stream_tx=None`）而非回退中继（重连重构 blocker：旧实现靠 data_rx 随流 drop 令
+    /// `send` 失败回 false，新实现 data_rx 整会话长存须显式复查 `data_ready` 顶替）。
     pub fn try_send_frame(&self, value: serde_json::Value) -> bool {
-        self.data_tx.send(value).is_ok()
+        self.is_data_ready() && self.data_tx.send(value).is_ok()
     }
 
     /// 非阻塞排空 P2P 线程事件（主线程每帧调用）。
@@ -252,8 +260,9 @@ fn signal_payload_within_bounds(p: &SignalPayload) -> bool {
 }
 
 /// 对一条对端信令负载发起打洞（spawn 异步 punch；`punching` 守卫避免重复打洞）。成功的连接经
-/// `res_tx` 回主循环保活；失败/超时则经 `evt_tx` 主动通告对端 `Fallback`（`fallback`
-/// 为本端 `SignalPayload`，仅用 nonce 关联本次会话），让对端不必干等满 5s 超时即知回退中继。
+/// `res_tx` 回主循环保活；失败/超时则经 `evt_tx` 主动通告对端 `Fallback`（`fallback` 为本端
+/// `SignalPayload`，仅用 nonce 关联本次会话）让对端不必干等满超时，**并经 `attempt_done` 通知主循环
+/// 本次直连尝试已终结**（主循环复位打洞守卫 + 安排退避重连）。
 #[allow(clippy::too_many_arguments)] // 与主循环共享的一组句柄/通道，拆结构体反更晦涩。
 fn spawn_punch(
     de: &DirectEndpoint,
@@ -264,6 +273,7 @@ fn spawn_punch(
     evt_tx: &Sender<P2pEvent>,
     waker: &Option<Waker>,
     fallback: SignalPayload,
+    attempt_done: &UnboundedSender<()>,
 ) {
     if *punching {
         return;
@@ -285,6 +295,7 @@ fn spawn_punch(
     let tx = res_tx.clone();
     let evt = evt_tx.clone();
     let wk = waker.clone();
+    let done = attempt_done.clone();
     tokio::spawn(async move {
         match punch(&ep, &cert, &peer_cert, &cands, PUNCH_TIMEOUT, role).await {
             Some(conn) => {
@@ -300,9 +311,35 @@ fn spawn_punch(
                         payload: fallback,
                     },
                 );
+                // 通知主循环：本次尝试终结（复位 punching + 安排退避重连）。
+                let _ = done.send(());
             }
         }
     });
+}
+
+/// 安排一次退避后的直连重连（**不阻塞主循环**：起延迟任务，到点经 `reconn_tx` 通知主循环重新打洞）。
+/// 无对端信息 / 已停机 / 超重连上限则不安排（保持中继兜底）。返回是否已安排（便于测试/诊断）。
+fn schedule_reconnect(
+    reconn_tx: &UnboundedSender<()>,
+    attempts: &mut u32,
+    have_peer: bool,
+    stop: &AtomicBool,
+) -> bool {
+    if !have_peer || stop.load(Ordering::SeqCst) {
+        return false;
+    }
+    if *attempts >= MAX_RECONNECT_ATTEMPTS {
+        log::info!("P2P 直连重连达上限 {MAX_RECONNECT_ATTEMPTS} 次，放弃直连、保持中继");
+        return false;
+    }
+    *attempts += 1;
+    let tx = reconn_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(P2P_RECONNECT_BACKOFF).await;
+        let _ = tx.send(());
+    });
+    true
 }
 
 /// P2P 后台线程主体：建 current-thread runtime，构建直连端点 + 跑打洞信令状态机 + 数据面收发。
@@ -363,9 +400,18 @@ fn run(
             );
         }
         let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel::<quinn::Connection>();
+        // 一次直连尝试终结信号（打洞失败 / 连上后断开）：主循环据此复位打洞守卫 + 安排退避重连。
+        let (attempt_done_tx, mut attempt_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // 退避到点触发重连（延迟任务发、主循环收，避免 sleep 阻塞主循环）。
+        let (reconn_tx, mut reconn_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // run() 始终持有主线程出站帧 receiver，转发到「当前数据面流」入口——断连换流即可重连
+        // （区别于旧实现把 data_rx move 进 run_data_plane 一次性消费，断后无法重建）。
+        let mut data_rx = data_rx;
+        let mut cur_stream_tx: Option<UnboundedSender<serde_json::Value>> = None;
         let mut conn_keep: Option<quinn::Connection> = None;
-        let mut data_rx_opt = Some(data_rx);
         let mut punching = false;
+        let mut peer_payload: Option<SignalPayload> = None; // 最近对端信令负载（重连复用候选/证书）。
+        let mut reconnect_attempts: u32 = 0;
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -380,6 +426,8 @@ fn run(
                                     payload: my_payload.clone(),
                                 },
                             );
+                            peer_payload = Some(payload.clone());
+                            reconnect_attempts = 0; // 新信令交换 → 重连预算归零。
                             spawn_punch(
                                 &de,
                                 payload,
@@ -389,9 +437,12 @@ fn run(
                                 evt_tx,
                                 &waker,
                                 my_payload.clone(),
+                                &attempt_done_tx,
                             );
                         }
                         P2pSignalKind::Answer => {
+                            peer_payload = Some(payload.clone());
+                            reconnect_attempts = 0;
                             spawn_punch(
                                 &de,
                                 payload,
@@ -401,6 +452,7 @@ fn run(
                                 evt_tx,
                                 &waker,
                                 my_payload.clone(),
+                                &attempt_done_tx,
                             );
                         }
                         // data_ready 由 run_data_plane 在**本端数据面流真正建立**时置位（而非据对端 Ready），
@@ -414,6 +466,7 @@ fn run(
                 },
                 Some(conn) = res_rx.recv() => {
                     log::info!("P2P 直连已通 → {}", conn.remote_address());
+                    reconnect_attempts = 0; // 连上即归零重连预算（下次断开有完整重试额度）。
                     emit(evt_tx, &waker, P2pEvent::Connected);
                     // 通告对端「我直连已通」（仅诊断；data_ready 由本端 run_data_plane 在流建立时置位）。
                     emit(
@@ -424,18 +477,74 @@ fn run(
                             payload: my_payload.clone(),
                         },
                     );
-                    // 在此 conn 上建立数据面双向流（仅一次）。
-                    if let Some(drx) = data_rx_opt.take() {
-                        tokio::spawn(run_data_plane(
-                            conn.clone(),
-                            role,
-                            drx,
-                            evt_tx.clone(),
-                            Arc::clone(data_ready),
-                            waker.clone(),
-                        ));
+                    // 为本连接建独立数据面流入口；主循环把 data_rx 帧转发到此。断连换流即可重连。
+                    let (stx, srx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                    cur_stream_tx = Some(stx);
+                    tokio::spawn(run_data_plane(
+                        conn.clone(),
+                        role,
+                        srx,
+                        evt_tx.clone(),
+                        Arc::clone(data_ready),
+                        waker.clone(),
+                    ));
+                    // 连接关闭监视 → 触发重连评估（独立于 run_data_plane 的 fail_data_plane；
+                    // conn.closed() 是连接终结的可靠信号，写泵阻塞在无出站帧时也能及时感知断开）。
+                    {
+                        let conn2 = conn.clone();
+                        let done = attempt_done_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = conn2.closed().await;
+                            let _ = done.send(());
+                        });
                     }
                     conn_keep = Some(conn); // 保活直连（其 drop 关连接）。
+                }
+                Some(v) = data_rx.recv() => {
+                    // 主线程出站帧 → 当前流；无流 / 转发失败（流已死）则丢弃。主线程此时应已据
+                    // data_ready=false 切中继，丢失帧由切换补发订阅重建镜像自愈。
+                    if let Some(tx) = &cur_stream_tx {
+                        if tx.send(v).is_err() {
+                            cur_stream_tx = None;
+                        }
+                    }
+                }
+                Some(()) = attempt_done_rx.recv() => {
+                    // 一次直连尝试终结（打洞失败 / 连上后断开）：复位打洞守卫 + 清当前流/连接，
+                    // 安排退避重连（有对端信息且未停机、未超上限）。
+                    // **先置 data_ready=false 再清 cur_stream_tx**：与 try_send_frame 的复查配对，杜绝
+                    // 「data_ready 仍 true、cur_stream_tx 已 None」窗口内主线程帧被静默丢弃（blocker #2）。
+                    // DataPlaneDown 事件由 run_data_plane 的 fail_data_plane 发（真断连才需重建镜像；
+                    // 打洞失败本无 Up 无需 Down），此处仅同步标志、不重复发事件。
+                    data_ready.store(false, Ordering::Release);
+                    punching = false;
+                    cur_stream_tx = None;
+                    conn_keep = None;
+                    schedule_reconnect(
+                        &reconn_tx,
+                        &mut reconnect_attempts,
+                        peer_payload.is_some(),
+                        stop,
+                    );
+                }
+                Some(()) = reconn_rx.recv() => {
+                    // 退避到点：用保存的对端 payload 重新打洞（候选/证书复用；NAT 未变即可重连）。
+                    if !stop.load(Ordering::SeqCst) {
+                        if let Some(pp) = peer_payload.clone() {
+                            log::info!("P2P 直连断开，重新打洞（第 {reconnect_attempts} 次）");
+                            spawn_punch(
+                                &de,
+                                pp,
+                                &res_tx,
+                                &mut punching,
+                                role,
+                                evt_tx,
+                                &waker,
+                                my_payload.clone(),
+                                &attempt_done_tx,
+                            );
+                        }
+                    }
                 }
             }
             if stop.load(Ordering::SeqCst) {
@@ -1224,6 +1333,41 @@ mod tests {
         assert_ne!(a, b, "CSPRNG transaction id 应不同");
         // 不应全零（CSPRNG 填充成功的弱信号）。
         assert_ne!(a, [0u8; 12], "不应全零");
+    }
+
+    #[tokio::test]
+    async fn schedule_reconnect_门控与计数() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let stop = AtomicBool::new(false);
+        let mut attempts = 0u32;
+        // 无对端信息 → 不安排、计数不动。
+        assert!(!schedule_reconnect(&tx, &mut attempts, false, &stop));
+        assert_eq!(attempts, 0);
+        // 有对端 + 未停机 → 安排 + 计数 +1（spawn 的退避任务在 runtime drop 时取消，不等 3s）。
+        assert!(schedule_reconnect(&tx, &mut attempts, true, &stop));
+        assert_eq!(attempts, 1);
+        // 已停机 → 不安排。
+        stop.store(true, Ordering::SeqCst);
+        assert!(!schedule_reconnect(&tx, &mut attempts, true, &stop));
+        assert_eq!(attempts, 1);
+        stop.store(false, Ordering::SeqCst);
+        // 达重连上限 → 不安排、计数封顶。
+        attempts = MAX_RECONNECT_ATTEMPTS;
+        assert!(!schedule_reconnect(&tx, &mut attempts, true, &stop));
+        assert_eq!(attempts, MAX_RECONNECT_ATTEMPTS);
+    }
+
+    #[test]
+    fn try_send_frame_直连未就绪回false_供回退中继() {
+        // 重连重构后 data_tx 整会话长存，try_send_frame 须复查 data_ready：未就绪回 false，
+        // 主线程据此走中继（否则断连瞬间帧被 run() 静默丢弃）。
+        let eng = P2pEngine::start(Role::Controller, String::new(), None, None, None);
+        assert!(!eng.is_data_ready(), "未握手数据面不就绪");
+        assert!(
+            !eng.try_send_frame(serde_json::json!({ "k": 1 })),
+            "直连未就绪 try_send_frame 应回 false，供主线程回退中继"
+        );
+        drop(eng);
     }
 
     #[test]
