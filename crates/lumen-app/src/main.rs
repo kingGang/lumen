@@ -5804,8 +5804,11 @@ impl ApplicationHandler<PtyWake> for App {
                     win32_input: if mirror_active {
                         state.remote_ws.mirror_win32_input()
                     } else {
+                        // 新版 Claude 等开 DEC 9001 即期望 win32 格式键盘——开了就自动
+                        // 启用。旧的 opt-in env 门控会让本地输入仍发 VT、被新版 Claude
+                        // 拒收（输入不了）。LUMEN_NO_WIN32_INPUT 为 opt-out 逃生口。
                         state.tabs[ti].panes[pi].term.win32_input()
-                            && std::env::var_os("LUMEN_WIN32_INPUT").is_some()
+                            && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none()
                     },
                     // M4.1 批D1：Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D）。
                     // 镜像态视作空：Ctrl+C 无镜像选区时落 Interrupt（转发中断）而非 CancelLine。
@@ -6134,8 +6137,11 @@ impl ApplicationHandler<PtyWake> for App {
                             }
                         } else {
                             // 兜底直通：encode_key / encode_key_win32 编码后写 PTY。
+                            // DEC 9001 开启即自动用 win32（去掉旧 opt-in env 门控，否则
+                            // 新版 Claude 开 9001 后本地仍发 VT、输入不了）。
+                            // LUMEN_NO_WIN32_INPUT 为 opt-out 逃生口。
                             let use_win32 = state.tabs[ti].panes[pi].term.win32_input()
-                                && std::env::var_os("LUMEN_WIN32_INPUT").is_some();
+                                && std::env::var_os("LUMEN_NO_WIN32_INPUT").is_none();
                             let bytes = if use_win32 {
                                 input::encode_key_win32(&event, state.modifiers, true)
                             } else {

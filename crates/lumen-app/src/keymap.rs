@@ -93,7 +93,8 @@ pub struct GuardState {
     pub filetree_dialog_open: bool,
     /// 终端是否持有键盘焦点（非聚焦时按键不写 PTY）。
     pub terminal_focused: bool,
-    /// win32-input-mode 已开启（LUMEN_WIN32_INPUT=1）。
+    /// win32-input-mode 已开启（终端开了 DEC 9001 即自动启用；可经
+    /// LUMEN_NO_WIN32_INPUT opt-out 强制禁用）。
     pub win32_input: bool,
     /// Compose 态编辑器缓冲是否为空（影响 Ctrl+C / Ctrl+D 的行为）。
     /// M4.1 批D1：仅在 input-editor feature 开启时有意义。
