@@ -11,6 +11,7 @@ use vte::{Params, Parser, Perform};
 use crate::block::Block;
 use crate::cell::{Cell, CellFlags, Color};
 use crate::grid::Grid;
+use crate::mouse::{MouseEncoding, MouseProtocol};
 
 /// 终端模拟器核心。喂入 PTY 字节流，维护屏幕状态。
 pub struct Terminal {
@@ -226,6 +227,23 @@ impl Terminal {
         self.inner.win32_input
     }
 
+    /// 当前生效的鼠标上报协议（DECSET 9/1000/1002/1003 中已开启的最高级别）。
+    /// `Off` 时鼠标归终端本地（选区 / 滚 scrollback）；非 `Off` 时上层应把鼠标
+    /// 事件经 [`crate::encode_mouse`] 编码后写 PTY。
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.inner.effective_mouse_protocol()
+    }
+
+    /// 当前鼠标坐标 / 按钮编码（DECSET 1006 = SGR，否则默认 X10）。
+    pub fn mouse_encoding(&self) -> MouseEncoding {
+        self.inner.mouse_encoding
+    }
+
+    /// 是否开启焦点上报（DEC 1004）：窗口获/失焦应发 `ESC[I` / `ESC[O`。
+    pub fn focus_event(&self) -> bool {
+        self.inner.focus_event
+    }
+
     /// ESU（同步帧结束）单调标记：每次 ESU 后递增。
     /// 上层对比两次取值即可知道期间是否完成过同步帧——完成的帧
     /// 应立即渲染（DEC 2026 的本意），无需再等静默合帧。
@@ -338,6 +356,21 @@ struct TermInner {
     /// ConPTY win32-input-mode（DEC 9001）已开启：键盘输入应编码为
     /// `CSI Vk;Sc;Uc;Kd;Cs;Rc _` 直达 conhost 输入队列。
     win32_input: bool,
+    /// 鼠标上报协议各级别的独立开关（DECSET 9/1000/1002/1003），有效协议取
+    /// 「已开启的最高级别」（见 [`Self::effective_mouse_protocol`]）。
+    ///
+    /// 注意：真实 xterm 把鼠标模式存在单一变量里，任一编号的 DECRST（`l`）都
+    /// 无条件整体关闭上报、四个编号互斥。这里**刻意**改成独立开关——常见 TUI
+    /// 都是「开/关同一组编号」，两种模型结果一致；独立开关额外让「复位一个从
+    /// 未开过的编号」不会误关其他级别（对只增不减的用法更稳健）。
+    mouse_x10: bool,
+    mouse_normal: bool,
+    mouse_button: bool,
+    mouse_any: bool,
+    /// 鼠标坐标 / 按钮编码（DECSET 1006 = SGR，否则默认 X10 字节编码）。
+    mouse_encoding: MouseEncoding,
+    /// 焦点上报（DECSET 1004）：窗口获/失焦时应发 `ESC[I` / `ESC[O`。
+    focus_event: bool,
     /// 事件序号，用于判断「显示光标」与「ESU」的先后。
     event_seq: u64,
     last_cursor_show_seq: u64,
@@ -370,6 +403,12 @@ impl TermInner {
             sync_output: false,
             bracketed_paste: false,
             win32_input: false,
+            mouse_x10: false,
+            mouse_normal: false,
+            mouse_button: false,
+            mouse_any: false,
+            mouse_encoding: MouseEncoding::Default,
+            focus_event: false,
             event_seq: 0,
             last_cursor_show_seq: 0,
             last_esu_seq: 0,
@@ -600,6 +639,22 @@ impl TermInner {
                 ))
             }
             _ => None,
+        }
+    }
+
+    /// 已开启的最高鼠标上报级别（Any > Button > Normal > X10 > Off）。
+    /// 各级别独立开关下，生效的是能力最强的那个（见字段注释的取舍说明）。
+    fn effective_mouse_protocol(&self) -> MouseProtocol {
+        if self.mouse_any {
+            MouseProtocol::Any
+        } else if self.mouse_button {
+            MouseProtocol::Button
+        } else if self.mouse_normal {
+            MouseProtocol::Normal
+        } else if self.mouse_x10 {
+            MouseProtocol::X10
+        } else {
+            MouseProtocol::Off
         }
     }
 
@@ -905,6 +960,19 @@ impl Perform for TermInner {
                             1049 | 1047 => self.set_alt_screen(on),
                             2004 => self.bracketed_paste = on,
                             9001 => self.win32_input = on,
+                            // 鼠标上报协议：各级别独立开关（刻意，非 xterm 原
+                            // 语义，见字段注释），有效协议取已开启的最高级别。
+                            9 => self.mouse_x10 = on,
+                            1000 => self.mouse_normal = on,
+                            1002 => self.mouse_button = on,
+                            1003 => self.mouse_any = on,
+                            // SGR 扩展编码（DEC 1006）：开 = SGR，关 = 默认 X10。
+                            1006 => {
+                                self.mouse_encoding =
+                                    if on { MouseEncoding::Sgr } else { MouseEncoding::Default };
+                            }
+                            // 焦点上报（DEC 1004）。
+                            1004 => self.focus_event = on,
                             2026 => {
                                 self.sync_output = on;
                                 if !on {
@@ -974,6 +1042,13 @@ impl Perform for TermInner {
                             2
                         }
                     }
+                    // 鼠标上报：协议按精确级别匹配应答，编码 / 焦点按布尔。
+                    9 => bool_to_decrqm(self.mouse_x10),
+                    1000 => bool_to_decrqm(self.mouse_normal),
+                    1002 => bool_to_decrqm(self.mouse_button),
+                    1003 => bool_to_decrqm(self.mouse_any),
+                    1006 => bool_to_decrqm(self.mouse_encoding == MouseEncoding::Sgr),
+                    1004 => bool_to_decrqm(self.focus_event),
                     _ => 0,
                 };
                 let s = format!("\x1b[?{mode};{value}$y");
@@ -1063,6 +1138,15 @@ impl Perform for TermInner {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
+}
+
+/// DECRQM 私有模式查询应答值：1 = 已设置（开），2 = 已复位（关）。
+fn bool_to_decrqm(on: bool) -> u8 {
+    if on {
+        1
+    } else {
+        2
+    }
 }
 
 /// 标准 base64 解码（RFC 4648，字母表 `A-Za-z0-9+/`，带可选 `=` padding）。
@@ -1445,6 +1529,72 @@ mod tests {
         assert!(t.bracketed_paste());
         t.advance(b"\x1b[?2004l");
         assert!(!t.bracketed_paste());
+    }
+
+    #[test]
+    fn 鼠标上报模式解析() {
+        let mut t = term();
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+        assert_eq!(t.mouse_encoding(), MouseEncoding::Default);
+        assert!(!t.focus_event());
+
+        // Claude 实测启动序列：一次开 1000/1002/1003/1006/1004，最宽松的
+        // 1003(Any) 生效，编码切 SGR，焦点上报打开。
+        t.advance(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1004h");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Any);
+        assert_eq!(t.mouse_encoding(), MouseEncoding::Sgr);
+        assert!(t.focus_event());
+
+        // 成组复位回到 Off / 默认编码。
+        t.advance(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1004l");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+        assert_eq!(t.mouse_encoding(), MouseEncoding::Default);
+        assert!(!t.focus_event());
+    }
+
+    #[test]
+    fn 鼠标上报级别独立_复位未开编号不误关() {
+        let mut t = term();
+        // 只开 Button(1002)。
+        t.advance(b"\x1b[?1002h");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Button);
+        // 复位一个从未开过的 1003：不应把 Button 也关掉（独立资源）。
+        t.advance(b"\x1b[?1003l");
+        assert_eq!(
+            t.mouse_protocol(),
+            MouseProtocol::Button,
+            "复位未开启的 1003 不应误关 1002"
+        );
+        // 叠开 1003 再单独关 1003：应降回 Button 而非 Off。
+        t.advance(b"\x1b[?1003h");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Any);
+        t.advance(b"\x1b[?1003l");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Button, "关 1003 应降回 1002");
+        // 关掉 1002 才到 Off。
+        t.advance(b"\x1b[?1002l");
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+    }
+
+    #[test]
+    fn 备用屏切换不动鼠标模式() {
+        // 鼠标上报与 alt screen 正交：进出备用屏不应清掉鼠标协议。
+        let mut t = term();
+        t.advance(b"\x1b[?1000h\x1b[?1006h");
+        t.advance(b"\x1b[?1049h"); // 进备用屏
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Normal);
+        assert_eq!(t.mouse_encoding(), MouseEncoding::Sgr);
+        t.advance(b"\x1b[?1049l"); // 出备用屏
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Normal);
+    }
+
+    #[test]
+    fn ris_重置鼠标模式() {
+        let mut t = term();
+        t.advance(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h");
+        t.advance(b"\x1bc"); // RIS
+        assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+        assert_eq!(t.mouse_encoding(), MouseEncoding::Default);
+        assert!(!t.focus_event());
     }
 
     #[test]
