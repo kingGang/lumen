@@ -63,7 +63,10 @@ use anyhow::{Context, Result};
 use log::{error, info};
 use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
-use lumen_term::{SelPoint, Selection};
+use lumen_term::{
+    encode_mouse, MouseButton as MouseReportBtn, MouseEvent, MouseEventKind, MouseMods,
+    MouseProtocol, SelPoint, Selection,
+};
 use session::{Session, SessionId, Tab, TabId, MAX_PANES};
 use shell::layout::{DividerKind, PaneLayout};
 use winit::application::ApplicationHandler;
@@ -589,6 +592,17 @@ struct AppState {
     /// 未拖动。egui 跨帧记住被拖控件，配合 `interact_pointer_pos` 用绝对
     /// 指针位置反算偏移（不靠 delta 累加，无漂移）。
     scrollbar_drag: Option<(SessionId, f32)>,
+    /// 鼠标上报态下当前按住的按键集合（索引 0=Left/1=Middle/2=Right；DECSET
+    /// 1002 拖动上报需要知道哪些键在按下）。被上报的按下置位、对应释放清位、
+    /// 离窗 / 失焦整体清零。用集合而非单值：多键并发时每枚按下都能配到自己的
+    /// 释放，不被后按的键覆盖丢失。
+    mouse_report_held: [bool; 3],
+    /// 最近一次上报的 motion 格子（会话 id, 列, 行）：同格不重复上报，避免
+    /// 子格抖动在 Any(1003) 模式下把 PTY 刷爆（xterm 同款节流）。带会话 id
+    /// 是因为分屏多窗格共用一套视口坐标系，仅比 (列,行) 会在跨窗格落到同
+    /// 一格时漏掉一次移动上报。离窗 / 失焦时清空；切焦点窗格无需额外清——
+    /// 节流键含会话 id，新焦点窗格的键与旧值永不相等，首个移动不会被误吞。
+    mouse_report_last_cell: Option<(SessionId, usize, usize)>,
 
     // —— F3 热更（自动更新）——
     /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
@@ -2353,6 +2367,378 @@ impl AppState {
         Some((pane_idx, pane_id, abs, col))
     }
 
+    /// 鼠标当前所在窗格的**视口内** 0 基格子坐标：返回 (窗格下标, 窗格 id,
+    /// 列, 行)。与 [`Self::cell_under_mouse`] 同源（按窗格矩形 + footer 夹紧），
+    /// 但返回视口内行号而非绝对行——鼠标上报要的是相对屏幕左上角的列/行。
+    fn viewport_cell_under_mouse(&self) -> Option<(usize, SessionId, usize, usize)> {
+        let pane_idx = self.pane_under_mouse()?;
+        let pane_id = self.tabs[self.active_tab].panes[pane_idx].id;
+        let (x, y, w, h) = self
+            .pane_rects_px
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, r)| *r)?;
+        let footer_px = self.pane_footer_px(pane_idx, h);
+        let (row, col) = self.renderer.cell_at_with_footer(
+            self.mouse_pos.0 - x as f64,
+            self.mouse_pos.1 - y as f64,
+            w.max(1.0) as u32,
+            h.max(1.0) as u32,
+            footer_px,
+        );
+        Some((pane_idx, pane_id, col, row))
+    }
+
+    /// 当前修饰键 → 鼠标协议修饰位。Shift 是本地选区逃生通道（上报前已被
+    /// 拦截），这里仍如实带上，仅 ctrl/alt 实际进入编码。
+    fn mouse_mods(&self) -> MouseMods {
+        MouseMods {
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+            ctrl: self.modifiers.control_key(),
+        }
+    }
+
+    /// 把 winit 按键映射为上报按钮（仅左/中/右参与上报）。
+    fn map_report_button(button: MouseButton) -> Option<MouseReportBtn> {
+        match button {
+            MouseButton::Left => Some(MouseReportBtn::Left),
+            MouseButton::Middle => Some(MouseReportBtn::Middle),
+            MouseButton::Right => Some(MouseReportBtn::Right),
+            _ => None,
+        }
+    }
+
+    /// 鼠标按键上报：把按下/释放编码成鼠标事件写入对应窗格 PTY 并请求重绘，
+    /// 返回 `true`（事件已被上报消费，调用方应跳过本地选区/块选中/复制粘贴）；
+    /// 否则返回 `false`，调用方按原逻辑处理。
+    ///
+    /// 按下与释放严格配对：本次「点击」归本地还是归上报，在**按下**一刻由
+    /// Shift（本地选区 / 复制逃生通道）latch 决定——`mouse_report_held` 记下
+    /// 被上报的按键即作标记。释放时**不再看当前 Shift / 鼠标是否还在窗格内**，
+    /// 当且仅当这枚键的按下当初被上报才上报释放，并无条件清掉 held。否则
+    /// 中途切 Shift / 拖出窗格松手会留下「幻影按住」（程序以为键没抬）+ held
+    /// 卡死（之后纯悬停被误报成拖动）。
+    fn report_mouse_button(&mut self, button: MouseButton, pressed: bool) -> bool {
+        let Some(btn) = Self::map_report_button(button) else {
+            return false;
+        };
+        let idx = Self::held_index(btn);
+        if !pressed {
+            // 这枚键的按下当初走了本地（Shift 逃生 / 非上报窗格）：释放也
+            // 走本地，不碰上报。
+            if !self.mouse_report_held[idx] {
+                return false;
+            }
+            // 解除该键的按住态（无条件，先于一切；仅清这一枚，不动其他键）。
+            self.mouse_report_held[idx] = false;
+            // 拖动全程钉在发起（焦点）窗格：释放也写焦点窗格、坐标按其矩形
+            // 夹紧（鼠标可能已拖到别的窗格 / 窗外），保证 Press 的那个窗格
+            // 一定收到配对的 Release、按钮不卡死。
+            let (pane_idx, col, row) = self.drag_report_target();
+            let pane = &self.tabs[self.active_tab].panes[pane_idx];
+            let proto = pane.term.mouse_protocol();
+            if !proto.is_on() {
+                return true; // 上报刚被程序关掉：消费掉释放即可，无需写
+            }
+            let enc = pane.term.mouse_encoding();
+            let ev = MouseEvent {
+                kind: MouseEventKind::Release(btn),
+                col,
+                row,
+                mods: self.mouse_mods(),
+            };
+            if let Some(bytes) = encode_mouse(proto, enc, ev) {
+                if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&bytes) {
+                    log::error!("鼠标上报写 PTY 失败: {e:#}");
+                }
+                self.window.request_redraw();
+            }
+            return true;
+        }
+        // —— 按下：Shift = 本地选区逃生通道（决策只在按下一刻 latch）。
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        // footer（编辑器输入区）不上报：它不是终端内容。
+        #[cfg(feature = "input-editor")]
+        if self.mouse_on_footer() {
+            return false;
+        }
+        let Some((pane_idx, _id, col, row)) = self.viewport_cell_under_mouse() else {
+            return false;
+        };
+        let pane = &self.tabs[self.active_tab].panes[pane_idx];
+        let proto = pane.term.mouse_protocol();
+        if !proto.is_on() {
+            return false;
+        }
+        let enc = pane.term.mouse_encoding();
+        let ev = MouseEvent {
+            kind: MouseEventKind::Press(btn),
+            col,
+            row,
+            mods: self.mouse_mods(),
+        };
+        let Some(bytes) = encode_mouse(proto, enc, ev) else {
+            return false;
+        };
+        // latch：记下被上报的按键（集合，多键并发各自配对），供 motion 上报
+        // 填 held、供释放配对。
+        self.mouse_report_held[idx] = true;
+        if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&bytes) {
+            log::error!("鼠标上报写 PTY 失败: {e:#}");
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// 拖动 / 释放上报的目标：始终是按下时的焦点（发起）窗格——按住期间把
+    /// 上报钉在起始窗格，模拟真实终端的指针捕获；坐标按该窗格矩形夹紧（鼠标
+    /// 可能已拖到别的窗格 / 窗外）。返回 (窗格下标, 列, 行)。
+    fn drag_report_target(&self) -> (usize, usize, usize) {
+        let pane_idx = self.tabs[self.active_tab].focused;
+        let (col, row) = self
+            .viewport_cell_in_pane(pane_idx)
+            .map(|(_, c, r)| (c, r))
+            .unwrap_or((0, 0));
+        (pane_idx, col, row)
+    }
+
+    /// 指定窗格的视口格（会话 id, 列, 行），坐标按该窗格矩形夹紧——鼠标在
+    /// 窗格外时落到边缘格。窗格不存在 / 尚无矩形时返回 None。
+    fn viewport_cell_in_pane(&self, pane_idx: usize) -> Option<(SessionId, usize, usize)> {
+        let pane_id = self.tabs[self.active_tab].panes.get(pane_idx)?.id;
+        let (x, y, w, h) = self
+            .pane_rects_px
+            .iter()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, r)| *r)?;
+        let footer_px = self.pane_footer_px(pane_idx, h);
+        let (row, col) = self.renderer.cell_at_with_footer(
+            self.mouse_pos.0 - x as f64,
+            self.mouse_pos.1 - y as f64,
+            w.max(1.0) as u32,
+            h.max(1.0) as u32,
+            footer_px,
+        );
+        Some((pane_id, col, row))
+    }
+
+    /// 鼠标上报按住集合的索引（0=Left / 1=Middle / 2=Right）。
+    fn held_index(btn: MouseReportBtn) -> usize {
+        match btn {
+            MouseReportBtn::Left => 0,
+            MouseReportBtn::Middle => 1,
+            MouseReportBtn::Right => 2,
+        }
+    }
+
+    /// 是否有任意被上报的按键处于按住（拖动进行中）。
+    fn any_button_held(&self) -> bool {
+        self.mouse_report_held.iter().any(|&h| h)
+    }
+
+    /// 拖动 motion 上报填入的代表按键：按住集合里按 左 > 中 > 右 取一个。
+    fn held_repr_button(&self) -> Option<MouseReportBtn> {
+        if self.mouse_report_held[0] {
+            Some(MouseReportBtn::Left)
+        } else if self.mouse_report_held[1] {
+            Some(MouseReportBtn::Middle)
+        } else if self.mouse_report_held[2] {
+            Some(MouseReportBtn::Right)
+        } else {
+            None
+        }
+    }
+
+    /// 按住集合索引 → 按键（0=Left / 1=Middle / 2=Right）。
+    fn button_from_index(i: usize) -> Option<MouseReportBtn> {
+        match i {
+            0 => Some(MouseReportBtn::Left),
+            1 => Some(MouseReportBtn::Middle),
+            2 => Some(MouseReportBtn::Right),
+            _ => None,
+        }
+    }
+
+    /// 鼠标上报的拖动被打断（离窗 / 失焦 / 切焦点窗格 / 切 Tab / 新建·关闭
+    /// 窗格 / 最大化）时：对每个仍被上报按住的键，向**当前焦点窗格**补发一条
+    /// Release，让程序收到配对的 button-up、不残留「幻影按住」，随后清空按住
+    /// 集合。拖动期间焦点不变，故此刻焦点窗格即拖动发起窗格——**务必在改
+    /// focused / active_tab / 移除发起窗格之前调用**，否则补发会落到错误窗格
+    /// 或漏发。坐标按发起窗格矩形夹紧（对 Release 而言坐标无关紧要，程序只在
+    /// 意「键已抬」）。
+    ///
+    /// 全程防御：取不到活的焦点窗格（close_tab 关末位激活 tab 时 active_tab
+    /// 暂越界、或发起窗格已被移除）就只清按住态、不补发——绝不硬索引 panic。
+    fn release_held_report_buttons(&mut self) {
+        if !self.any_button_held() {
+            return;
+        }
+        let pane_idx = match self.tabs.get(self.active_tab) {
+            Some(tab) if tab.focused < tab.panes.len() => tab.focused,
+            _ => {
+                self.mouse_report_held = [false; 3];
+                return;
+            }
+        };
+        let (col, row) = self
+            .viewport_cell_in_pane(pane_idx)
+            .map(|(_, c, r)| (c, r))
+            .unwrap_or((0, 0));
+        let proto = self.tabs[self.active_tab].panes[pane_idx]
+            .term
+            .mouse_protocol();
+        if proto.is_on() {
+            let enc = self.tabs[self.active_tab].panes[pane_idx]
+                .term
+                .mouse_encoding();
+            let mods = self.mouse_mods();
+            let held = self.mouse_report_held; // [bool;3] 是 Copy
+            let mut buf = Vec::new();
+            for (i, &down) in held.iter().enumerate() {
+                if down {
+                    if let Some(btn) = Self::button_from_index(i) {
+                        if let Some(b) = encode_mouse(
+                            proto,
+                            enc,
+                            MouseEvent {
+                                kind: MouseEventKind::Release(btn),
+                                col,
+                                row,
+                                mods,
+                            },
+                        ) {
+                            buf.extend_from_slice(&b);
+                        }
+                    }
+                }
+            }
+            if !buf.is_empty() {
+                if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&buf) {
+                    log::error!("补发鼠标释放写 PTY 失败: {e:#}");
+                }
+                self.window.request_redraw();
+            }
+        }
+        self.mouse_report_held = [false; 3];
+    }
+
+    /// 滚轮上报：上报开启时把滚轮编码成鼠标按钮 64(上)/65(下)，按档数发
+    /// 给程序（每档一个事件），返回 `true`；否则返回 `false` 走本地滚动。
+    /// Shift+滚轮强制本地滚动（逃生通道）。
+    fn report_mouse_wheel(&mut self, up: bool, notches: usize) -> bool {
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        #[cfg(feature = "input-editor")]
+        if self.mouse_on_footer() {
+            return false;
+        }
+        let Some((pane_idx, _id, col, row)) = self.viewport_cell_under_mouse() else {
+            return false;
+        };
+        // 维持 F5 不变量：滚轮只作用于**焦点窗格**。悬停在别的窗格上时让位
+        // 本地（本地回退滚的也是焦点窗格），否则同一手势的落点会随被悬停
+        // 窗格是否开了鼠标上报而变，路由不一致。
+        if pane_idx != self.tabs[self.active_tab].focused {
+            return false;
+        }
+        let pane = &self.tabs[self.active_tab].panes[pane_idx];
+        let proto = pane.term.mouse_protocol();
+        if !proto.is_on() {
+            return false;
+        }
+        let enc = pane.term.mouse_encoding();
+        let kind = if up {
+            MouseEventKind::WheelUp
+        } else {
+            MouseEventKind::WheelDown
+        };
+        let mods = self.mouse_mods();
+        let mut buf = Vec::new();
+        for _ in 0..notches.max(1) {
+            if let Some(b) = encode_mouse(proto, enc, MouseEvent { kind, col, row, mods }) {
+                buf.extend_from_slice(&b);
+            }
+        }
+        if buf.is_empty() {
+            return false;
+        }
+        if let Err(e) = self.tabs[self.active_tab].panes[pane_idx].write_user_input(&buf) {
+            log::error!("滚轮上报写 PTY 失败: {e:#}");
+        }
+        self.window.request_redraw();
+        true
+    }
+
+    /// 指针移动上报：协议为 Button（仅按住拖动时）或 Any（任意移动）时，把
+    /// 移动编码成鼠标 motion 事件写 PTY，返回 `true`（调用方跳过本地拖选 /
+    /// 链接 hover）；否则 `false` 走本地逻辑。Shift 按下时让位本地。
+    /// 同一格内的抖动不重复上报（节流），避免 Any 模式刷爆 PTY。
+    fn report_mouse_motion(&mut self) -> bool {
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        #[cfg(feature = "input-editor")]
+        if self.mouse_on_footer() {
+            return false;
+        }
+        // 上报目标始终是焦点窗格（与按键 / 滚轮上报同源）。
+        let focused_idx = self.tabs[self.active_tab].focused;
+        let proto = self.tabs[self.active_tab].panes[focused_idx]
+            .term
+            .mouse_protocol();
+        let dragging = self.any_button_held();
+        // 仅 Any（任意移动）或 Button（拖动中）上报 motion；其余让位本地。
+        let want = match proto {
+            MouseProtocol::Any => true,
+            MouseProtocol::Button => dragging,
+            _ => false,
+        };
+        if !want {
+            return false;
+        }
+        // 坐标解析：拖动中把上报钉在焦点窗格、坐标按其矩形夹紧（指针捕获，
+        // 即便鼠标已拖到别的窗格 / 窗外）；纯 hover 则鼠标必须确实落在焦点
+        // 窗格内容区，否则让位（不给焦点窗格发它管不到的移动）。
+        let (pane_id, col, row) = if dragging {
+            match self.viewport_cell_in_pane(focused_idx) {
+                Some(t) => t,
+                None => return false,
+            }
+        } else {
+            match self.viewport_cell_under_mouse() {
+                Some((pi, id, c, r)) if pi == focused_idx => (id, c, r),
+                _ => return false,
+            }
+        };
+        // 同格节流：未跨格（同窗格同格）不重复发，但仍视为「已被上报接管」
+        // 返回 true。节流键带窗格身份，避免跨窗格落到同一视口格漏发。
+        if self.mouse_report_last_cell == Some((pane_id, col, row)) {
+            return true;
+        }
+        let enc = self.tabs[self.active_tab].panes[focused_idx]
+            .term
+            .mouse_encoding();
+        let ev = MouseEvent {
+            kind: MouseEventKind::Move(self.held_repr_button()),
+            col,
+            row,
+            mods: self.mouse_mods(),
+        };
+        let Some(bytes) = encode_mouse(proto, enc, ev) else {
+            return false;
+        };
+        self.mouse_report_last_cell = Some((pane_id, col, row));
+        if let Err(e) = self.tabs[self.active_tab].panes[focused_idx].write_user_input(&bytes) {
+            log::error!("鼠标移动上报写 PTY 失败: {e:#}");
+        }
+        self.window.request_redraw();
+        true
+    }
+
     /// 求鼠标当前位置命中的可点击链接（F10）：先查 OSC 8 显式超链接，
     /// 再按行文本扫描裸 URL / 文件路径（文件需在 cwd 下存在才算链接）。
     /// 焦点窗格的 footer（编辑器输入区）不参与终端链接识别。
@@ -2637,6 +3023,9 @@ impl AppState {
     /// 清未读点，同步窗口标题并立即重绘。无覆盖层/重命名时终端拿
     /// 键盘/IME 焦点。
     fn activate(&mut self, idx: usize) {
+        // 切 Tab 同样打断鼠标上报拖动：先向旧 tab 焦点（=发起）窗格补发
+        // Release（须在改 active_tab 前），否则原窗格程序留下幻影按住。
+        self.release_held_report_buttons();
         // 换出 tab 的拖选手势随切换结束：按住左键 Ctrl+Tab 切走后，
         // Released 只检查新焦点窗格的 selecting，旧窗格的标志会永久
         // 残留——切回时不按键鼠标一动就「幽灵拖选」，且 Ctrl+C 被
@@ -2700,15 +3089,22 @@ impl AppState {
     /// 切换激活 tab 内的焦点窗格（点击窗格 / F5 焦点路由）。窗口
     /// 标题、文件树 cwd、键盘/IME/滚轮路由随之跟随新焦点窗格。
     fn focus_pane(&mut self, idx: usize) {
+        {
+            let tab = &self.tabs[self.active_tab];
+            if idx >= tab.panes.len() || idx == tab.focused {
+                return;
+            }
+            // 最大化期间焦点强制为最大化格（P14）：隐藏窗格的矩形不在
+            // 本帧布局里、正常路径点不到，纯防御（陈旧矩形/竞态）。
+            if tab.maximized.is_some_and(|m| m != idx) {
+                return;
+            }
+        }
+        // 焦点真的要换走：若鼠标上报拖动正进行，先向旧焦点（=拖动发起）
+        // 窗格补发 Release，避免原窗格里的程序留下幻影按住（与下面清
+        // selecting 同源，须在改 focused 前）。
+        self.release_held_report_buttons();
         let tab = &mut self.tabs[self.active_tab];
-        if idx >= tab.panes.len() || idx == tab.focused {
-            return;
-        }
-        // 最大化期间焦点强制为最大化格（P14）：隐藏窗格的矩形不在
-        // 本帧布局里、正常路径点不到，纯防御（陈旧矩形/竞态）。
-        if tab.maximized.is_some_and(|m| m != idx) {
-            return;
-        }
         // 旧焦点窗格的拖选手势随切焦点结束（与 activate 同理：标志
         // 残留会在切回时产生幽灵拖选）。窗格本身保持可见、渲染计划
         // 与冻结计时是「正在上屏」的活状态，不清。
@@ -2817,6 +3213,14 @@ impl AppState {
     /// 事件随通道一并丢弃，无需清理）。
     /// 返回是否已无 tab（调用方应退出应用）。
     fn close_tab(&mut self, idx: usize) -> bool {
+        // 关的是当前激活（=拖动发起）tab 时，移除前先补发鼠标上报的 Release
+        // 给它的焦点窗格（移除后该 tab 连同窗格 drop、无处可补；且 activate
+        // 在移除后才补发会落到左移顶上来的另一个 tab，误投）。关非激活 tab
+        // 只是下标平移、激活 tab 身份不变，不打断拖动。close_pane→close_tab
+        // 链里 close_pane 已先 flush，这里即空操作（held 已清，不重复补发）。
+        if idx == self.active_tab {
+            self.release_held_report_buttons();
+        }
         let removed = self.tabs.remove(idx);
         info!(
             "关闭 tab id={}（{} 个窗格）",
@@ -2855,6 +3259,12 @@ impl AppState {
     /// 关闭单个窗格（shell 退出 / Ctrl+Shift+W）：最后一个窗格时 =
     /// 关整个 tab。返回是否已无 tab（调用方应退出应用）。
     fn close_pane(&mut self, ti: usize, pi: usize) -> bool {
+        // 关的是当前焦点（=拖动发起）窗格时，移除前先补发鼠标上报的 Release
+        // （移除后该窗格 drop、无处可补）。关非焦点窗格只是索引平移、焦点窗格
+        // 身份不变，不打断拖动，无需补发。
+        if ti == self.active_tab && pi == self.tabs[ti].focused {
+            self.release_held_report_buttons();
+        }
         if self.tabs[ti].panes.len() <= 1 {
             return self.close_tab(ti);
         }
@@ -3021,6 +3431,9 @@ impl AppState {
             self.window.request_redraw();
             return;
         }
+        // 新建窗格会把焦点移到新格：先给旧焦点（=拖动发起）窗格补发鼠标
+        // 上报的 Release，避免它残留幻影按住（held 是全局态、不随焦点自愈）。
+        self.release_held_report_buttons();
 
         // —— 预计算新窗格真实尺寸（B3 根治）——
         // 新格加入后共 n+1 格，布局均分，新格是最后一个（index=n）。
@@ -3159,9 +3572,22 @@ impl AppState {
     /// ——可见的只有最大化格，按钮/快捷键都落在它身上）；普通态把
     /// `pi` 最大化并强制聚焦。布局权重不动：还原即回原比例。
     fn toggle_maximize_pane(&mut self, ti: usize, pi: usize) {
+        // 仅当操作的是激活 tab、且「进入最大化」会改焦点时，先补发鼠标上报
+        // 拖动的 Release（避免旧焦点窗格幻影按住）。ti 可能是后台 tab（远程
+        // 最大化非激活 tab 的窗格），那种情况无本地拖动、无需补发。
+        let will_change_focus = {
+            let tab = &self.tabs[ti];
+            if pi >= tab.panes.len() {
+                return; // 防御：结构刚变更的过渡帧
+            }
+            ti == self.active_tab && tab.maximized.is_none() && tab.panes.len() > 1
+        };
+        if will_change_focus {
+            self.release_held_report_buttons();
+        }
         let tab = &mut self.tabs[ti];
         if pi >= tab.panes.len() {
-            return; // 防御：结构刚变更的过渡帧
+            return; // 防御：结构刚变更的过渡帧（与上面同判，借用分隔）
         }
         if tab.maximized.is_some() {
             tab.maximized = None;
@@ -4350,6 +4776,8 @@ impl App {
             hovered_link: None,
             hover_probe_cell: None,
             scrollbar_drag: None,
+            mouse_report_held: [false; 3],
+            mouse_report_last_cell: None,
             update_tx,
             update_rx,
             update_available: None,
@@ -5732,8 +6160,9 @@ impl ApplicationHandler<PtyWake> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.mouse_pos = (position.x, position.y);
 
-                // M5.3 part4b 镜像拖选：控制中+远程视图、拖选进行中则更新选区终点，
-                // 端点作用于显示的镜像终端（clamped：拖出镜像区收在边缘行列，不冻结）。
+                // 镜像态（远程视图）：拖选进行中则更新选区终点并 return；其余
+                // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
+                // 只更新 hover，不会误触本地鼠标上报）。
                 if state.is_mirror_active() {
                     // 多窗格 per-pane 拖选：clamp 到拖选起始窗格矩形（不跨格）。
                     if let Some(sid) = state.remote_ws.mirror_pane_selecting_sid() {
@@ -5751,6 +6180,20 @@ impl ApplicationHandler<PtyWake> for App {
                                 state.window.request_redraw();
                             }
                         }
+                        return;
+                    }
+                } else {
+                    // 本地态：鼠标上报（Button 拖动 / Any 任意移动）开启时，移动
+                    // 交给程序，不走本地拖选 / 链接 hover。但一旦本地拖选 / footer
+                    // 拖选已经起手（按下时归了本地），本次拖动全程交给本地分支收尾，
+                    // 绝不中途被上报劫持（否则跨窗格 / 中途松 Shift 会冻结、丢选区）。
+                    #[allow(unused_mut)]
+                    let mut local_drag = state.focused_pane().selecting;
+                    #[cfg(feature = "input-editor")]
+                    {
+                        local_drag = local_drag || state.footer_dragging;
+                    }
+                    if !local_drag && state.report_mouse_motion() {
                         return;
                     }
                 }
@@ -5831,6 +6274,32 @@ impl ApplicationHandler<PtyWake> for App {
                     state.window.request_redraw();
                 } else {
                     state.hover_probe_cell = None;
+                }
+                // 离屏后清掉 motion 节流缓存：重入窗口的首个移动正常上报。
+                state.mouse_report_last_cell = None;
+                // 加固：离窗也结束上报拖动——给程序补发配对 Release 再清
+                // held（正常情况下 winit 按下时捕获指针、窗外释放仍会送达，
+                // 这里是双保险，且保证程序不残留幻影按住）。
+                state.release_held_report_buttons();
+            }
+            WindowEvent::Focused(focused) => {
+                // 失焦相当于交互中断：向焦点窗格补发配对 Release 再清按住态
+                // 与 motion 节流缓存。winit 在失活、非自愿丢失指针捕获时不会
+                // 合成按键释放——不补发则程序留下幻影按住、本地 held 卡住后
+                // 纯悬停又会被误报成拖动。
+                if !focused {
+                    state.release_held_report_buttons();
+                    state.mouse_report_last_cell = None;
+                }
+                // 焦点上报（DEC 1004）：窗口获/失焦时通知焦点窗格里的程序
+                // （`ESC[I` = 获焦，`ESC[O` = 失焦）。未开启则不发。
+                let on = state.focused_pane().term.focus_event();
+                if on {
+                    let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                    let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
+                    if let Err(e) = state.tabs[ti].panes[pi].write_user_input(seq) {
+                        log::error!("焦点上报写 PTY 失败: {e:#}");
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -5964,6 +6433,17 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
+                    // 鼠标上报开启（且非 Shift）：本次按下交给程序处理，不建本地
+                    // 选区（已在上面完成聚焦该窗格）。显式 !is_mirror_active() 守卫：
+                    // 镜像态恒不触发本地上报，与左右键 Released / 中键四处一致——镜像
+                    // 态点击在上面镜像分支处理；若镜像未命中（标题栏/窗格间隙/几何
+                    // 错位）也绝不穿透写本地 PTY、卡住单边 held。
+                    if !state.is_mirror_active()
+                        && state.report_mouse_button(MouseButton::Left, true)
+                    {
+                        return;
+                    }
+
                     // 选区在点中的窗格（即新焦点窗格）建立。
                     let Some(p) = state.sel_point_at_mouse() else {
                         return;
@@ -5982,7 +6462,7 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
-                    // M5.3 part4b 镜像拖选结束（空选区=仅点击则清掉）。多窗格 per-pane / 单窗格各一路。
+                    // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
                     if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
                         state.remote_ws.mirror_pane_sel_end();
                         state.window.request_redraw();
@@ -5991,6 +6471,12 @@ impl ApplicationHandler<PtyWake> for App {
                     if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
                         state.remote_ws.mirror_sel_end();
                         state.window.request_redraw();
+                        return;
+                    }
+                    // 本地态：鼠标上报开启（且非 Shift）→ 把释放编码发给程序。
+                    if !state.is_mirror_active()
+                        && state.report_mouse_button(MouseButton::Left, false)
+                    {
                         return;
                     }
 
@@ -6066,6 +6552,15 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
+                    // 鼠标上报开启（且非 Shift）：右键按下交给程序，不走本地复制/
+                    // 粘贴（程序可能用右键弹自己的菜单）。!is_mirror_active() 守卫同
+                    // 左键 Pressed：镜像态恒不触发本地上报、不穿透写本地 PTY。
+                    if !state.is_mirror_active()
+                        && state.report_mouse_button(MouseButton::Right, true)
+                    {
+                        return;
+                    }
+
                     // 右键（终端区）：有选区则复制，否则粘贴（Windows Terminal 惯例）。
                     // 字段级下标：clipboard 需要同时可变借用。
                     let (ti, pi) = (state.active_tab, state.tabs[state.active_tab].focused);
@@ -6075,6 +6570,25 @@ impl ApplicationHandler<PtyWake> for App {
                     } else {
                         state.tabs[ti].panes[pi].paste_clipboard(&mut state.clipboard);
                     }
+                }
+                (MouseButton::Right, ElementState::Released) if !state.is_mirror_active() => {
+                    // 镜像态不走本地上报（远程右键在 Pressed 已处理并 return；
+                    // 镜像态此分支不匹配，落到 `_ => {}`）。
+                    state.report_mouse_button(MouseButton::Right, false);
+                }
+                (MouseButton::Middle, ElementState::Pressed) if !state.is_mirror_active() => {
+                    // 镜像态（远程视图）中键不处理（落到 `_ => {}`）；本地态与左/右
+                    // 键一致先做焦点仲裁（F5）再上报，否则中键上报会写给非焦点窗格、
+                    // 且释放回退焦点窗格时与按下目标对不齐（留下幻影按住）。点在
+                    // egui 面板上则不聚焦。
+                    if let Some(pidx) = state.pane_under_mouse() {
+                        state.focus_pane(pidx);
+                        state.terminal_focused = true;
+                    }
+                    state.report_mouse_button(MouseButton::Middle, true);
+                }
+                (MouseButton::Middle, ElementState::Released) if !state.is_mirror_active() => {
+                    state.report_mouse_button(MouseButton::Middle, false);
                 }
                 _ => {}
             },
@@ -6205,23 +6719,34 @@ impl ApplicationHandler<PtyWake> for App {
                         (p.y / state.renderer.cell_size().1 as f64) as isize
                     }
                 };
-                if lines != 0 {
-                    // M5.3 镜像：控制中（远程视图）滚轮滚镜像历史，否则滚本地焦点窗格。镜像态滚轮
-                    // **作用于鼠标所在窗格**（自动聚焦 + 滚，符直觉；回看绑焦点窗格、切焦点会复位回看态）。
-                    if state.is_mirror_active() {
-                        if let Some((sid, ..)) = state.mirror_pane_at_mouse() {
-                            state.remote_ws.set_mirror_active_pane(sid);
-                        }
-                        state.remote_ws.scroll_mirror(lines);
-                    } else {
-                        state
-                            .focused_pane_mut()
-                            .term
-                            .grid_mut()
-                            .scroll_display(lines);
-                    }
-                    state.window.request_redraw();
+                if lines == 0 {
+                    return;
                 }
+                // 镜像态（远程视图）：滚轮滚控制端**本地镜像回看**，不转发给被控端
+                // （海风哥拍板：本地滚动不联动远程）。本地态落到下方鼠标上报 / 本地滚。
+                if state.is_mirror_active() {
+                    if let Some((sid, ..)) = state.mirror_pane_at_mouse() {
+                        state.remote_ws.set_mirror_active_pane(sid);
+                    }
+                    state.remote_ws.scroll_mirror(lines);
+                    state.window.request_redraw();
+                    return;
+                }
+                // 鼠标上报开启（如 Claude 的全屏 TUI）时，滚轮交给程序：编码成
+                // SGR/X10 鼠标按钮 64(上)/65(下)写 PTY，程序自己滚它的视口——
+                // 不再滚本地 scrollback（备用屏本就无 scrollback 可滚）。否则
+                // 维持本地 scrollback 滚动。Shift+滚轮强制本地（逃生通道）。
+                let up = lines > 0;
+                let notches = lines.unsigned_abs().div_ceil(3).max(1);
+                if state.report_mouse_wheel(up, notches) {
+                    return;
+                }
+                state
+                    .focused_pane_mut()
+                    .term
+                    .grid_mut()
+                    .scroll_display(lines);
+                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
                 // 问题4（B4 修复）：无边框窗口最小化时 winit inner_size
