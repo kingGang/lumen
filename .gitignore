@@ -11,3 +11,6 @@
 F*ClaudeWorkspacesLumen*
 # 终端调试/验证日志（pty dump、截图、复现脚本）
 /ptylog/
+
+# 本地临时/调研用(如下载的第三方源码)，不入库
+/temp/

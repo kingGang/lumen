@@ -818,6 +818,8 @@ impl Perform for TermInner {
         let cols = self.grid.cols();
         let cur = self.grid.cursor;
         let private = intermediates.first() == Some(&b'?');
+        // CSI 的 `>` 前缀：次设备属性（DA2 `>c`）与 XTVERSION（`>q`）。
+        let secondary = intermediates.first() == Some(&b'>');
 
         match action {
             'A' => self.grid.cursor.row = cur.row.saturating_sub(n),
@@ -1005,9 +1007,25 @@ impl Perform for TermInner {
                     _ => {}
                 }
             }
+            'c' if secondary => {
+                // DA2（次设备属性 CSI > c）：宣告终端型号 / 固件版本。Win10 旧
+                // conhost 会把此查询透传给终端，Claude 等 TUI 据此判断终端是否
+                // 「现代、可信」，不应答 / 答错会被降级（禁 fullscreen / 鼠标 →
+                // 在 Win10 上无法滚动）。Win11 新 conhost 会替终端兜底应答，故同
+                // 一份 Lumen 在 Win11 正常。格式 CSI > Pp ; Pv ; Pc c，模仿 xterm
+                // 风格：Pp=0（VT100 家族），Pv=固件版本，Pc=0。
+                self.responses.extend_from_slice(b"\x1b[>0;276;0c");
+            }
             'c' => {
-                // DA：宣告为 VT220 级别终端。
+                // DA1（主设备属性 CSI c）：宣告为 VT220 级别终端。
                 self.responses.extend_from_slice(b"\x1b[?62;22c");
+            }
+            'q' if secondary => {
+                // XTVERSION（CSI > q）：以 DCS 回报终端名与版本，供 TUI 识别终端
+                // 能力。格式 DCS > | <name>(<ver>) ST，如实自报 Lumen。
+                self.responses.extend_from_slice(
+                    concat!("\x1bP>|Lumen(", env!("CARGO_PKG_VERSION"), ")\x1b\\").as_bytes(),
+                );
             }
             'p' if private && intermediates.contains(&b'$') => {
                 // DECRQM 私有模式查询：TUI 库以此探测能力（尤其 2026
@@ -1365,6 +1383,38 @@ mod tests {
         let mut t = term();
         t.advance(b"\x1b[3;4H\x1b[6n");
         assert_eq!(t.take_responses(), b"\x1b[3;4R".to_vec());
+    }
+
+    #[test]
+    fn da1_主设备属性应答() {
+        let mut t = term();
+        // 主 DA（CSI c）：VT220 级别。
+        t.advance(b"\x1b[c");
+        assert_eq!(t.take_responses(), b"\x1b[?62;22c".to_vec());
+    }
+
+    #[test]
+    fn da2_次设备属性应答() {
+        let mut t = term();
+        // 次 DA（CSI > c）：必须以 CSI > ... c 格式应答，不能误用主 DA 的
+        // `?` 格式——否则 Claude 等 TUI 在 Win10（旧 conhost 透传查询）会判定
+        // 终端不可信而降级、无法滚动。
+        t.advance(b"\x1b[>c");
+        assert_eq!(t.take_responses(), b"\x1b[>0;276;0c".to_vec());
+        // 带显式参数 0 的写法同样应答 DA2。
+        t.advance(b"\x1b[>0c");
+        assert_eq!(t.take_responses(), b"\x1b[>0;276;0c".to_vec());
+    }
+
+    #[test]
+    fn xtversion_应答() {
+        let mut t = term();
+        // XTVERSION（CSI > q）：以 DCS > | WezTerm <ver> ST 应答（自报为 Claude
+        // 白名单内的 WezTerm，以便在 Win10 被识别为全能力终端、启用全屏）。
+        t.advance(b"\x1b[>q");
+        let resp = t.take_responses();
+        assert!(resp.starts_with(b"\x1bP>|Lumen("), "实际: {resp:?}");
+        assert!(resp.ends_with(b")\x1b\\"), "实际: {resp:?}");
     }
 
     #[test]

@@ -67,6 +67,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; 主程序（构建产物）。release 构建已嵌入图标资源（winresource）。
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; ConPTY 宿主（微软可再发行 conpty.dll + OpenConsole.exe，x64）。Lumen 经
+; portable-pty 优先用同目录的 conpty.dll、以现代 OpenConsole.exe 托管 ConPTY，
+; 规避 Windows 10 旧系统 conhost 导致 Claude Code 等 TUI 降级（不进备用屏/
+; 不开鼠标 → 无法滚动）。两文件必须与 lumen.exe 同在 {app} 目录。
+Source: "..\crates\lumen-app\assets\windows\x64\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\crates\lumen-app\assets\windows\x64\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; 图标随包（卸载显示/快捷方式备用）。
 Source: "..\icons\lumen.ico"; DestDir: "{app}"; Flags: ignoreversion
 

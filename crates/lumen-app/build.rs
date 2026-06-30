@@ -6,7 +6,52 @@
 
 fn main() {
     #[cfg(target_os = "windows")]
-    embed_icon();
+    {
+        embed_icon();
+        copy_conpty_assets();
+    }
+}
+
+/// 把随仓库 vendored 的 ConPTY 宿主（`conpty.dll` + `OpenConsole.exe`）拷到
+/// 构建输出目录（`lumen.exe` 同目录）。
+///
+/// portable-pty 0.9 会**优先加载同目录的 `conpty.dll`**（见其 `psuedocon.rs`
+/// `load_conpty`），用现代 `OpenConsole.exe` 托管 ConPTY，替代 Windows 10 上
+/// 偏旧的系统 conhost。旧系统 conhost 会让 Claude Code 等 TUI 判定终端「会
+/// ConPTY 重渲染」而降级——不进备用屏、不开鼠标上报——导致 Win10 上会话内容
+/// 无法用滚轮滚动（海风哥 2026-06-30 实测：同一份 Lumen，Win11 正常、Win10
+/// 失败，差异仅在 ConPTY 宿主；WT/Warp 也是靠自带 OpenConsole 规避）。
+/// 二进制取自微软可再发行的 ConPTY 包（x64）。
+#[cfg(target_os = "windows")]
+fn copy_conpty_assets() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let asset_dir = std::path::Path::new(&manifest_dir)
+        .join("assets")
+        .join("windows")
+        .join("x64");
+
+    // 由 OUT_DIR 反推构建输出目录 target/<profile>/（lumen.exe 所在）：
+    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out，上溯 3 级即得。
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let Some(target_dir) = std::path::Path::new(&out_dir).ancestors().nth(3) else {
+        eprintln!("cargo:warning=无法由 OUT_DIR 定位输出目录，跳过 ConPTY 资产拷贝");
+        return;
+    };
+
+    for file in ["conpty.dll", "OpenConsole.exe"] {
+        let src = asset_dir.join(file);
+        let dst = target_dir.join(file);
+        // 资产变化时重跑本脚本。
+        println!("cargo:rerun-if-changed={}", src.display());
+        if let Err(e) = std::fs::copy(&src, &dst) {
+            // 拷贝失败仅警告：Win11 因系统 conhost 已够新仍可工作，
+            // 仅 Win10 受影响——不阻断构建。
+            eprintln!(
+                "cargo:warning=拷贝 {file} 到 {} 失败（Win10 上 Claude 可能无法滚动）：{e}",
+                dst.display()
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
