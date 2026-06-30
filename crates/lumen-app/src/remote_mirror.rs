@@ -13,7 +13,7 @@
 
 use std::fmt::Write as _;
 
-use lumen_term::{CellFlags, Color, Row, Terminal};
+use lumen_term::{CellFlags, Color, MouseEncoding, MouseProtocol, Row, Terminal};
 
 /// 把终端**当前可见屏**序列化为等效 VT 字节：喂给一个全新 [`Terminal::advance`]
 /// 即复现该屏（颜色/属性/光标位置）。仅含可见区，不含 scrollback 历史。
@@ -22,6 +22,11 @@ pub fn screen_snapshot_vt(term: &Terminal) -> Vec<u8> {
     let grid = term.grid();
     let cols = grid.cols();
     let mut out: Vec<u8> = Vec::new();
+    // 先重发当前终端模式（鼠标上报协议/编码/焦点/win32），使控制端**中途接入**时
+    // 镜像 `Terminal` 复现这些状态。否则订阅前已发的 DECSET（如 Claude 全屏的
+    // ?1003h/?1006h）丢失，控制端无从判定该不该把滚轮上报转发给被控端
+    // （2026-06-30 控制端滚轮路由依赖镜像 term 的 mouse_protocol）。
+    out.extend_from_slice(&terminal_modes_vt(term));
     // 清屏 + 光标归位。
     out.extend_from_slice(b"\x1b[2J\x1b[H");
     for (r, row) in grid.visible_rows().enumerate() {
@@ -39,6 +44,33 @@ pub fn screen_snapshot_vt(term: &Terminal) -> Vec<u8> {
     let mut tail = String::new();
     let _ = write!(tail, "\x1b[{};{}H", cur.row + 1, cur.col + 1);
     out.extend_from_slice(tail.as_bytes());
+    out
+}
+
+/// 把终端**当前鼠标/输入相关私有模式**序列化为等效 DECSET 字节，供 [`screen_snapshot_vt`]
+/// 前置——使控制端中途接入时镜像 `Terminal` 重放即复现这些状态。仅含影响控制端
+/// **滚轮路由**与输入语义的模式（鼠标上报协议/SGR 编码/焦点事件/win32 输入）；不含
+/// 备用屏（?1049）与括号粘贴（?2004）：前者会改镜像主/备屏切换语义、后者只影响被控端
+/// 粘贴（镜像不粘贴），均与本快照「复现可见屏 + 滚轮路由状态」目标无关，故不发。
+#[must_use]
+fn terminal_modes_vt(term: &Terminal) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    match term.mouse_protocol() {
+        MouseProtocol::Off => {}
+        MouseProtocol::X10 => out.extend_from_slice(b"\x1b[?9h"),
+        MouseProtocol::Normal => out.extend_from_slice(b"\x1b[?1000h"),
+        MouseProtocol::Button => out.extend_from_slice(b"\x1b[?1002h"),
+        MouseProtocol::Any => out.extend_from_slice(b"\x1b[?1003h"),
+    }
+    if term.mouse_encoding() == MouseEncoding::Sgr {
+        out.extend_from_slice(b"\x1b[?1006h");
+    }
+    if term.focus_event() {
+        out.extend_from_slice(b"\x1b[?1004h");
+    }
+    if term.win32_input() {
+        out.extend_from_slice(b"\x1b[?9001h");
+    }
     out
 }
 
@@ -240,5 +272,32 @@ mod tests {
         // 越界请求（screen_top + rows = 6 之后无保留行）：返回空行。
         let (oob, _b, _s) = history_rows_vt(&src, 6, 2);
         assert!(oob.iter().all(Vec::is_empty), "越界绝对行应序列化为空");
+    }
+
+    /// 快照应重发鼠标/输入模式，使中途接入的镜像复现 proto（控制端滚轮路由依赖）。
+    #[test]
+    fn 快照复现鼠标上报模式() {
+        let mut src = Terminal::new(6, 20, 100);
+        // Claude 全屏典型：Any 鼠标 + SGR 编码 + 焦点 + win32 输入。
+        src.advance(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?9001h");
+        let snap = screen_snapshot_vt(&src);
+
+        let mut dst = Terminal::new(6, 20, 100);
+        dst.advance(&snap);
+        assert_eq!(dst.mouse_protocol(), MouseProtocol::Any, "镜像应复现 Any 上报");
+        assert_eq!(dst.mouse_encoding(), MouseEncoding::Sgr, "镜像应复现 SGR 编码");
+        assert!(dst.focus_event(), "镜像应复现焦点事件");
+        assert!(dst.win32_input(), "镜像应复现 win32 输入");
+    }
+
+    /// 未开鼠标上报时快照不应启用它（镜像保持 Off → 滚轮走本地回看）。
+    #[test]
+    fn 快照不误开鼠标上报() {
+        let mut src = Terminal::new(4, 10, 50);
+        src.advance(b"plain text\r\n");
+        let snap = screen_snapshot_vt(&src);
+        let mut dst = Terminal::new(4, 10, 50);
+        dst.advance(&snap);
+        assert_eq!(dst.mouse_protocol(), MouseProtocol::Off, "无上报时镜像应保持 Off");
     }
 }

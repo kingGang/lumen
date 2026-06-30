@@ -6728,13 +6728,61 @@ impl ApplicationHandler<PtyWake> for App {
                 if lines == 0 {
                     return;
                 }
-                // 镜像态（远程视图）：滚轮滚控制端**本地镜像回看**，不转发给被控端
-                // （海风哥拍板：本地滚动不联动远程）。本地态落到下方鼠标上报 / 本地滚。
+                // 镜像态（远程视图）控制端滚轮：按**被控端焦点会话的鼠标上报模式**
+                // 路由（与本地态对称，不按端特判，对 Claude/codex 等任何 TUI 通用）：
+                //   - 开了鼠标上报（如 Claude/codex 全屏 ?1003h）→ 把滚轮编码成鼠标
+                //     上报，`send_input` 转发给被控端 PTY，程序自己滚、重绘同步两端；
+                //   - 没开（PowerShell / inline）→ 滚控制端**本地镜像 scrollback** 回看，
+                //     不转发、不碰被控端（各端各看各的历史，原设计语义）。
+                // Shift+滚轮强制本地回看（逃生通道）。坐标取镜像窗格内单元格、目标
+                // 会话即鼠标所在镜像窗格（上面 set_mirror_active_pane → send_input 定位）。
+                // 修正既有 bug：原无条件 scroll_mirror、从不转发，致 Claude 全屏时控制端
+                // 滚轮被吞、本地镜像又无 scrollback 可滚 → 看着无效（海风哥 2026-06-30）。
                 if state.is_mirror_active() {
-                    if let Some((sid, ..)) = state.mirror_pane_at_mouse() {
+                    let cell = state.mirror_pane_cell_at_mouse();
+                    if let Some((sid, _, _)) = cell {
                         state.remote_ws.set_mirror_active_pane(sid);
                     }
-                    state.remote_ws.scroll_mirror(lines);
+                    let shift = state.modifiers.shift_key();
+                    let mods = state.mouse_mods();
+                    let up = lines > 0;
+                    let notches = lines.unsigned_abs().div_ceil(3).max(1);
+                    let forward: Option<Vec<u8>> = match cell {
+                        Some((sid, row, col)) if !shift => state
+                            .remote_ws
+                            .mirror_panes()
+                            .iter()
+                            .find(|p| p.session_id == sid)
+                            .and_then(|mp| {
+                                let proto = mp.term.mouse_protocol();
+                                if !proto.is_on() {
+                                    return None;
+                                }
+                                let enc = mp.term.mouse_encoding();
+                                let kind = if up {
+                                    MouseEventKind::WheelUp
+                                } else {
+                                    MouseEventKind::WheelDown
+                                };
+                                let mut buf = Vec::new();
+                                for _ in 0..notches {
+                                    if let Some(b) = encode_mouse(
+                                        proto,
+                                        enc,
+                                        MouseEvent { kind, col, row, mods },
+                                    ) {
+                                        buf.extend_from_slice(&b);
+                                    }
+                                }
+                                (!buf.is_empty()).then_some(buf)
+                            }),
+                        _ => None,
+                    };
+                    if let Some(buf) = forward {
+                        state.remote_ws.send_input(&buf);
+                    } else {
+                        state.remote_ws.scroll_mirror(lines);
+                    }
                     state.window.request_redraw();
                     return;
                 }
