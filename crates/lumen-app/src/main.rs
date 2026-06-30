@@ -64,8 +64,8 @@ use log::{error, info};
 use lumen_pty::PtyEvent;
 use lumen_renderer::{wgpu, Renderer};
 use lumen_term::{
-    encode_mouse, MouseButton as MouseReportBtn, MouseEvent, MouseEventKind, MouseMods,
-    MouseProtocol, SelPoint, Selection,
+    encode_mouse, MouseButton as MouseReportBtn, MouseEncoding, MouseEvent, MouseEventKind,
+    MouseMods, MouseProtocol, SelPoint, Selection,
 };
 use session::{Session, SessionId, Tab, TabId, MAX_PANES};
 use shell::layout::{DividerKind, PaneLayout};
@@ -603,6 +603,12 @@ struct AppState {
     /// 一格时漏掉一次移动上报。离窗 / 失焦时清空；切焦点窗格无需额外清——
     /// 节流键含会话 id，新焦点窗格的键与旧值永不相等，首个移动不会被误吞。
     mouse_report_last_cell: Option<(SessionId, usize, usize)>,
+    /// M5.3 镜像态（控制端）鼠标上报的**拖动目标镜像窗格** session id：按下时
+    /// 记下，拖动 / 释放钉在它（指针捕获，坐标按其矩形夹紧），与本地
+    /// `drag_report_target` 对称，但编码后经 `send_input` 转发给被控端。所有键
+    /// 抬起后清 None。复用 `mouse_report_held` / `mouse_report_last_cell` 做配对与
+    /// 节流（本地与镜像鼠标上报互斥——控制中处远程视图、不操作本地窗格，不会并发）。
+    mirror_report_sid: Option<SessionId>,
 
     // —— F3 热更（自动更新）——
     /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
@@ -2576,6 +2582,46 @@ impl AppState {
         if !self.any_button_held() {
             return;
         }
+        // 镜像态（控制端）拖动中断（失焦 / 离窗等）：把仍按住的键的 Release 转发给
+        // 被控端、清状态，避免被控端程序残留「幻影按住」。`mirror_report_sid` 有值
+        // 即当前按住是镜像转发的（与本地互斥）。
+        if let Some(sid) = self.mirror_report_sid {
+            if let (Some((row, col)), Some((proto, enc))) =
+                (self.mirror_pane_cell_clamped(sid), self.mirror_pane_proto_enc(sid))
+            {
+                if proto.is_on() {
+                    let mods = self.mouse_mods();
+                    let held = self.mouse_report_held;
+                    let mut buf = Vec::new();
+                    for (i, &down) in held.iter().enumerate() {
+                        if down {
+                            if let Some(btn) = Self::button_from_index(i) {
+                                if let Some(b) = encode_mouse(
+                                    proto,
+                                    enc,
+                                    MouseEvent {
+                                        kind: MouseEventKind::Release(btn),
+                                        col,
+                                        row,
+                                        mods,
+                                    },
+                                ) {
+                                    buf.extend_from_slice(&b);
+                                }
+                            }
+                        }
+                    }
+                    if !buf.is_empty() {
+                        self.remote_ws.send_input_to(sid, &buf);
+                        self.window.request_redraw();
+                    }
+                }
+            }
+            self.mouse_report_held = [false; 3];
+            self.mirror_report_sid = None;
+            self.mouse_report_last_cell = None;
+            return;
+        }
         let pane_idx = match self.tabs.get(self.active_tab) {
             Some(tab) if tab.focused < tab.panes.len() => tab.focused,
             _ => {
@@ -2735,6 +2781,169 @@ impl AppState {
         if let Err(e) = self.tabs[self.active_tab].panes[focused_idx].write_user_input(&bytes) {
             log::error!("鼠标移动上报写 PTY 失败: {e:#}");
         }
+        self.window.request_redraw();
+        true
+    }
+
+    /// 取指定镜像窗格的 (鼠标上报协议, 编码)；窗格不存在返回 None。镜像 `Terminal`
+    /// 解析被控端 PTY 流（含 DECSET 鼠标模式），故与被控端同步。
+    fn mirror_pane_proto_enc(&self, sid: SessionId) -> Option<(MouseProtocol, MouseEncoding)> {
+        self.remote_ws
+            .mirror_panes()
+            .iter()
+            .find(|p| p.session_id == sid)
+            .map(|mp| (mp.term.mouse_protocol(), mp.term.mouse_encoding()))
+    }
+
+    /// 镜像态（控制端）鼠标**按钮**上报：被控端目标会话开了鼠标上报时，把
+    /// 按下 / 抬起编码成鼠标上报、经 `send_input` 转发给被控端，返回 `true`（调用
+    /// 方跳过本地镜像拖选 / 复制粘贴）；否则 `false`（走本地镜像逻辑）。与本地
+    /// [`Self::report_mouse_button`] 对称：press 用鼠标所在镜像窗格、release 钉在
+    /// 按下时记下的 `mirror_report_sid`（指针捕获，坐标按其矩形夹紧）。复用
+    /// `mouse_report_held` 做多键并发配对（本地 / 镜像互斥，不会并发按住）。
+    /// Shift 按下 = 本地选区逃生通道（仅按下一刻 latch）。
+    fn report_mirror_mouse_button(&mut self, button: MouseButton, pressed: bool) -> bool {
+        let Some(btn) = Self::map_report_button(button) else {
+            return false;
+        };
+        let idx = Self::held_index(btn);
+        if !pressed {
+            // 这枚键按下当初没走上报（Shift 本地选区 / 上报未开）→ 释放也不碰上报。
+            if !self.mouse_report_held[idx] {
+                return false;
+            }
+            self.mouse_report_held[idx] = false;
+            // 末键抬起即清拖动锚点 / 节流键——**无论下面转发成功与否**（早退路径也清，
+            // 否则镜像窗格 mid-drag 消失 / 上报被关时残留陈旧 sid，违反「键抬即清」不变量）。
+            let last = !self.any_button_held();
+            // 钉在按下时的镜像窗格、坐标按其矩形夹紧（鼠标可能已拖到别处 / 窗外），
+            // 保证发起窗格收到配对的 Release、被控端按钮不卡死；用 send_input_to 钉 sid。
+            if let Some(sid) = self.mirror_report_sid {
+                if let (Some((row, col)), Some((proto, enc))) =
+                    (self.mirror_pane_cell_clamped(sid), self.mirror_pane_proto_enc(sid))
+                {
+                    if proto.is_on() {
+                        let ev = MouseEvent {
+                            kind: MouseEventKind::Release(btn),
+                            col,
+                            row,
+                            mods: self.mouse_mods(),
+                        };
+                        if let Some(bytes) = encode_mouse(proto, enc, ev) {
+                            self.remote_ws.send_input_to(sid, &bytes);
+                            self.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            if last {
+                self.mirror_report_sid = None;
+                self.mouse_report_last_cell = None;
+            }
+            return true;
+        }
+        // —— 按下：Shift = 本地选区逃生通道（仅按下一刻 latch）。
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        // 本手势第一枚键：锚定鼠标所在镜像窗格做拖动目标 + 焦点；后续键（拖动中多键
+        // 并发）复用已钉住的 sid、坐标按其矩形夹紧，不改锚点 / 不夺焦点（与本地「拖动
+        // 钉发起窗格」语义一致，避免第二键把目标改投别格致先按住键失配对）。
+        let first = !self.any_button_held();
+        let (sid, row, col) = if first {
+            let Some(cell) = self.mirror_pane_cell_at_mouse() else {
+                return false;
+            };
+            cell
+        } else {
+            let Some(sid) = self.mirror_report_sid else {
+                return false;
+            };
+            let Some((row, col)) = self.mirror_pane_cell_clamped(sid) else {
+                return false;
+            };
+            (sid, row, col)
+        };
+        let Some((proto, enc)) = self.mirror_pane_proto_enc(sid) else {
+            return false;
+        };
+        if !proto.is_on() {
+            return false; // 上报未开 → 走本地镜像拖选
+        }
+        let ev = MouseEvent {
+            kind: MouseEventKind::Press(btn),
+            col,
+            row,
+            mods: self.mouse_mods(),
+        };
+        let Some(bytes) = encode_mouse(proto, enc, ev) else {
+            return false;
+        };
+        if first {
+            self.remote_ws.set_mirror_active_pane(sid);
+            self.mirror_report_sid = Some(sid);
+        }
+        self.mouse_report_held[idx] = true;
+        self.remote_ws.send_input_to(sid, &bytes);
+        self.window.request_redraw();
+        true
+    }
+
+    /// 镜像态（控制端）鼠标**移动 / 拖动**上报：被控端目标会话为 Any（任意移动）
+    /// 或 Button（拖动中）时把移动编码、经 `send_input` 转发给被控端，返回 `true`
+    /// （调用方跳过本地镜像拖选）；否则 `false`。与本地 [`Self::report_mouse_motion`]
+    /// 对称：拖动中钉在 `mirror_report_sid`、坐标夹紧；纯 hover（Any）取鼠标所在
+    /// 镜像窗格。同格节流（复用 `mouse_report_last_cell`）。Shift 让位本地。
+    fn report_mirror_mouse_motion(&mut self) -> bool {
+        if self.modifiers.shift_key() {
+            return false;
+        }
+        let dragging = self.any_button_held();
+        let (sid, row, col) = if dragging {
+            // 拖动中：钉在按下窗格、坐标夹紧（指针捕获）。
+            let Some(sid) = self.mirror_report_sid else {
+                return false;
+            };
+            match self.mirror_pane_cell_clamped(sid) {
+                Some((r, c)) => (sid, r, c),
+                None => return false,
+            }
+        } else {
+            // 纯 hover（Any）：仅对**当前焦点镜像窗格**上报——鼠标须确实落在它内容区，
+            // 否则让位（不给非焦点镜像窗格发它管不到的移动，与本地 hover 同语义）。
+            let Some((s, r, c)) = self.mirror_pane_cell_at_mouse() else {
+                return false;
+            };
+            if self.remote_ws.mirror_target_sid() != Some(s) {
+                return false;
+            }
+            (s, r, c)
+        };
+        let Some((proto, enc)) = self.mirror_pane_proto_enc(sid) else {
+            return false;
+        };
+        let want = match proto {
+            MouseProtocol::Any => true,
+            MouseProtocol::Button => dragging,
+            _ => false,
+        };
+        if !want {
+            return false;
+        }
+        if self.mouse_report_last_cell == Some((sid, row, col)) {
+            return true; // 同格节流：未跨格不重复转发，仍视为已接管
+        }
+        let ev = MouseEvent {
+            kind: MouseEventKind::Move(self.held_repr_button()),
+            col,
+            row,
+            mods: self.mouse_mods(),
+        };
+        let Some(bytes) = encode_mouse(proto, enc, ev) else {
+            return false;
+        };
+        self.mouse_report_last_cell = Some((sid, row, col));
+        self.remote_ws.send_input_to(sid, &bytes);
         self.window.request_redraw();
         true
     }
@@ -4778,6 +4987,7 @@ impl App {
             scrollbar_drag: None,
             mouse_report_held: [false; 3],
             mouse_report_last_cell: None,
+            mirror_report_sid: None,
             update_tx,
             update_rx,
             update_available: None,
@@ -6170,6 +6380,15 @@ impl ApplicationHandler<PtyWake> for App {
                 // 镜像态移动落到下方既有逻辑（local_drag 在镜像态恒 false，最终
                 // 只更新 hover，不会误触本地鼠标上报）。
                 if state.is_mirror_active() {
+                    // 鼠标上报开（Claude/codex 全屏）→ 移动/拖动转发给被控端，不走本地
+                    // 镜像拖选。但若本次拖动按下时已归了本地镜像拖选（上报未开时起的手），
+                    // 全程交给本地收尾、绝不中途被上报劫持（对称本地臂的 local_drag 闸门——
+                    // 否则中途松 Shift / 被控端中途开上报会冻结镜像拖选、丢选区）。
+                    let mirror_dragging = state.remote_ws.mirror_pane_selecting_sid().is_some()
+                        || state.remote_ws.mirror_selecting();
+                    if !mirror_dragging && state.report_mirror_mouse_motion() {
+                        return;
+                    }
                     // 多窗格 per-pane 拖选：clamp 到拖选起始窗格矩形（不跨格）。
                     if let Some(sid) = state.remote_ws.mirror_pane_selecting_sid() {
                         if let Some((row, col)) = state.mirror_pane_cell_clamped(sid) {
@@ -6336,6 +6555,12 @@ impl ApplicationHandler<PtyWake> for App {
                         && !state.mouse_on_pane_divider()
                         && !state.mouse_on_panel_resize()
                     {
+                        // 鼠标上报开（Claude/codex 全屏）→ 左键按下转发给被控端，不起
+                        // 本地镜像拖选（上报未开时返 false，落到下面镜像拖选）。
+                        if state.report_mirror_mouse_button(MouseButton::Left, true) {
+                            state.terminal_focused = true;
+                            return;
+                        }
                         // Phase 4 多窗格：点哪个镜像窗格 → 选它做**焦点**（输入/回看/复制/IME 目标）+
                         // 起该窗格 per-pane 拖选。单窗格镜像走既有 part4b 单选区。
                         if !state.remote_ws.mirror_panes().is_empty() {
@@ -6468,6 +6693,13 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
 
+                    // 镜像态：鼠标上报开 → 左键释放编码转发给被控端（与按下配对，
+                    // 上报未开 / 该键未上报按住时返 false，落到下面镜像拖选收尾）。
+                    if state.is_mirror_active()
+                        && state.report_mirror_mouse_button(MouseButton::Left, false)
+                    {
+                        return;
+                    }
                     // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
                     if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
                         state.remote_ws.mirror_pane_sel_end();
@@ -6520,6 +6752,14 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
+                    // 镜像态：鼠标上报开（Claude/codex 全屏，程序可能用右键弹自己的菜单）
+                    // → 右键按下转发给被控端，不走本地复制/粘贴（上报未开返 false，落到
+                    // 下面镜像右键复制/粘贴）。
+                    if state.is_mirror_active()
+                        && state.report_mirror_mouse_button(MouseButton::Right, true)
+                    {
+                        return;
+                    }
                     // M5.3 part4b 镜像右键：有选区→复制到本地剪贴板；无选区→粘贴转发给
                     // 被控端（沿用本地终端右键惯例）。仅命中镜像区时拦截。
                     if state.is_mirror_active()
@@ -6595,6 +6835,18 @@ impl ApplicationHandler<PtyWake> for App {
                 }
                 (MouseButton::Middle, ElementState::Released) if !state.is_mirror_active() => {
                     state.report_mouse_button(MouseButton::Middle, false);
+                }
+                // 镜像态（控制端）：上报开时转发右键释放 / 中键按下·释放给被控端，与
+                // 各自按下配对（上报未开 / 该键未上报按住时 report_mirror 返 false、无
+                // 副作用——镜像右键复制粘贴已在 Right Pressed 处理）。
+                (MouseButton::Right, ElementState::Released) if state.is_mirror_active() => {
+                    state.report_mirror_mouse_button(MouseButton::Right, false);
+                }
+                (MouseButton::Middle, ElementState::Pressed) if state.is_mirror_active() => {
+                    state.report_mirror_mouse_button(MouseButton::Middle, true);
+                }
+                (MouseButton::Middle, ElementState::Released) if state.is_mirror_active() => {
+                    state.report_mirror_mouse_button(MouseButton::Middle, false);
                 }
                 _ => {}
             },
@@ -7975,6 +8227,10 @@ impl ApplicationHandler<PtyWake> for App {
                         // part3d（K3）：远程视图点击列表项 = 订阅查看该被控端会话（被控端焦点
                         // 不动）；非重复订阅才发（subscribe_tab 内含回看复位）。
                         if state.remote_ws.subscribed_tab() != Some(id) {
+                            // 切订阅前补发仍按住的鼠标上报键 Release 给**当前**订阅会话，
+                            // 否则切走后旧会话程序残留幻影按住（mirror_report_sid 指向旧
+                            // 订阅窗格，flush 在 subscribe_tab 改订阅之前 → 投到正确会话）。
+                            state.release_held_report_buttons();
                             state.remote_ws.subscribe_tab(id);
                         }
                     } else if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
@@ -8595,6 +8851,12 @@ impl ApplicationHandler<PtyWake> for App {
                 };
                 // M5.2：本地/远程 tab 切换 → 写 settings 并触发存盘。
                 let view_mode_changed = if let Some(v) = shell_out.toggle_view_mode {
+                    // 切视图前先补发仍按住的鼠标上报键的 Release（本地↔镜像视图是
+                    // mouse_report_held / mirror_report_sid 共用态的边界，不 flush 会两端
+                    // 幻影按住）。**务必在改 view_mode 之前**：release_held_report_buttons
+                    // 按 mirror_report_sid.is_some() 而非 view_mode 判路、send 只看
+                    // is_controlling()，故切前 flush 能把 Release 投到正确一侧。
+                    state.release_held_report_buttons();
                     state.settings.layout.view_mode = v;
                     // 切到远程视图：请求后台立即刷新一次设备列表。
                     if v {

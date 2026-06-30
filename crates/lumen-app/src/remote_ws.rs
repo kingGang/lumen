@@ -1780,6 +1780,38 @@ impl RemoteWs {
         true
     }
 
+    /// 转发输入到**指定会话** `session_id`（镜像鼠标上报专用：拖动 / 释放钉在按下
+    /// 时的窗格 sid，不随 `mirror_active_pane` 漂移、不夺焦点，杜绝「发错会话 /
+    /// 被控端幻影按住」）。其余语义同 [`Self::send_input`]（仅控制态 + 已订阅 tab
+    /// 时发出，回看态 snap 回底部）。返回是否真正发出。
+    pub fn send_input_to(&mut self, session_id: SessionId, bytes: &[u8]) -> bool {
+        if !self.is_controlling() || bytes.is_empty() {
+            return false;
+        }
+        let Some(tab_id) = self.subscribed_tab else {
+            return false;
+        };
+        self.hist_top = None;
+        self.send_frame(&RemoteFrame::InputWithId {
+            tab_id,
+            session_id,
+            data: bytes.to_vec(),
+        });
+        true
+    }
+
+    /// 当前镜像输入 / 鼠标上报的**目标会话** sid，与 [`Self::send_input`] 的 target
+    /// 同口径：多窗格取 `mirror_active_pane`（控制端自选焦点），单窗格取
+    /// `mirror_focus_sid`。镜像 hover 上报据此只对焦点镜像窗格上报。
+    #[must_use]
+    pub fn mirror_target_sid(&self) -> Option<SessionId> {
+        if self.mirror_panes.is_empty() {
+            self.mirror_focus_sid
+        } else {
+            self.mirror_active_pane
+        }
+    }
+
     // part3d：控制端 SSH 式视口跟随已移除（多会话模型下被控端焦点不动、订阅会话可为后台
     // tab，不强制其 resize）。被控端侧 `ViewportResize` 收处理 + `take_viewport` 暂保留休眠，
     // 留待 Phase 3/4 若需「订阅=被控端焦点 tab」时的 1:1 满屏渲染再启用。
