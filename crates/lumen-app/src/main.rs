@@ -99,6 +99,9 @@ const REDRAW_ABS_CAP: Duration = Duration::from_millis(100);
 /// （动画残留位）——经实战验证 50ms 能盖住 codex 归位批的延迟，
 /// 调小到 10ms 时 ESU 直渲下残留位会在超时后漏画（闪烁回归）。
 const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
+/// 拖选边缘 auto-scroll 的 tick 间隔：拖选时鼠标停在内容区上/下边缘外，每隔此
+/// 时长滚动一行并把选区端点续到边缘（~50 行/秒）。
+const AUTOSCROLL_DRAG_TICK: Duration = Duration::from_millis(20);
 /// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
 /// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在**本
 /// 会话自己的通道**里（靠 bounded 容量反压该会话的读线程，不连坐
@@ -609,6 +612,12 @@ struct AppState {
     /// 抬起后清 None。复用 `mouse_report_held` / `mouse_report_last_cell` 做配对与
     /// 节流（本地与镜像鼠标上报互斥——控制中处远程视图、不操作本地窗格，不会并发）。
     mirror_report_sid: Option<SessionId>,
+    /// 拖选边缘 auto-scroll 方向：0=无、+1=向上滚（露出更早 scrollback）、
+    /// -1=向下滚（回到更晚内容）。本地终端拖选中鼠标停在内容区上/下边缘外时
+    /// 由 `CursorMoved` 置位，`about_to_wait` 据此定时滚动 + 续选。
+    autoscroll_drag: i8,
+    /// 拖选 auto-scroll 下次 tick 的时刻（`AUTOSCROLL_DRAG_TICK` 节流）；None=可立即 tick。
+    autoscroll_at: Option<Instant>,
 
     // —— F3 热更（自动更新）——
     /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
@@ -1975,6 +1984,54 @@ impl AppState {
             .iter()
             .find(|(id, _)| *id == fid)
             .map(|(_, r)| *r)
+    }
+
+    /// 拖选边缘 auto-scroll 方向：鼠标在焦点窗格**内容区**（扣 footer）上边缘以上
+    /// 返回 +1（向上滚露出更早内容）、下边缘以下返回 -1（向下滚回到更晚内容）、
+    /// 区内返回 0。坐标几何与 `sel_point_at_mouse` 同源（`focused_pane_rect_px` +
+    /// `pane_footer_px`，均物理像素）。
+    fn autoscroll_dir_for_drag(&self) -> i8 {
+        let Some((_, y, _, h)) = self.focused_pane_rect_px() else {
+            return 0;
+        };
+        let footer = self.pane_footer_px(self.tabs[self.active_tab].focused, h);
+        let top = f64::from(y);
+        let bottom = f64::from(y + h - footer);
+        let my = self.mouse_pos.1;
+        if my < top {
+            1
+        } else if my > bottom {
+            -1
+        } else {
+            0
+        }
+    }
+
+    /// 拖选 auto-scroll 单步：按 `autoscroll_drag` 方向滚焦点窗格一行，再把选区端点
+    /// 续到滚动后新视口下鼠标（夹在边缘）对应的绝对行列——`sel_point_at_mouse` 用
+    /// `view_top_abs_line()+row`，滚动后自动反映新行，故端点随滚动扩展选区。
+    fn tick_autoscroll_drag(&mut self) {
+        let dir = self.autoscroll_drag;
+        if dir == 0 {
+            return;
+        }
+        let before = self.focused_pane().term.grid().view_top_abs_line();
+        self.focused_pane_mut()
+            .term
+            .grid_mut()
+            .scroll_display(isize::from(dir));
+        // 已到 scrollback 顶 / 底（视口未动）→ 无可滚，停 tick，避免在边缘空转
+        // （否则鼠标停边缘不动时按 tick 频率空跑 request_redraw）。
+        if self.focused_pane().term.grid().view_top_abs_line() == before {
+            self.autoscroll_drag = 0;
+            self.autoscroll_at = None;
+            return;
+        }
+        if let Some(head) = self.sel_point_at_mouse() {
+            if let Some(sel) = self.focused_pane_mut().selection.as_mut() {
+                sel.head = head;
+            }
+        }
     }
 
     /// 把 IME 候选框钉到焦点窗格光标所在格子（Compose 态跟 footer 编辑器
@@ -4988,6 +5045,8 @@ impl App {
             mouse_report_held: [false; 3],
             mouse_report_last_cell: None,
             mirror_report_sid: None,
+            autoscroll_drag: 0,
+            autoscroll_at: None,
             update_tx,
             update_rx,
             update_available: None,
@@ -5720,6 +5779,20 @@ impl ApplicationHandler<PtyWake> for App {
         //   （其余仍在同步区间的窗格由 RedrawRequested 的逐窗格门控
         //   各自跳过，保留上一完整帧）。
         let now = Instant::now();
+        // 拖选边缘 auto-scroll：本地终端拖选进行中、鼠标停在焦点窗格内容区上/下边缘
+        // 外时，按节流定时滚动一行 + 续选（露出 scrollback 上/下内容），并安排下次
+        // tick。优先于下方渲染调度——它自带 request_redraw + WaitUntil 自维持节拍。
+        if state.autoscroll_drag != 0 && state.focused_pane().selecting {
+            if state.autoscroll_at.is_none_or(|t| now >= t) {
+                state.tick_autoscroll_drag();
+                state.autoscroll_at = Some(now + AUTOSCROLL_DRAG_TICK);
+                state.window.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                state.autoscroll_at.unwrap_or(now + AUTOSCROLL_DRAG_TICK),
+            ));
+            return;
+        }
         // 未到点计划中的最早时刻（含 egui 计划）。
         let mut wake: Option<Instant> = None;
         // 任一窗格到点且可渲染 → 立即重绘。
@@ -6461,6 +6534,15 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                     // 不再走终端拖选
                 } else if state.focused_pane().selecting {
+                    // 拖选边缘 auto-scroll：鼠标停在内容区上/下边缘外则置方向（非 0），
+                    // 由 about_to_wait 定时滚动 + 续选；回到区内则清零停滚。
+                    let dir = state.autoscroll_dir_for_drag();
+                    state.autoscroll_drag = dir;
+                    if dir == 0 {
+                        state.autoscroll_at = None;
+                    } else {
+                        state.window.request_redraw(); // 唤起 about_to_wait 开始 tick
+                    }
                     // 终端区拖选跟随焦点窗格：端点按窗格矩形换算（cell_at 已
                     // 夹紧，拖出窗格边界即收在边缘行列）。
                     if let Some(head) = state.sel_point_at_mouse() {
@@ -6723,6 +6805,9 @@ impl ApplicationHandler<PtyWake> for App {
                         return;
                     }
                     state.focused_pane_mut().selecting = false;
+                    // 拖选结束：停掉边缘 auto-scroll。
+                    state.autoscroll_drag = 0;
+                    state.autoscroll_at = None;
                     if state.focused_pane().selection.is_some_and(|s| s.is_empty()) {
                         // F10：**Ctrl+单击**落在可点击链接上 → 用系统默认
                         // 程序/浏览器打开（对齐 VSCode 终端 Ctrl+Click 惯例）。
