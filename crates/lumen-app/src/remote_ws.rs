@@ -4080,6 +4080,23 @@ impl RemoteWs {
         self.mirror_selecting = true;
     }
 
+    /// 控制端：Shift+点击范围扩展——**保留**当前选区锚点、把 head 续到点击处（标准
+    /// 编辑器「先选一段、Shift+点击别处扩展」语义）。无现有选区时等价 start（以点击处
+    /// 为锚）。同设 `mirror_selecting=true`，允许扩展后继续拖动微调。
+    /// 注意：仅在**同一显示窗口内**（未回看滚动）扩展坐标系一致；与 auto-scroll 的
+    /// 跨窗口选区是两回事。
+    pub fn mirror_sel_extend(&mut self, row: usize, col: usize) {
+        let head = SelPoint {
+            line: self.displayed_view_top() + row as u64,
+            col,
+        };
+        match self.mirror_selection.as_mut() {
+            Some(sel) => sel.head = head,
+            None => self.mirror_selection = Some(Selection { anchor: head, head }),
+        }
+        self.mirror_selecting = true;
+    }
+
     /// 控制端：拖动更新选区终点。返回是否真的移动了（驱动重绘）。
     pub fn mirror_sel_update(&mut self, row: usize, col: usize) -> bool {
         if !self.mirror_selecting {
@@ -4160,6 +4177,26 @@ impl RemoteWs {
             if mp.session_id == sid {
                 let p = SelPoint { line, col };
                 mp.selection = Some(Selection { anchor: p, head: p });
+            } else {
+                mp.selection = None;
+            }
+        }
+        self.mirror_pane_selecting = Some(sid);
+    }
+
+    /// 控制端（多窗格）：Shift+点击范围扩展指定窗格的选区——保留锚点、head 续到点击
+    /// 处；无现有选区时以点击处为锚。仅扩展目标窗格，其它窗格选区清空（单一活跃选区）。
+    pub fn mirror_pane_sel_extend(&mut self, sid: SessionId, row: usize, col: usize) {
+        let head = SelPoint {
+            line: self.pane_view_top(sid) + row as u64,
+            col,
+        };
+        for mp in self.mirror_panes.iter_mut() {
+            if mp.session_id == sid {
+                match mp.selection.as_mut() {
+                    Some(sel) => sel.head = head,
+                    None => mp.selection = Some(Selection { anchor: head, head }),
+                }
             } else {
                 mp.selection = None;
             }

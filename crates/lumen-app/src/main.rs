@@ -102,6 +102,7 @@ const CURSOR_FREEZE_CAP: Duration = Duration::from_millis(50);
 /// 拖选边缘 auto-scroll 的 tick 间隔：拖选时鼠标停在内容区上/下边缘外，每隔此
 /// 时长滚动一行并把选区端点续到边缘（~50 行/秒）。
 const AUTOSCROLL_DRAG_TICK: Duration = Duration::from_millis(20);
+
 /// 后台会话单次 wake 的消化字节上限：`advance()` 在主线程跑，后台
 /// `yes` 级输出不限量会抢占主线程拖慢前台打字。超限的事件留在**本
 /// 会话自己的通道**里（靠 bounded 容量反压该会话的读线程，不连坐
@@ -618,6 +619,10 @@ struct AppState {
     autoscroll_drag: i8,
     /// 拖选 auto-scroll 下次 tick 的时刻（`AUTOSCROLL_DRAG_TICK` 节流）；None=可立即 tick。
     autoscroll_at: Option<Instant>,
+    /// 上次**普通**左键点击的锚点 `(窗格 id, 选择点)`：Shift+左键「范围快选」从此处
+    /// 扩展选区到当前点（保留锚点）。仅普通点击更新（Shift 扩展保持原锚点，供连续
+    /// Shift+点击继续扩展）；窗格 id 不符（点了别的窗格）则 Shift 退化为新建。
+    last_left_click: Option<(SessionId, SelPoint)>,
 
     // —— F3 热更（自动更新）——
     /// 后台更新线程 → 主循环的消息通道发送端（克隆给检查/下载线程）。
@@ -5047,6 +5052,7 @@ impl App {
             mirror_report_sid: None,
             autoscroll_drag: 0,
             autoscroll_at: None,
+            last_left_click: None,
             update_tx,
             update_rx,
             update_available: None,
@@ -6645,17 +6651,28 @@ impl ApplicationHandler<PtyWake> for App {
                         }
                         // Phase 4 多窗格：点哪个镜像窗格 → 选它做**焦点**（输入/回看/复制/IME 目标）+
                         // 起该窗格 per-pane 拖选。单窗格镜像走既有 part4b 单选区。
+                        // Shift+左键 = 范围扩展：保留现有选区锚点、把 head 续到点击处（标准
+                        // 「先拖选一段、Shift+点别处扩展」语义）；无选区则等价新建。
+                        let shift = state.modifiers.shift_key();
                         if !state.remote_ws.mirror_panes().is_empty() {
                             if let Some((sid, row, col)) = state.mirror_pane_cell_at_mouse() {
                                 state.terminal_focused = true;
                                 state.remote_ws.set_mirror_active_pane(sid);
-                                state.remote_ws.mirror_pane_sel_start(sid, row, col);
+                                if shift {
+                                    state.remote_ws.mirror_pane_sel_extend(sid, row, col);
+                                } else {
+                                    state.remote_ws.mirror_pane_sel_start(sid, row, col);
+                                }
                                 state.window.request_redraw();
                                 return;
                             }
                         } else if let Some((row, col)) = state.mirror_cell_at_mouse() {
                             state.terminal_focused = true;
-                            state.remote_ws.mirror_sel_start(row, col);
+                            if shift {
+                                state.remote_ws.mirror_sel_extend(row, col);
+                            } else {
+                                state.remote_ws.mirror_sel_start(row, col);
+                            }
                             state.window.request_redraw();
                             return;
                         }
@@ -6761,10 +6778,40 @@ impl ApplicationHandler<PtyWake> for App {
                     let Some(p) = state.sel_point_at_mouse() else {
                         return;
                     };
-                    let s = state.focused_pane_mut();
-                    s.selecting = true;
-                    // 单击先建立空选区（不高亮），拖动后才有内容。
-                    s.selection = Some(Selection { anchor: p, head: p });
+                    let pane_id = state.focused_pane().id;
+                    // 新拖选起手：复位边缘 auto-scroll 方向，绝不继承上次拖选的陈旧值。
+                    state.autoscroll_drag = 0;
+                    state.autoscroll_at = None;
+                    // Shift+左键 = 范围快选：从上次（本窗格）普通左键点位扩展选区到此处、
+                    // 保留锚点。仅当三条都满足才扩展：① **非鼠标上报终端**——上报态（Claude
+                    // 全屏）Shift 是「逃生到本地选区」、应按普通拖选以按下点为锚，不做范围
+                    // 扩展（否则第二次拖选锚点错乱）；② 记忆点位是本窗格的；③ 锚点绝对行仍落在
+                    // 当前 grid 有效区间内（跨备用屏 / 主屏切换、或滚出 scrollback 则失效，避免
+                    // 坐标系串台高亮错范围）。否则退化为新建。普通左键 = 新建空选区并记锚点。
+                    let reporting = state.focused_pane().term.mouse_protocol().is_on();
+                    let prev = state.last_left_click.filter(|&(id, a)| {
+                        id == pane_id && state.focused_pane().term.grid().line_by_abs(a.line).is_some()
+                    });
+                    let shift_extend = !reporting && state.modifiers.shift_key() && prev.is_some();
+                    let anchor = if shift_extend {
+                        prev.map_or(p, |(_, a)| a)
+                    } else {
+                        p
+                    };
+                    {
+                        let s = state.focused_pane_mut();
+                        s.selecting = true;
+                        s.selection = Some(Selection { anchor, head: p });
+                        // 范围扩展：清掉单击锚点时选中的命令块，避免块高亮与文本选区并存、
+                        // 或复制取了块而非选区文本。
+                        if shift_extend {
+                            s.selected_block = None;
+                        }
+                    }
+                    // 仅普通点击更新记忆锚点（Shift 扩展保持原锚点供连续扩展）。
+                    if !shift_extend {
+                        state.last_left_click = Some((pane_id, p));
+                    }
                     state.window.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Released) => {
