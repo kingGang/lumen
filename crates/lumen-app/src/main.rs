@@ -9911,6 +9911,18 @@ impl ApplicationHandler<PtyWake> for App {
                     state.last_term_render_at = Some(render_t0);
                 }
 
+                // 镜像离屏必须【不透明】：远程屏幕是实心内容，不该透出本地窗格。开了背景图时
+                // 全局 transparent_background=true 会让镜像随离屏 Clear 变透明，下层本地窗格的
+                // 命令行就透过镜像显出来（海风哥实测：release 配了背景图触发；debug 无背景图不
+                // 复现；单窗格+控制中）。故渲染镜像前临时关透明、渲染后恢复——不影响已渲染完的
+                // 本地窗格纹理，也不影响无背景图的默认路径。
+                let force_opaque_mirror = state.is_mirror_active()
+                    && state.settings.appearance.background.enabled
+                    && state.bg_texture.is_some();
+                if force_opaque_mirror {
+                    state.renderer.set_transparent_background(false);
+                }
+
                 // —— M5.3 part3b/part3d 控制端镜像渲染：把镜像 Terminal 画进保留 id 的离屏
                 // 纹理（wgpu 上色，复用窗格渲染器；控制端主题就地解析颜色）。
                 if state.is_mirror_active() {
@@ -10018,6 +10030,10 @@ impl ApplicationHandler<PtyWake> for App {
                             error!("多窗格镜像渲染失败: {e:#}");
                         }
                     }
+                }
+                // 恢复透明背景：供下一帧本地窗格离屏 Clear 透出 egui 背景图（仅本帧镜像期间关过）。
+                if force_opaque_mirror {
+                    state.renderer.set_transparent_background(true);
                 }
 
                 // —— egui 平台输出 + IME 强制复位（IME 最大坑对策）——
