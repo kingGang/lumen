@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use lumen_protocol::DeviceRecord;
 use winit::event_loop::EventLoopProxy;
 
-use crate::cloud::{server_url, CloudClient};
+use crate::cloud::{server_url, CloudClient, CloudError};
 use crate::PtyWake;
 
 /// 心跳 + 列表轮询周期。10s：上下线在列表里更及时反映（轻量 HTTP，几台设备开销可忽略）；
@@ -46,12 +46,28 @@ fn in_refresh_window(now_secs: i64, expires_at: i64) -> bool {
     expires_at > 0 && now_secs < expires_at && now_secs + TOKEN_REFRESH_AHEAD_SECS >= expires_at
 }
 
+/// 与云服务器的连接态（底部状态栏「已连接 / 未连接 / 连接错误」指示用）。
+/// 仅在登录后（心跳 worker 运行时）有意义；未登录场景由 [`RemoteState::is_running`]
+/// 判定（那时统一显示「未连接」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerConn {
+    /// 未确认连上真服务器：心跳线程刚起未拿到首次结果（连接中），或服务器有响应但非正常
+    /// list_devices（401/5xx/非 Lumen 响应）——UI 统一显示黄「未连接服务器」。
+    #[default]
+    Connecting,
+    /// 已连上真 Lumen 服务器且账户有效（list_devices 成功）——UI 显示绿「已连接服务器」。
+    Connected,
+    /// 最近一次请求网络层失败（连不上服务器）。
+    Error,
+}
+
 /// 后台线程 → 主线程的消息。
 enum Event {
     /// 设备列表刷新成功。
     Devices(Vec<DeviceRecord>),
-    /// 拉取失败（用户可见原因）。
-    Error(String),
+    /// 拉取失败。`network=true` 表示网络层连不上（红「连接错误」）；`false` 表示
+    /// 服务器有响应但业务错误（如 401，服务器仍可达，不算连接错误）。
+    Error { message: String, network: bool },
     /// token 已自动续期：主线程据此落 profile（持久化新 token + 到期时间）。
     TokenRefreshed { token: String, expires_at: i64 },
 }
@@ -63,6 +79,8 @@ pub struct RemoteState {
     pub devices: Vec<DeviceRecord>,
     /// 最近一次拉取错误（展示用）。
     pub last_error: Option<String>,
+    /// 与服务器的连接态（状态栏指示；仅登录后有意义，由心跳结果驱动）。
+    conn: ServerConn,
     /// 当前选中的设备 id（高亮用；M5.3 连接用）。
     pub active_device_id: Option<String>,
     /// 当前账户 token（**共享可变**：心跳 worker 自动续期时写回，改名/删除一次性请求 + WS 重连
@@ -120,12 +138,18 @@ impl RemoteState {
         self.refresh = None;
         self.devices.clear();
         self.last_error = None;
+        self.conn = ServerConn::Connecting;
         self.active_device_id = None;
     }
 
     /// 是否已在运行（登录态）。
     pub fn is_running(&self) -> bool {
         self.stop.is_some()
+    }
+
+    /// 与服务器的连接态（状态栏指示用；仅在 [`Self::is_running`] 为真时有意义）。
+    pub fn server_conn(&self) -> ServerConn {
+        self.conn
     }
 
     /// 请求后台线程尽快刷新一次（进入远程 tab / 改名删除后调用）。
@@ -144,10 +168,21 @@ impl RemoteState {
                     Event::Devices(d) => {
                         self.devices = d;
                         self.last_error = None;
+                        self.conn = ServerConn::Connected;
                         updated = true;
                     }
-                    Event::Error(e) => {
-                        self.last_error = Some(e);
+                    Event::Error { message, network } => {
+                        self.last_error = Some(message);
+                        // 网络层失败=连不上→红。其余（HTTP 有响应但非正常 list_devices：
+                        // 401 token 失效/被吊销、5xx、captive portal / 非 Lumen 服务器致解析
+                        // 失败）→未确认连上真服务器，退回 Connecting（黄「未连接」），绝不误报绿。
+                        // 只有 list_devices 成功（Devices 分支）才置 Connected（绿）——那是「连到
+                        // 真 Lumen 且账户有效」的唯一可信证据。
+                        self.conn = if network {
+                            ServerConn::Error
+                        } else {
+                            ServerConn::Connecting
+                        };
                         updated = true;
                     }
                     Event::TokenRefreshed { token, expires_at } => {
@@ -257,7 +292,11 @@ fn worker(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Event::Error(e.user_message()));
+                    let network = matches!(e, CloudError::Network(_));
+                    let _ = tx.send(Event::Error {
+                        message: e.user_message(),
+                        network,
+                    });
                 }
             }
             nudge(ctx, proxy, wake_pending);

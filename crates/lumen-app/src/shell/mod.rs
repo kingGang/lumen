@@ -185,6 +185,9 @@ pub struct ShellInput<'a> {
     /// 数据面链路状态（Some 时状态栏左区显示 ● 直连/中继 持久指示）。main 每帧由
     /// `remote_ws.p2p_link_state()` 取；非远程会话 None。
     pub link: Option<crate::remote_ws::P2pLink>,
+    /// 与云服务器的连接态（Some 时状态栏左区显示 ● 已连接/未连接/连接错误；
+    /// None=未配置服务端地址，不显示）。main 每帧据 `cloud::server_url()` + `state.remote` 计算。
+    pub server_conn: Option<statusbar::ServerConnBadge>,
     /// 历史搜索面板本帧展示的行（由 main 在 render 前计算；面板关闭时传空切片）。
     pub history_rows: &'a [history_search_ui::HistoryRow],
     /// 补全弹窗本帧展示数据（M4.4 批1）：Some = 弹窗可见，None = 不显示。
@@ -1005,6 +1008,7 @@ pub fn show(
                     input.force_fallback,
                     input.transfer,
                     input.link,
+                    input.server_conn,
                     pal,
                 );
                 if sb_out.toggle_fallback {

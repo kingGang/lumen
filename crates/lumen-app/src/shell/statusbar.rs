@@ -45,6 +45,18 @@ pub struct StatusBarOutput {
     pub toggle_fallback: bool,
 }
 
+/// 状态栏「服务器连接」三态徽标（由 main 据 `cloud::server_url()` + 心跳连接态计算；
+/// 传 `None` 时不显示该 ● 徽标——对应「未配置服务端地址」）。见 [`show`] 的 `server_conn` 参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConnBadge {
+    /// 已连接服务器（绿）。
+    Connected,
+    /// 未连接服务器（黄，已配置地址但未登录 / 连接中）。
+    Disconnected,
+    /// 连接服务器错误（红，网络层连不上服务器）。
+    Error,
+}
+
 /// 绘制底部状态栏。
 ///
 /// # Arguments
@@ -55,10 +67,13 @@ pub struct StatusBarOutput {
 /// * `transfer` - 控制端活跃文件传输（Some 时中间区改画进度 ↓N↑M + 进度条 + 轮换文件名，
 ///   替代 cwd；None 时照常显示 cwd）。
 /// * `link` - 数据面链路状态（Some 时左区显示持久 ● 直连/中继 指示；None=非远程会话不显示）。
+/// * `server_conn` - 与云服务器的连接态（Some 时左区显示 ● 已连接/未连接/连接错误；
+///   None=未配置服务端地址，不显示）。
 /// * `pal` - 当前主题色板。
 ///
 /// # Errors
 /// 本函数仅做 egui 绘制，无 IO，不返回 Result。
+#[allow(clippy::too_many_arguments)] // 一次绘制需要的一组独立状态量，打包成 struct 反更晦涩。
 pub fn show(
     root: &mut egui::Ui,
     mode: InputMode,
@@ -66,6 +81,7 @@ pub fn show(
     force_fallback: bool,
     transfer: Option<&crate::remote_ws::TransferStatus>,
     link: Option<crate::remote_ws::P2pLink>,
+    server_conn: Option<ServerConnBadge>,
     pal: &Palette,
 ) -> StatusBarOutput {
     let mut out = StatusBarOutput::default();
@@ -112,6 +128,24 @@ pub fn show(
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(format!("● {txt}")).size(11.0).color(color),
+                )
+                .selectable(false),
+            );
+        }
+
+        // 服务器连接指示（● 已连接/未连接/连接错误）：None=未配置服务端地址，不显示（需求①）。
+        if let Some(conn) = server_conn {
+            ui.add_space(10.0);
+            let (conn_text, conn_color) = match conn {
+                ServerConnBadge::Connected => (s.statusbar_server_connected, pal.success),
+                ServerConnBadge::Disconnected => (s.statusbar_server_disconnected, pal.warn),
+                ServerConnBadge::Error => (s.statusbar_server_error, pal.error),
+            };
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("● {conn_text}"))
+                        .size(11.0)
+                        .color(conn_color),
                 )
                 .selectable(false),
             );

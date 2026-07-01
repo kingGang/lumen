@@ -7782,6 +7782,27 @@ impl ApplicationHandler<PtyWake> for App {
                     force_fallback: state.force_fallback,
                     transfer: transfer_status.as_ref(),
                     link: state.remote_ws.p2p_link_state(),
+                    // 服务器连接指示三态：①未配置地址→None(不显示)；②已配置但未登录(心跳未起)
+                    // →未连接(黄)；③已登录→据心跳连接态映射 已连接(绿)/连接错误(红)/连接中(黄)。
+                    server_conn: {
+                        if crate::cloud::server_url().trim().is_empty() {
+                            None
+                        } else if !state.remote.is_running() {
+                            Some(shell::statusbar::ServerConnBadge::Disconnected)
+                        } else {
+                            match state.remote.server_conn() {
+                                crate::remote::ServerConn::Connected => {
+                                    Some(shell::statusbar::ServerConnBadge::Connected)
+                                }
+                                crate::remote::ServerConn::Error => {
+                                    Some(shell::statusbar::ServerConnBadge::Error)
+                                }
+                                crate::remote::ServerConn::Connecting => {
+                                    Some(shell::statusbar::ServerConnBadge::Disconnected)
+                                }
+                            }
+                        }
+                    },
                     history_rows: &history_rows_owned,
                     #[cfg(feature = "input-editor")]
                     completion_view: completion_view_owned,
@@ -9100,7 +9121,10 @@ impl ApplicationHandler<PtyWake> for App {
                         *g = state.settings.proxy.effective_url().map(str::to_owned);
                     }
                 }
-                // M5.2：服务端地址改动 → 应用到 cloud 全局（下次登录/心跳即用）。
+                // M5.2：服务端地址改动 → 更新 cloud 全局。注意：运行中的心跳 worker 在 start
+                // 时已一次性捕获旧地址（CloudClient::new(server_url())，循环外不热切），故状态栏
+                // 连接指示要到「下次登录」worker 用新地址重启后才与新地址一致——与设置页
+                // 「改后下次登录生效」提示相符（登录 UI/心跳每次新建 client 时才读新全局）。
                 if shell_out.settings_server_url_changed {
                     cloud::set_server_url(&state.settings.server_url);
                 }

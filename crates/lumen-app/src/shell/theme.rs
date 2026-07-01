@@ -47,6 +47,8 @@ pub struct Palette {
     pub warn: egui::Color32,
     /// 错误文字色（语义红，保留彩色；登录校验失败红字等）。
     pub error: egui::Color32,
+    /// 成功/已连接文字色（语义绿，保留彩色；状态栏「已连接服务器」等）。
+    pub success: egui::Color32,
     /// 信息提示色（toast Info）：M3.7b 起中性白灰/深灰（原青色去彩）。
     pub info: egui::Color32,
     /// 三栏面板外轮廓描边色（P16）：深色板中亮灰（比 bg_highlight 再亮一
@@ -86,6 +88,8 @@ pub static DARK: Palette = Palette {
     warn: egui::Color32::from_rgb(0xe0, 0xaf, 0x68),
     // #f7768e 语义红保留（Tokyo Night 同源）。
     error: egui::Color32::from_rgb(0xf7, 0x76, 0x8e),
+    // #3fb950 语义绿（对齐 mod.rs 在线圆点绿；对 #161616 约 7.1:1）。
+    success: egui::Color32::from_rgb(0x3f, 0xb9, 0x50),
     // #d6d6d6 toast Info 中性白灰（原青 #7dcfff 去彩）。
     info: egui::Color32::from_rgb(0xd6, 0xd6, 0xd6),
     // #4a4a4a 面板外轮廓描边（P16b 调暗）：比初版 #626262 更沉，
@@ -125,6 +129,8 @@ pub static LIGHT: Palette = Palette {
     warn: egui::Color32::from_rgb(0x8c, 0x6c, 0x3e),
     // #c64343 语义红保留（Tokyo Night day red1）。
     error: egui::Color32::from_rgb(0xc6, 0x43, 0x43),
+    // #2b7434 语义绿（浅底暗化到 ≈4.6:1，达 WCAG AA）。
+    success: egui::Color32::from_rgb(0x2b, 0x74, 0x34),
     // #3c3c3c toast Info 中性深灰（原青 #07879d 去彩）。
     info: egui::Color32::from_rgb(0x3c, 0x3c, 0x3c),
     // #a0a0a0 面板外轮廓描边（P16b 调整）：浅色板方向——比初版 #888888
@@ -197,6 +203,7 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             extreme_bg,
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, black),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, black),
+            success: ensure_contrast(c32(t.ansi[2]), bg_dark, 4.5, black),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, black),
             // 浅色派生（P16b）：比 bg_highlight 再深 0.20 档，
             // 与 LIGHT 手调板 #a0a0a0 量级保持一致（低调灰线）。
@@ -231,6 +238,7 @@ fn derive_palette(light: bool, t: &lumen_renderer::Theme) -> Palette {
             extreme_bg,
             warn: ensure_contrast(c32(t.ansi[3]), bg_dark, 4.5, white),
             error: ensure_contrast(c32(t.ansi[1]), bg_dark, 4.5, white),
+            success: ensure_contrast(c32(t.ansi[2]), bg_dark, 4.5, white),
             info: ensure_contrast(mix(fg, bg_dark, 0.12), bg_dark, 4.5, white),
             // 深色派生（P16b）：比 bg_highlight 再亮 0.22 档，
             // 与 DARK 手调板 #4a4a4a 量级保持一致（低调灰线）。
@@ -474,6 +482,7 @@ mod tests {
                 ("fg_dim vs bg_dark", contrast(p.fg_dim, p.bg_dark), 4.5),
                 ("warn vs bg_dark", contrast(p.warn, p.bg_dark), 4.5),
                 ("error vs bg_dark", contrast(p.error, p.bg_dark), 4.5),
+                ("success vs bg_dark", contrast(p.success, p.bg_dark), 4.5),
                 ("info vs bg_dark", contrast(p.info, p.bg_dark), 4.5),
                 // 实底按钮上的文字。
                 ("accent_fg vs accent", contrast(p.accent_fg, p.accent), 4.5),

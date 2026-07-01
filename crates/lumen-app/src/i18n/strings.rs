@@ -465,6 +465,12 @@ pub struct Strings {
     pub statusbar_link_direct: &'static str,
     /// 状态栏链路指示：中继转发（短标签）
     pub statusbar_link_relay: &'static str,
+    /// 状态栏服务器连接指示：已连接（绿）
+    pub statusbar_server_connected: &'static str,
+    /// 状态栏服务器连接指示：未连接（黄，已配置地址但尚未连上/未登录）
+    pub statusbar_server_disconnected: &'static str,
+    /// 状态栏服务器连接指示：连接错误（红，网络层连不上服务器）
+    pub statusbar_server_error: &'static str,
     /// toast：请求被拒——目标离线
     pub remote_denied_offline: &'static str,
     /// toast：请求被拒——对方忙（已被控/配对中）
