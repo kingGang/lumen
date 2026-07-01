@@ -231,7 +231,11 @@ async fn upsert_device(
     Ok(id)
 }
 
-/// `GET /devices`：本账户全部设备（按 `last_seen` 倒序，含在线/本机标记）。
+/// `GET /devices`：本账户全部设备（含在线/本机标记）。
+///
+/// 按注册时间 `created_at` 升序（`id` 兜底确保完全确定性）——**稳定排序**：老实现按
+/// `last_seen DESC`，而 `last_seen` 每次心跳都变，导致列表每刷新一次就重排、设备跳位
+/// （海风哥反馈）。改按注册先后固定顺序，新设备排末尾、既有设备不再移动。
 pub async fn list_devices(
     State(state): State<AppState>,
     user: AuthUser,
@@ -239,7 +243,7 @@ pub async fn list_devices(
     let client = state.pool.get().await?;
     let rows = client
         .query(
-            "SELECT id, name, os, app_version, last_seen FROM devices WHERE user_id = $1 ORDER BY last_seen DESC",
+            "SELECT id, name, os, app_version, last_seen FROM devices WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
             &[&user.user_id],
         )
         .await?;
