@@ -14,3 +14,10 @@ F*ClaudeWorkspacesLumen*
 
 # 本地临时/调研用(如下载的第三方源码)，不入库
 /temp/
+
+# 敏感：证书/私钥，绝不入库（公开仓库）。
+/证书/
+# 文档媒体素材（截图等），本地保留、不随源码入库。
+/docs/media/
+# Docker 交叉编译 Linux 版服务端的产物目录（本地临时）。
+/target-linux/
