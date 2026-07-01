@@ -2039,6 +2039,51 @@ impl AppState {
         }
     }
 
+    /// 镜像（控制端远程视图）拖选边缘 auto-scroll 方向：鼠标在**正在拖选的镜像窗格**
+    /// 矩形上边缘以上返回 +1（回看向上露更早）、下边缘以下返回 -1、区内返回 0。多窗格
+    /// per-pane 矩形（生产路径）；镜像无 footer，整个窗格矩形即内容区。
+    fn autoscroll_dir_for_mirror_drag(&self) -> i8 {
+        let Some(sid) = self.remote_ws.mirror_pane_selecting_sid() else {
+            return 0;
+        };
+        let Some((_, _x, y, _w, h)) = self
+            .mirror_pane_rects_px
+            .iter()
+            .copied()
+            .find(|(s, ..)| *s == sid)
+        else {
+            return 0;
+        };
+        let my = self.mouse_pos.1;
+        if my < f64::from(y) {
+            1
+        } else if my > f64::from(y + h) {
+            -1
+        } else {
+            0
+        }
+    }
+
+    /// 镜像拖选 auto-scroll 单步：按 `autoscroll_drag` 方向回看滚一行（保留选区并按被控端
+    /// 绝对行重投影 anchor——见 `scroll_mirror_pane_drag`），再把 head 续到新视口边缘行
+    /// （`mirror_pane_sel_update` 按当前显示窗口 0 基）。到回看顶 / 底无可滚则停 tick。
+    fn tick_autoscroll_mirror_drag(&mut self) {
+        let dir = self.autoscroll_drag;
+        if dir == 0 {
+            return;
+        }
+        if !self.remote_ws.scroll_mirror_pane_drag(isize::from(dir)) {
+            self.autoscroll_drag = 0;
+            self.autoscroll_at = None;
+            return;
+        }
+        if let Some(sid) = self.remote_ws.mirror_pane_selecting_sid() {
+            if let Some((row, col)) = self.mirror_pane_cell_clamped(sid) {
+                self.remote_ws.mirror_pane_sel_update(row, col);
+            }
+        }
+    }
+
     /// 把 IME 候选框钉到焦点窗格光标所在格子（Compose 态跟 footer 编辑器
     /// 光标，其余态跟终端光标）。egui 会按自身文本焦点开关整窗 IME / 把
     /// 候选框挪到它的默认控件位，终端聚焦时必须强制复位回光标处。
@@ -5785,12 +5830,17 @@ impl ApplicationHandler<PtyWake> for App {
         //   （其余仍在同步区间的窗格由 RedrawRequested 的逐窗格门控
         //   各自跳过，保留上一完整帧）。
         let now = Instant::now();
-        // 拖选边缘 auto-scroll：本地终端拖选进行中、鼠标停在焦点窗格内容区上/下边缘
-        // 外时，按节流定时滚动一行 + 续选（露出 scrollback 上/下内容），并安排下次
-        // tick。优先于下方渲染调度——它自带 request_redraw + WaitUntil 自维持节拍。
-        if state.autoscroll_drag != 0 && state.focused_pane().selecting {
+        // 拖选边缘 auto-scroll：本地终端 或 镜像（远程视图）拖选进行中、鼠标停在内容区
+        // 上/下边缘外时，按节流定时滚动一行 + 续选（露出 scrollback 上/下内容），并安排
+        // 下次 tick。优先于下方渲染调度——它自带 request_redraw + WaitUntil 自维持节拍。
+        let mirror_selecting = state.remote_ws.mirror_pane_selecting_sid().is_some();
+        if state.autoscroll_drag != 0 && (state.focused_pane().selecting || mirror_selecting) {
             if state.autoscroll_at.is_none_or(|t| now >= t) {
-                state.tick_autoscroll_drag();
+                if mirror_selecting {
+                    state.tick_autoscroll_mirror_drag();
+                } else {
+                    state.tick_autoscroll_drag();
+                }
                 state.autoscroll_at = Some(now + AUTOSCROLL_DRAG_TICK);
                 state.window.request_redraw();
             }
@@ -6468,6 +6518,17 @@ impl ApplicationHandler<PtyWake> for App {
                     if !mirror_dragging && state.report_mirror_mouse_motion() {
                         return;
                     }
+                    // 镜像拖选边缘 auto-scroll 方向（拖到拖选窗格上/下边缘外则非 0），由
+                    // about_to_wait 定时回看滚动 + 续选；回到区内则清零停滚。
+                    if mirror_dragging {
+                        let dir = state.autoscroll_dir_for_mirror_drag();
+                        state.autoscroll_drag = dir;
+                        if dir == 0 {
+                            state.autoscroll_at = None;
+                        } else {
+                            state.window.request_redraw();
+                        }
+                    }
                     // 多窗格 per-pane 拖选：clamp 到拖选起始窗格矩形（不跨格）。
                     if let Some(sid) = state.remote_ws.mirror_pane_selecting_sid() {
                         if let Some((row, col)) = state.mirror_pane_cell_clamped(sid) {
@@ -6832,11 +6893,15 @@ impl ApplicationHandler<PtyWake> for App {
                     // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
                     if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
                         state.remote_ws.mirror_pane_sel_end();
+                        state.autoscroll_drag = 0;
+                        state.autoscroll_at = None;
                         state.window.request_redraw();
                         return;
                     }
                     if state.is_mirror_active() && state.remote_ws.mirror_selecting() {
                         state.remote_ws.mirror_sel_end();
+                        state.autoscroll_drag = 0;
+                        state.autoscroll_at = None;
                         state.window.request_redraw();
                         return;
                     }

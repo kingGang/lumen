@@ -3781,8 +3781,9 @@ impl RemoteWs {
     /// 控制端：滚轮回看镜像历史（part3d 按需拉取）。`lines > 0` 向上看更旧、`< 0` 向下；
     /// 按**绝对行**锚定窗口——被控端实时输出推进时回看内容不被推走（标准终端回滚行为）。
     /// 滚回底部即恢复「跟随实时」。返回是否改变了视图（驱动重绘）。
-    pub fn scroll_mirror(&mut self, lines: isize) -> bool {
-        // 单窗格借 `mirror`，多窗格借**焦点窗格**（`mirror_active_pane`）；都无则无可回看。
+    /// 内部：仅推进焦点窗格回看窗口 `hist_top`（不碰选区），返回是否真的变了。
+    /// `lines>0` 向上 = 更旧 = 绝对行减小。
+    fn advance_hist_top(&mut self, lines: isize) -> bool {
         if self.focused_mirror_term().is_none() {
             return false;
         }
@@ -3792,9 +3793,7 @@ impl RemoteWs {
         if screen_top <= base {
             return false; // 被控端无 scrollback 历史，无可回看。
         }
-        // 当前窗口首行：跟随态视作可视区首行 screen_top。
         let cur_top = self.hist_top.unwrap_or(screen_top);
-        // lines>0 向上 = 更旧 = 绝对行减小。
         let delta = i64::try_from(lines).unwrap_or(0);
         let new_top = i64::try_from(cur_top)
             .unwrap_or(i64::MAX)
@@ -3806,7 +3805,14 @@ impl RemoteWs {
             return false;
         }
         self.hist_top = new_hist;
-        // 视图窗口变了（跟随↔回看 / 换窗口）：旧选区坐标作废（单窗格 + 多窗格焦点窗格都清）。
+        true
+    }
+
+    pub fn scroll_mirror(&mut self, lines: isize) -> bool {
+        if !self.advance_hist_top(lines) {
+            return false;
+        }
+        // 手动滚动（滚轮 / 滚动条）：视图窗口变，清旧选区（UX——主动滚动即重新开始选）。
         self.mirror_selection = None;
         self.mirror_selecting = false;
         self.mirror_pane_selecting = None;
@@ -3816,6 +3822,62 @@ impl RemoteWs {
             }
         }
         true
+    }
+
+    /// 多窗格拖选 auto-scroll 专用：回看滚 `lines` 行并**按被控端绝对行重投影当前拖选
+    /// 窗格选区的 anchor**——使 anchor 跨回看窗口 / 跨 follow↔回看边界始终指向同一被控端
+    /// 内容行（选区随滚动延展，而非塌缩）。选区其余不动，渲染/复制仍按当前显示窗口坐标
+    /// （局部方案，不动全局选区坐标系）。调用方随后 `mirror_pane_sel_update` 把 head 续到
+    /// 新视口边缘行。返回是否真滚了（未动 = 已到回看顶 / 底）。
+    pub fn scroll_mirror_pane_drag(&mut self, lines: isize) -> bool {
+        let Some(sid) = self.mirror_pane_selecting else {
+            return false;
+        };
+        // 滚动前算 anchor 的被控端绝对行（当前显示状态下）。
+        let anchor_abs = self.mirror_pane_anchor_abs(sid);
+        if !self.advance_hist_top(lines) {
+            return false;
+        }
+        // 滚动后按新显示状态把 anchor.line 投影回去（指向同一被控端内容行）。
+        if let Some(abs) = anchor_abs {
+            let new_line = self.abs_to_pane_display_line(sid, abs);
+            if let Some(mp) = self.mirror_panes.iter_mut().find(|p| p.session_id == sid) {
+                if let Some(sel) = mp.selection.as_mut() {
+                    sel.anchor.line = new_line;
+                }
+            }
+        }
+        true
+    }
+
+    /// 拖选窗格选区 anchor 的**被控端绝对行号**：回看态 = `hist_top` + anchor 本地行；
+    /// 跟随态 = 被控端 `screen_top` + （anchor 本地行 − live 视口首行）。无选区返回 None。
+    fn mirror_pane_anchor_abs(&self, sid: SessionId) -> Option<u64> {
+        let mp = self.mirror_panes.iter().find(|p| p.session_id == sid)?;
+        let anchor = mp.selection?.anchor;
+        if let Some(ht) = self.hist_top {
+            Some(ht + anchor.line)
+        } else {
+            let screen_top = self.hist_bounds.map_or(mp.hist_screen_top, |b| b.1);
+            let live_top = mp.term.grid().view_top_abs_line();
+            Some(screen_top + anchor.line.saturating_sub(live_top))
+        }
+    }
+
+    /// 把被控端绝对行 `abs` 投影为拖选窗格在**当前显示状态**下的本地行号（与
+    /// [`Self::pane_view_top`] 同口径的逆运算）：回看 = abs − hist_top；跟随 =（abs −
+    /// screen_top）+ live 视口首行。
+    fn abs_to_pane_display_line(&self, sid: SessionId, abs: u64) -> u64 {
+        if let Some(ht) = self.hist_top {
+            abs.saturating_sub(ht)
+        } else {
+            let mp = self.mirror_panes.iter().find(|p| p.session_id == sid);
+            let screen_top = self
+                .hist_bounds
+                .map_or_else(|| mp.map_or(0, |m| m.hist_screen_top), |b| b.1);
+            let live_top = mp.map_or(0, |m| m.term.grid().view_top_abs_line());
+            abs.saturating_sub(screen_top) + live_top
+        }
     }
 
     /// 控制端：产出本帧镜像渲染源（[`MirrorFrame`]）。跟随态借 live `mirror`；回看态按
