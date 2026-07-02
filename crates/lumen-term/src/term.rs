@@ -56,7 +56,20 @@ impl Terminal {
     /// 的「复制/提取输出」，不损坏 grid、不触发 panic、不破坏绝对行号单调
     /// 性。完整修复需位置级 (行,列) 重映射，留作后续（对抗审查 minor 项）。
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        if let Some(remap) = self.inner.grid.resize(rows, cols) {
+        // 当前网格（备用屏激活时为 alt 网格）照常 resize。
+        let cur_remap = self.inner.grid.resize(rows, cols);
+        // 备用屏激活期间，主屏（saved_main）必须**同步** resize——否则退出
+        // 备用屏后恢复的主屏仍是旧行列，渲染只按旧行数铺屏、底部残留 alt
+        // 全屏程序（claude/vim）内容；且退出瞬间窗口尺寸未变、不会再触发
+        // 一次 resize 来兜底（此前 rustdoc「由上层 resize 流程兜底」的假设
+        // 对「备用屏内 resize→退出」路径不成立，实测本地部分残留）。
+        // 块行号以**主屏坐标**记，故 blocks 用主屏 reflow 的 remap 重映射；
+        // 非备用屏时当前网格即主屏，退化为原逻辑。
+        let block_remap = match self.inner.saved_main.as_mut() {
+            Some(main) => main.resize(rows, cols),
+            None => cur_remap,
+        };
+        if let Some(remap) = block_remap {
             for b in &mut self.inner.blocks {
                 b.prompt_line = remap.apply(b.prompt_line);
                 b.cmd_line = b.cmd_line.map(|l| remap.apply(l));
@@ -105,9 +118,36 @@ impl Terminal {
     }
 
     /// 主屏网格：块行号永远以主屏坐标记录，alt screen 激活期间
-    /// 块查询/提取必须用它而不是当前（alt）网格。
-    fn main_grid(&self) -> &Grid {
+    /// 块查询/提取必须用它而不是当前（alt）网格。备用屏激活时返回
+    /// `saved_main`（切 alt 前的主屏），否则即当前网格。镜像整屏快照
+    /// （[`crate`] 外的 `screen_snapshot_vt`）据此复现主/备两级。
+    pub fn main_grid(&self) -> &Grid {
         self.inner.saved_main.as_ref().unwrap_or(&self.inner.grid)
+    }
+
+    /// 当前滚动区（DECSTBM）`(top, bottom)`，0-based 含端点，默认 `(0, rows-1)`。
+    /// 终端级单份活状态（非 Grid 状态），且 `?1049` 切屏两侧都会重置为全屏——
+    /// 镜像整屏快照（[`crate`] 外的 `screen_snapshot_vt`）据此在 alt 段补发
+    /// CSI r，否则 vim 类「设一次滚动区不重发」的应用在中途接入的镜像上按
+    /// 全屏滚动、状态行被一起搬动。
+    pub fn scroll_region(&self) -> (usize, usize) {
+        (self.inner.scroll_top, self.inner.scroll_bottom)
+    }
+
+    /// 当前画笔（SGR 累积的前景/背景/属性，存于 [`Cell`] 各字段；`ch` 无意义）。
+    /// 镜像整屏快照据此在末尾复现画笔——快照逐行序列化时每行末尾 `\x1b[0m`
+    /// 已把镜像画笔归零，不补则快照后依赖 back-color-erase 的擦除（EL/ED 用
+    /// pen.bg 填充）在镜像上擦成默认底色，与被控端分叉。
+    pub fn pen(&self) -> Cell {
+        self.inner.pen
+    }
+
+    /// 保存槽里的画笔（`?1049h` 进备用屏或 DECSC/CSI s 时另存，配对恢复指令
+    /// 取回）；槽空时 `None`。镜像整屏快照在备用屏激活时据此在 `?1049h` 字节前
+    /// 把镜像画笔设为同值——镜像切 alt 时存入同一画笔，`?1049l` 恢复才与被控端
+    /// 一致。
+    pub fn saved_pen(&self) -> Option<Cell> {
+        self.inner.saved_cursor.map(|(_, _, pen)| pen)
     }
 
     /// 查找覆盖指定绝对行的块。块范围为 `[prompt_line, end_line)`，
@@ -667,12 +707,14 @@ impl TermInner {
         } else if !on {
             if let Some(main) = self.saved_main.take() {
                 self.grid = main;
-                if let Some((r, c, pen)) = self.saved_cursor.take() {
-                    self.grid.cursor.row = r.min(self.grid.rows() - 1);
-                    self.grid.cursor.col = c.min(self.grid.cols() - 1);
+                // 光标行列直接沿用主屏网格自带 cursor：它就是切 alt 前的位置，
+                // 且备用屏期间的 resize 已由 [`Terminal::resize`] 对 saved_main
+                // 同步重映射/夹紧（缩行时随内容上移）。saved_cursor 里的行列是
+                // **旧尺寸**坐标，拿来覆盖会在「alt 内缩行 resize → 退出」后
+                // 光标落错行、后续输出写错位置（2026-07 修），故只用它恢复画笔。
+                if let Some((_, _, pen)) = self.saved_cursor.take() {
                     self.pen = pen;
                 }
-                // 主屏行列可能在 alt 期间被 resize 过，由上层 resize 流程兜底。
                 self.grid.mark_dirty();
             }
         }
@@ -1376,6 +1418,65 @@ mod tests {
         t.advance(b"\x1b[?1049l");
         assert!(!t.is_alt_screen());
         assert!(screen_text(&t)[0].starts_with("main"));
+    }
+
+    /// 备用屏激活期间 resize：主屏（saved_main）须同步跟随，退出后恢复的
+    /// 主屏是**新行列**、内容不丢。回归 2026-07「进 claude 副屏、期间 resize、
+    /// 退出后本地部分残留」（旧实现只 resize 当前 alt 网格，主屏仍旧行数，
+    /// 退出后渲染只铺旧行数、底部残留 alt 内容）。
+    #[test]
+    fn 备用屏期间resize同步主屏() {
+        let mut t = Terminal::new(4, 20, 100);
+        t.advance(b"M0\r\nM1\r\nM2"); // 主屏 3 行内容，光标在第 3 行
+        t.advance(b"\x1b[?1049h"); // 进备用屏
+        t.advance(b"\x1b[HALT-FILL"); // alt 屏内容
+        assert!(t.is_alt_screen());
+        // 备用屏期间窗口放大：4 → 6 行。
+        t.resize(6, 20);
+        assert_eq!(t.grid().visible_rows().count(), 6, "alt 网格已扩到 6 行");
+        // 退出备用屏：恢复的主屏应是 6 行（跟随 resize），而非旧的 4 行。
+        t.advance(b"\x1b[?1049l");
+        assert!(!t.is_alt_screen());
+        assert_eq!(
+            t.grid().visible_rows().count(),
+            6,
+            "退出后主屏应为 resize 后的 6 行，不残留旧行数"
+        );
+        let s = screen_text(&t);
+        assert!(s[0].starts_with("M0"), "主屏内容保留");
+        assert!(s[1].starts_with("M1"));
+        assert!(s[2].starts_with("M2"));
+        assert!(
+            s.iter().all(|l| !l.contains("ALT-FILL")),
+            "退出后不残留 alt 内容"
+        );
+        let cur = &t.grid().cursor;
+        assert_eq!((cur.row, cur.col), (2, 2), "放大不移动内容，光标应留在原位");
+    }
+
+    /// 备用屏内**缩行** resize 再退出：主屏光标须跟随内容重映射（顶部行滚入
+    /// 历史后光标行随之上移），而非按 ?1049h 时存的旧尺寸坐标夹紧——旧实现
+    /// 用 saved_cursor 旧行列覆盖 Grid::resize 已重映射的光标，退出后光标落
+    /// 错行、后续输出写错位置（2026-07 修）。
+    #[test]
+    fn 备用屏内缩行resize退出_光标跟随内容行() {
+        let mut t = Terminal::new(10, 20, 100);
+        t.advance(b"L0\r\nL1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7");
+        t.advance(b"\x1b[6;3H"); // 光标停 L5 行（0-based row=5, col=2）
+        t.advance(b"\x1b[?1049h");
+        t.advance(b"\x1b[HALT");
+        t.resize(5, 20); // 缩行：L0..L2 滚入历史，主屏光标应重映射到 row=2
+        t.advance(b"\x1b[?1049l");
+        assert!(!t.is_alt_screen());
+        let s = screen_text(&t);
+        assert!(s[0].starts_with("L3"), "缩行后主屏顶行为 L3");
+        assert!(s[4].starts_with("L7"), "缩行后主屏底行为 L7");
+        let cur = &t.grid().cursor;
+        assert_eq!(
+            (cur.row, cur.col),
+            (2, 2),
+            "光标应跟随内容行 L5（重映射后 row=2），而非旧坐标 row=5 被夹到 4"
+        );
     }
 
     #[test]
