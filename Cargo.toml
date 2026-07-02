@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 # 最低支持 Rust 版本（MSRV）：由锁定依赖树决定，当前最高为 ecolor 0.34.3
 # （egui 0.34 成员）要求 1.92；README 徽章与此保持一致。仅客户端 crates 继承；
