@@ -6915,6 +6915,25 @@ impl ApplicationHandler<PtyWake> for App {
                     {
                         return;
                     }
+                    // 镜像 copy-on-select（**仅焦点镜像窗格开鼠标上报时**=全屏 TUI 如 Claude）：
+                    // 上报态下普通拖被转发、选区只能靠 Shift 逃生拖出，松手即自动复制到本地剪贴板，
+                    // 免去「选完还得右键 / Ctrl+C」（对齐本地 copy-on-select）。**不清选区**：保留
+                    // 高亮，右键 / Ctrl+C 仍可再复制。普通 shell（未上报）不自动复制，避免只想选来
+                    // 看看却误清剪贴板。置于 report 转发 return 之后，故仅本地镜像选区收尾这条路生
+                    // 效（被转发的普通释放已在上面早退）；先复制、再由下面 mirror_*_sel_end 收尾
+                    // （非空不清）。
+                    if state.is_mirror_active()
+                        && state.remote_ws.mirror_active_reporting()
+                        && state.remote_ws.has_mirror_active_selection()
+                    {
+                        if let Some(text) = state.remote_ws.copy_mirror_active() {
+                            match state.clipboard.as_mut().map(|c| c.set_text(text.clone())) {
+                                Some(Ok(())) => state.show_copied_toast(&text),
+                                Some(Err(e)) => error!("写剪贴板失败: {e}"),
+                                None => log::warn!("剪贴板不可用，复制跳过"),
+                            }
+                        }
+                    }
                     // 镜像态拖选结束（空选区=仅点击则清掉）；多窗格 per-pane / 单窗格各一路。
                     if state.is_mirror_active() && state.remote_ws.mirror_pane_selecting() {
                         state.remote_ws.mirror_pane_sel_end();
@@ -6992,30 +7011,44 @@ impl ApplicationHandler<PtyWake> for App {
                     }
                 }
                 (MouseButton::Right, ElementState::Pressed) => {
-                    // 镜像态：鼠标上报开（Claude/codex 全屏，程序可能用右键弹自己的菜单）
-                    // → 右键按下转发给被控端，不走本地复制/粘贴（上报未开返 false，落到
-                    // 下面镜像右键复制/粘贴）。
+                    // 镜像态**有非空选区 → 右键优先本地复制**，抢在 report_mirror 转发之前
+                    // （对齐本地右键 7046：修 Claude 等全屏 TUI 里右键被鼠标上报吃掉、下面
+                    // 复制那条路根本走不到——「镜像里选中却复制不了」的直接成因）。仅命中镜像
+                    // 区时拦截（与下方粘贴同门控、与本地「右键须在终端区」对称）。写剪贴板成功
+                    // → 清选区 + 弹「已复制」toast；失败/不可用则保留选区便于重试。
+                    if state.is_mirror_active()
+                        && state.remote_ws.has_mirror_active_selection()
+                        && (state.mirror_pane_at_mouse().is_some()
+                            || state.mirror_cell_at_mouse().is_some())
+                    {
+                        if let Some(text) = state.remote_ws.copy_mirror_active() {
+                            match state.clipboard.as_mut().map(|c| c.set_text(text.clone())) {
+                                Some(Ok(())) => {
+                                    state.remote_ws.clear_mirror_active_selection();
+                                    state.show_copied_toast(&text);
+                                }
+                                Some(Err(e)) => error!("写剪贴板失败: {e}"),
+                                None => log::warn!("剪贴板不可用，复制跳过"),
+                            }
+                        }
+                        state.window.request_redraw();
+                        return;
+                    }
+                    // 无选区：鼠标上报开（Claude/codex 全屏，程序可能用右键弹自己的菜单）
+                    // → 右键按下转发给被控端，不走本地粘贴（上报未开返 false，落到下面
+                    // 镜像右键粘贴）。
                     if state.is_mirror_active()
                         && state.report_mirror_mouse_button(MouseButton::Right, true)
                     {
                         return;
                     }
-                    // M5.3 part4b 镜像右键：有选区→复制到本地剪贴板；无选区→粘贴转发给
-                    // 被控端（沿用本地终端右键惯例）。仅命中镜像区时拦截。
+                    // M5.3 part4b 镜像右键无选区（上报未开）→ 粘贴转发给被控端（沿用本地
+                    // 终端右键惯例）。仅命中镜像区时拦截。
                     if state.is_mirror_active()
                         && (state.mirror_pane_at_mouse().is_some()
                             || state.mirror_cell_at_mouse().is_some())
                     {
-                        if let Some(text) = state.remote_ws.copy_mirror_active() {
-                            // 仅写入成功才清选区——失败/剪贴板不可用时保留，便于重试。
-                            match state.clipboard.as_mut().map(|c| c.set_text(text)) {
-                                Some(Ok(())) => state.remote_ws.clear_mirror_active_selection(),
-                                Some(Err(e)) => error!("写剪贴板失败: {e}"),
-                                None => log::warn!("剪贴板不可用，复制跳过"),
-                            }
-                        } else if let Some(Ok(text)) =
-                            state.clipboard.as_mut().map(|c| c.get_text())
-                        {
+                        if let Some(Ok(text)) = state.clipboard.as_mut().map(|c| c.get_text()) {
                             state.remote_ws.send_paste(&text);
                         }
                         state.window.request_redraw();
