@@ -85,8 +85,89 @@ pub struct HistoryStore {
 
 /// 单会话内存条目上限。
 const MAX_ENTRIES: usize = 10_000;
-/// PSReadLine 种子导入上限（最近条目）。
+/// shell 历史种子导入上限（最近条目）。
 const SEED_LIMIT: usize = 5_000;
+
+/// 系统 shell 历史文件路径（首次启动种子来源）。Windows：PSReadLine
+/// `%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt`。
+/// 取不到返回 `None`。
+#[cfg(windows)]
+fn history_seed_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let mut p = PathBuf::from(appdata);
+    p.push("Microsoft");
+    p.push("Windows");
+    p.push("PowerShell");
+    p.push("PSReadLine");
+    p.push("ConsoleHost_history.txt");
+    Some(p)
+}
+
+/// unix：优先 `$HISTFILE`，否则试 `~/.zsh_history`、`~/.bash_history`（取存在
+/// 的第一个）。`$HISTFILE` 常未导出到进程环境，故通常落到后两者。
+#[cfg(not(windows))]
+fn history_seed_path() -> Option<PathBuf> {
+    if let Some(hf) = std::env::var_os("HISTFILE").filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(hf);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    for name in [".zsh_history", ".bash_history"] {
+        let p = PathBuf::from(&home).join(name);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 规整一条种子历史行。Windows（PSReadLine）为纯命令行，原样返回。
+#[cfg(windows)]
+fn normalize_seed_line(line: &str) -> String {
+    line.to_owned()
+}
+
+/// unix：zsh 扩展历史格式为 `": <ts>:<dur>;command"`，剥离元数据前缀取命令；
+/// bash 及 zsh 简单格式为纯命令行，原样返回。
+#[cfg(not(windows))]
+fn normalize_seed_line(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix(": ") {
+        if let Some((meta, cmd)) = rest.split_once(';') {
+            // meta 形如 "1609459200:0"：数字:数字才认作 zsh 扩展格式。
+            let is_zsh_meta = meta.split_once(':').is_some_and(|(ts, dur)| {
+                !ts.is_empty()
+                    && ts.bytes().all(|c| c.is_ascii_digit())
+                    && dur.bytes().all(|c| c.is_ascii_digit())
+            });
+            if is_zsh_meta {
+                return cmd.to_owned();
+            }
+        }
+    }
+    line.to_owned()
+}
+
+#[cfg(all(test, not(windows)))]
+mod seed_line_tests {
+    use super::normalize_seed_line;
+
+    #[test]
+    fn zsh_扩展格式剥离元数据前缀() {
+        assert_eq!(normalize_seed_line(": 1609459200:0;ls -la"), "ls -la");
+        assert_eq!(normalize_seed_line(": 1700000000:12;git status"), "git status");
+    }
+
+    #[test]
+    fn 纯命令行与非zsh前缀原样保留() {
+        assert_eq!(normalize_seed_line("ls -la"), "ls -la");
+        // ": " 起始但元数据非「数字:数字」不误剥。
+        assert_eq!(normalize_seed_line(": not:meta;x"), ": not:meta;x");
+        // 冒号不在行首前缀位置也不误伤。
+        assert_eq!(normalize_seed_line("echo : 1:2;still"), "echo : 1:2;still");
+    }
+}
 
 /// 当前 Unix 毫秒时间戳。
 fn now_ms() -> u64 {
@@ -123,8 +204,8 @@ impl HistoryStore {
         };
 
         if seed_needed {
-            // 首次：尝试 PSReadLine 种子导入。
-            store.import_psreadline_seed();
+            // 首次：尝试从系统 shell 历史导入种子（Windows PSReadLine / unix zsh/bash）。
+            store.import_shell_history_seed();
         } else {
             // 读取现有文件。
             store.load_from_file();
@@ -158,26 +239,16 @@ impl HistoryStore {
         self.entries = deduplicate(raw, MAX_ENTRIES);
     }
 
-    /// PSReadLine 种子导入（首次启动时调用）。
-    fn import_psreadline_seed(&mut self) {
-        let psrl_path = match std::env::var_os("APPDATA") {
-            Some(a) => {
-                let mut p = PathBuf::from(a);
-                p.push("Microsoft");
-                p.push("Windows");
-                p.push("PowerShell");
-                p.push("PSReadLine");
-                p.push("ConsoleHost_history.txt");
-                p
-            }
-            None => {
-                info!("历史种子导入跳过：APPDATA 未设置");
-                return;
-            }
+    /// 首次启动时从系统 shell 历史导入种子（Windows: PSReadLine；
+    /// unix: zsh/bash 历史）。找不到来源或文件不存在则静默跳过。
+    fn import_shell_history_seed(&mut self) {
+        let Some(seed_path) = history_seed_path() else {
+            info!("历史种子导入跳过：未找到可用的 shell 历史来源");
+            return;
         };
 
-        let Ok(file) = std::fs::File::open(&psrl_path) else {
-            info!("历史种子导入跳过：PSReadLine 历史文件不存在（{psrl_path:?}）");
+        let Ok(file) = std::fs::File::open(&seed_path) else {
+            info!("历史种子导入跳过：历史文件不存在（{seed_path:?}）");
             return;
         };
 
@@ -194,6 +265,7 @@ impl HistoryStore {
         let lines: Vec<String> = reader
             .lines()
             .map_while(Result::ok)
+            .map(|l| normalize_seed_line(&l))
             .map(|l| l.trim().to_owned())
             .filter(|l| !l.is_empty())
             .collect();
@@ -214,10 +286,7 @@ impl HistoryStore {
 
         let count = seed.len();
         self.entries = deduplicate(seed, MAX_ENTRIES);
-        info!(
-            "历史种子导入完成：{count} 条（来自 {}）",
-            psrl_path.display()
-        );
+        info!("历史种子导入完成：{count} 条（来自 {}）", seed_path.display());
     }
 
     /// 提交命令时立即追加（不含 exit_code/duration，稍后回填）。
