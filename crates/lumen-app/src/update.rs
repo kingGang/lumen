@@ -389,10 +389,13 @@ mod tests {
     fn 安装包落地路径_清洗tag() {
         let p = installer_dest("v0.2.0");
         assert!(p.to_string_lossy().contains("Lumen-Setup-v0.2.0.exe"));
-        // 含非法字符的 tag 被清洗。
+        // 含非法字符的 tag 被清洗——只断言文件名部分（清洗后）不含路径分隔符
+        // 与非法字符。不能断言整条路径：unix 上 temp_dir 的目录分隔符本就是
+        // `/`，会误判（跨平台移植前该测试只在 Windows 跑，故未暴露）。
         let p2 = installer_dest("v0.2/evil");
-        assert!(!p2.to_string_lossy().contains('/'));
-        assert!(p2.to_string_lossy().contains("Lumen-Setup-v0.2_evil.exe"));
+        let name2 = p2.file_name().expect("应有文件名").to_string_lossy();
+        assert!(!name2.contains('/'));
+        assert_eq!(name2, "Lumen-Setup-v0.2_evil.exe");
     }
 
     #[test]
