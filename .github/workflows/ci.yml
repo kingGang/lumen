@@ -45,7 +45,7 @@ jobs:
       # wgpu（Vulkan/GL loader）、winit（X11/Wayland/xkb）、arboard（X11 剪贴板）、
       # rfd（GTK3 同步文件对话框）在 Linux 上链接这些系统库；缺任一则 lumen
       # 二进制链接失败。
-      - name: 安装系统依赖（X11 / Wayland / GTK / xkb）
+      - name: 安装系统依赖（X11 / Wayland / GTK / xkb / 等宽字体）
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -53,7 +53,10 @@ jobs:
             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev \
-            pkg-config
+            pkg-config \
+            fonts-dejavu-core
+          # 渲染器需一个真实等宽字体（pick_mono_family 命中 DejaVu Sans Mono）；
+          # headless runner 默认可能无等宽字体，否则字体测量测试会挂。
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 测试（含全 crate 构建）
