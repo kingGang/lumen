@@ -45,7 +45,7 @@ mod imp {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
-        BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+        BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, RGBQUAD,
     };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -154,7 +154,7 @@ mod imp {
         if unsafe { GetIconInfo(hicon, &mut ii) } == 0 {
             return None;
         }
-        let out = color_bitmap_to_rgba(ii.hbmColor);
+        let out = color_bitmap_to_rgba(ii.hbmColor, ii.hbmMask);
         // SAFETY: hbmColor/hbmMask 是 GetIconInfo 产出的 HBITMAP，各删一次。
         unsafe {
             if !ii.hbmColor.is_null() {
@@ -167,7 +167,7 @@ mod imp {
         out
     }
 
-    fn color_bitmap_to_rgba(hbm: HBITMAP) -> Option<super::IconRgba> {
+    fn color_bitmap_to_rgba(hbm: HBITMAP, hbm_mask: HBITMAP) -> Option<super::IconRgba> {
         if hbm.is_null() {
             return None;
         }
@@ -223,12 +223,24 @@ mod imp {
         if lines == 0 {
             return None;
         }
-        // BGRA → RGBA；alpha 全 0（无 alpha 通道的旧图标）则视为不透明。
+        // BGRA → RGBA。
         let any_alpha = buf.chunks_exact(4).any(|p| p[3] != 0);
         for px in buf.chunks_exact_mut(4) {
             px.swap(0, 2);
-            if !any_alpha {
-                px[3] = 255;
+        }
+        // alpha 全 0 = 无 alpha 通道的旧式图标：透明度不在彩色位图里、而在配套的
+        // 1-bit AND 掩码里。早年实现丢掉掩码、整张强制不透明——白背景的图标就被
+        // 涂成不透明白方块（=用户看到的「白框」）。改用掩码逐像素恢复透明度；掩码
+        // 读取失败才回退「整张不透明」（老行为，至少不崩、不透明总比丢图好）。
+        if !any_alpha {
+            if let Some(alpha) = mask_to_alpha(hbm_mask, w, h) {
+                for (px, a) in buf.chunks_exact_mut(4).zip(alpha) {
+                    px[3] = a;
+                }
+            } else {
+                for px in buf.chunks_exact_mut(4) {
+                    px[3] = 255;
+                }
             }
         }
         Some(super::IconRgba {
@@ -236,6 +248,66 @@ mod imp {
             height: h,
             rgba: buf,
         })
+    }
+
+    /// 读 1-bit AND 掩码位图 → 每像素 alpha（掩码 bit=0 不透明→255，bit=1
+    /// 透明→0）。彩色位图无 alpha 通道（旧式图标）时用它恢复透明度。任何一步
+    /// 失败返回 `None`（调用方回退「整张不透明」）。
+    fn mask_to_alpha(hbm_mask: HBITMAP, w: u32, h: u32) -> Option<Vec<u8>> {
+        if hbm_mask.is_null() {
+            return None;
+        }
+        // 1bpp DIB 每行按 4 字节（DWORD）对齐。
+        let stride = (w as usize).div_ceil(32) * 4;
+        let mut buf = vec![0u8; stride * h as usize];
+        // 1bpp BITMAPINFO 需 2 项调色板；windows_sys 的 `BITMAPINFO` 只含 1 项，
+        // 手动拼一个 header + 2×RGBQUAD 的 POD 结构喂给 GetDIBits。
+        #[repr(C)]
+        struct BitmapInfo1 {
+            header: BITMAPINFOHEADER,
+            colors: [RGBQUAD; 2],
+        }
+        // SAFETY: 全零 POD 合法。
+        let mut bi: BitmapInfo1 = unsafe { std::mem::zeroed() };
+        bi.header.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.header.biWidth = w as i32;
+        bi.header.biHeight = -(h as i32); // top-down
+        bi.header.biPlanes = 1;
+        bi.header.biBitCount = 1;
+        bi.header.biCompression = 0; // BI_RGB
+        // SAFETY: CreateCompatibleDC(null)=内存 DC，失败返回 null。
+        let dc = unsafe { CreateCompatibleDC(ptr::null_mut()) };
+        if dc.is_null() {
+            return None;
+        }
+        // SAFETY: dc 有效；hbm_mask 未选入该 DC；buf 容量=stride*h 与 bi（1bpp、
+        // top-down）描述一致；bi 指向 header + 2 调色板，满足 1bpp GetDIBits 要求。
+        let lines = unsafe {
+            GetDIBits(
+                dc,
+                hbm_mask,
+                0,
+                h,
+                buf.as_mut_ptr().cast(),
+                (&mut bi as *mut BitmapInfo1).cast(),
+                DIB_RGB_COLORS,
+            )
+        };
+        // SAFETY: dc 由 CreateCompatibleDC 创建，删除一次。
+        unsafe { DeleteDC(dc) };
+        if lines == 0 {
+            return None;
+        }
+        // AND 掩码：bit=1 透明、bit=0 不透明；每字节高位对应最左像素。
+        let mut alpha = vec![0u8; (w * h) as usize];
+        for y in 0..h as usize {
+            let row = &buf[y * stride..];
+            for x in 0..w as usize {
+                let bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
+                alpha[y * w as usize + x] = if bit == 0 { 255 } else { 0 };
+            }
+        }
+        Some(alpha)
     }
 }
 

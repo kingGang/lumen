@@ -718,6 +718,25 @@ pub struct TabState {
     pub unseen: bool,
     /// tab 内窗格数（>1 时控制端标「N 格」）。
     pub pane_count: u32,
+    /// 焦点窗格前台程序 exe 图标（top-down RGBA8 位图）。被控端抽取上线、控制端
+    /// 贴图；`None` = 无图标 / 抽取失败（控制端回退自绘终端字形）。旧端不带此字段
+    /// 按 `None` 解析（`#[serde(default)]` 后向兼容；服务端盲转 JSON、不受影响）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<IconBitmap>,
+}
+
+/// part3d 会话图标位图（前台程序 exe 图标）：被控端 `proc_icon` 抽取的平台无关
+/// top-down RGBA8（`rgba.len() == w*h*4`），控制端解码贴成 egui 纹理。`TabState::icon`
+/// 的载体；`rgba` 走 base64 上线（同 [`PaneSnapshot::snapshot`]，免 JSON 数字数组 4x 膨胀）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IconBitmap {
+    /// 宽（像素）。
+    pub w: u16,
+    /// 高（像素）。
+    pub h: u16,
+    /// top-down RGBA8 像素（base64，见 [`b64`]）。
+    #[serde(with = "b64")]
+    pub rgba: Vec<u8>,
 }
 
 /// part3d 窗格(pane)初始快照（[`SubscriptionStarted`](RemoteFrame::SubscriptionStarted) 元素）。
@@ -1428,6 +1447,12 @@ mod tests {
                         busy: false,
                         unseen: true,
                         pane_count: 1,
+                        // 带图标：验证 Some(IconBitmap) 经 base64 往返。
+                        icon: Some(IconBitmap {
+                            w: 2,
+                            h: 2,
+                            rgba: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+                        }),
                     },
                     TabState {
                         id: 3,
@@ -1436,6 +1461,7 @@ mod tests {
                         busy: true,
                         unseen: false,
                         pane_count: 4,
+                        icon: None,
                     },
                 ],
             },
@@ -1447,6 +1473,7 @@ mod tests {
                     busy: false,
                     unseen: false,
                     pane_count: 1,
+                    icon: None,
                 },
             },
             RemoteFrame::TabClosed { tab_id: 3 },
@@ -1458,6 +1485,7 @@ mod tests {
                     busy: true,
                     unseen: false,
                     pane_count: 2,
+                    icon: None,
                 },
             },
             RemoteFrame::SubscribeSession { tab_id: 0 },
@@ -1593,6 +1621,12 @@ mod tests {
                 busy: i % 2 == 0,
                 unseen: i % 3 == 0,
                 pane_count: (i % 6) + 1,
+                // 满载每会话都带 32×32 图标，验证「带图标满载」仍远小于 4 MiB 单帧上限。
+                icon: Some(IconBitmap {
+                    w: 32,
+                    h: 32,
+                    rgba: vec![0u8; 32 * 32 * 4],
+                }),
             })
             .collect();
         let frame = RemoteFrame::TabListSnapshot { tabs };

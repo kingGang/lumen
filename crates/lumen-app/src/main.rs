@@ -514,6 +514,27 @@ struct HoverLink {
     target: links::LinkTarget,
 }
 
+/// F7② 会话图标纹理缓存条目：纹理 + 首抽时刻 + 是否已延迟重抽（自愈用）。
+struct SessionIcon {
+    /// 抽取到的纹理；`None` = 抽取失败（回退自绘字形）。
+    tex: Option<egui::TextureHandle>,
+    /// 首次抽取时刻（延迟重抽计时基准）。
+    born: Instant,
+    /// 是否已做过「进程稳定后重抽一次」（做过即定型、不再重抽）。
+    refreshed: bool,
+}
+
+/// F7②-remote 图标位图内容 hash（控制端远程图标纹理缓存键；同图标多 tab
+/// 共享一张纹理）。`DefaultHasher` 固定 key、跨调用确定，作缓存键足够。
+fn remote_icon_hash(bm: &lumen_protocol::remote::IconBitmap) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bm.w.hash(&mut h);
+    bm.h.hash(&mut h);
+    bm.rgba.hash(&mut h);
+    h.finish()
+}
+
 /// 终端区滚动条的逐窗格几何（仅 scrollback 非空、内容区够高的可见
 /// 窗格各一条）。run_ui 闭包内据此绘制轨道/滑块并处理拖动，闭包后把
 /// 目标 `display_offset` 落到对应 grid。几何取自上一帧 `pane_rects_px`
@@ -710,9 +731,18 @@ struct AppState {
     /// F7② 会话图标——每 tab 当前前台运行程序的 exe 路径（节流轮询写入，
     /// 见 [`Self::probe_session_icons`]）；值 None = 查不到。
     session_icon_exe: HashMap<TabId, Option<std::path::PathBuf>>,
-    /// F7② 会话图标纹理缓存（键 = exe 路径）：值 None = 抽取失败（缓存
-    /// 失败避免每帧重试，回退自绘字形）。TextureHandle 在此存活即保活纹理。
-    session_icon_tex: HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    /// F7② 会话图标纹理缓存（键 = exe 路径）。首抽可能撞上前台进程刚 spawn、
+    /// 系统图标未就绪的窗口而抽到通用占位图标，故隔 [`ICON_REFRESH_DELAY`] 延迟
+    /// 重抽一次覆盖（[`SessionIcon`] 的 `born`/`refreshed`），治「抽坏被永久冻结、
+    /// 不自愈」。`tex: None` = 抽取失败，回退自绘字形。
+    session_icon_tex: HashMap<std::path::PathBuf, SessionIcon>,
+    /// F7②-remote 被控端会话图标位图缓存（键 = exe 路径）：抽成 top-down RGBA8
+    /// 上线给控制端（`Arc` 免每帧 clone bytes）；值 None = 抽取失败。
+    session_icon_rgba:
+        HashMap<std::path::PathBuf, Option<std::sync::Arc<lumen_protocol::remote::IconBitmap>>>,
+    /// F7②-remote 控制端远程图标纹理缓存（键 = 图标位图内容 hash，同图标多 tab
+    /// 共享一张纹理）：把被控端传来的 RGBA 贴成本地 egui 纹理。
+    remote_icon_tex: HashMap<u64, egui::TextureHandle>,
     /// F7② 前台进程轮询的上次时刻（节流；进程快照较重，不必每帧查）。
     last_icon_probe: Option<Instant>,
     /// 激活 tab 各窗格的矩形（会话 id, 物理像素 x/y/w/h），来自最近
@@ -1226,7 +1256,13 @@ impl AppState {
                 }
             }
             // part3d：推会话(tab)列表 + 概览状态（K6 去重，变化才发；busy 是布尔判定不含
-            // spinner 字形、不刷链路）。
+            // spinner 字形、不刷链路）。F7②-remote：仅被控端采集会话图标位图上线（控制端
+            // 不需要；进程快照较重，非被控端不做）。图标随 tab_states 一起 K6 去重——前台
+            // exe 稳定则图标字节稳定，不额外刷链路。
+            let controlled = self.remote_ws.is_controlled();
+            if controlled {
+                self.refresh_remote_tab_icons();
+            }
             let tab_states: Vec<lumen_protocol::remote::TabState> = self
                 .tabs
                 .iter()
@@ -1237,6 +1273,11 @@ impl AppState {
                     busy: t.is_busy(),
                     unseen: t.has_unseen(),
                     pane_count: t.panes.len() as u32,
+                    icon: if controlled {
+                        self.remote_tab_icon(t.id)
+                    } else {
+                        None
+                    },
                 })
                 .collect();
             self.remote_ws.push_tab_list(tab_states);
@@ -2599,12 +2640,26 @@ impl AppState {
         let Some((pane_idx, _id, col, row)) = self.viewport_cell_under_mouse() else {
             return false;
         };
-        let pane = &self.tabs[self.active_tab].panes[pane_idx];
-        let proto = pane.term.mouse_protocol();
+        let proto = self.tabs[self.active_tab].panes[pane_idx]
+            .term
+            .mouse_protocol();
         if !proto.is_on() {
             return false;
         }
-        let enc = pane.term.mouse_encoding();
+        // 上报开启（Claude/vim/less 等全屏程序）：Ctrl+左键落在链接上 = 本地开链接
+        // 逃生通道（对齐普通 shell 的 Ctrl+单击开链接）。命中链接的 Ctrl+左键让位
+        // 本地、不上报（held 不置位，释放因 held==false 自然配对走本地），使释放时
+        // 走到 F10「Ctrl+Click 开链接」；否则这枚点击被上报吞掉，全屏程序里链接永
+        // 远点不开。非链接区的 Ctrl+左键仍照常上报，不破坏程序自身 Ctrl+Click 语义。
+        if button == MouseButton::Left
+            && self.modifiers.control_key()
+            && self.link_at_mouse().is_some()
+        {
+            return false;
+        }
+        let enc = self.tabs[self.active_tab].panes[pane_idx]
+            .term
+            .mouse_encoding();
         let ev = MouseEvent {
             kind: MouseEventKind::Press(btn),
             col,
@@ -2995,6 +3050,17 @@ impl AppState {
         if !proto.is_on() {
             return false; // 上报未开 → 走本地镜像拖选
         }
+        // F10：Ctrl+左键落在 URL 链接上 = 本地开链接逃生（对齐本地
+        // report_mouse_button）。命中链接的 Ctrl+左键不转发被控端、held 不置位，
+        // 释放因 held==false 自然配对走本地 Ctrl+Click 开链接；否则这枚点击被上报
+        // 吞掉，镜像里 Claude 等全屏程序的链接永远点不开。非链接区 Ctrl+左键仍照常
+        // 转发，不破坏被控端程序自身语义。
+        if button == MouseButton::Left
+            && self.modifiers.control_key()
+            && self.mirror_link_at_mouse().is_some()
+        {
+            return false;
+        }
         let ev = MouseEvent {
             kind: MouseEventKind::Press(btn),
             col,
@@ -3083,10 +3149,13 @@ impl AppState {
         }
         let (pane_idx, pane_id, abs, col) = self.cell_under_mouse()?;
         let pane = &self.tabs[self.active_tab].panes[pane_idx];
-        // 备用屏幕（vim/less 等）下不识别链接：坐标语义与块/历史不一致。
-        if pane.term.is_alt_screen() {
-            return None;
-        }
+        // 备用屏幕（vim/less/Claude 等全屏程序）下也识别链接：alt 屏用独立 Grid
+        // （`set_alt_screen` 建 `scrollback_limit=0` 的新网格），故 scrollback 恒空、
+        // display_offset 夹在 0 滚不动 → `view_top_abs_line()==0`、`abs==row`，
+        // 与 `line_by_abs(row)==screen.get(row)` 坐标自洽，取行安全。放开后 Claude
+        // CLI 等上报态全屏程序里链接可 hover 高亮 + Ctrl+单击打开（配合
+        // `report_mouse_button` 的 Ctrl+链接让位）。注：块选中另有 `is_alt_screen`
+        // 守卫（释放分支）不受影响——alt 屏无 shell 命令块概念。
         // 1) OSC 8 显式超链接（区段与 URI 由终端侧直接给出）。
         if let Some((sc, ec, uri)) = pane.term.hyperlink_span_at(abs, col) {
             return Some(HoverLink {
@@ -3148,6 +3217,113 @@ impl AppState {
         }
         self.hover_probe_cell = probe;
         let new_link = self.link_at_mouse();
+        let changed = match (&new_link, &self.hovered_link) {
+            (Some(a), Some(b)) => {
+                a.pane_id != b.pane_id
+                    || a.line != b.line
+                    || a.start_col != b.start_col
+                    || a.end_col != b.end_col
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        self.hovered_link = new_link;
+        if changed {
+            self.window.request_redraw();
+        }
+    }
+
+    /// 镜像态求鼠标命中的可点击链接（F10·**只放 URL**）：镜像显示的是**远端**
+    /// 机器，而 [`links::open`] 在**本地**打开——URL 交本地浏览器语义正确，但
+    /// 「本地文件路径」在镜像里其实是远端文件、本地会开错，故这里**只识别 URL**
+    /// （OSC 8 超链接 + 隐式 http/https），丢弃文件路径候选、不碰 cwd / 文件系统。
+    /// 回看态（渲染 hist_term）坐标系与 live 窗格不一致，MVP 不识别。
+    fn mirror_link_at_mouse(&self) -> Option<HoverLink> {
+        // 回看态渲染的是 hist_term scratch，坐标系与 live 窗格 term 不一致，且
+        // hist 快照经 serialize_row_vt 不带 OSC 8——只在 live 跟随态识别。
+        if self.remote_ws.mirror_pane_in_hist() {
+            return None;
+        }
+        let (sid, row, col) = self.mirror_pane_cell_at_mouse()?;
+        let mp = self
+            .remote_ws
+            .mirror_panes()
+            .iter()
+            .find(|p| p.session_id == sid)?;
+        // 视口行 → 绝对行（镜像 term 有 scrollback，view_top 非 0；与本地
+        // cell_under_mouse 同法）。
+        let abs = mp.term.grid().view_top_abs_line() + row as u64;
+        // 1) OSC 8 显式超链接（订阅后写入的内容才带 hyperlink_id；初始快照 /
+        //    历史行经 serialize_row_vt 不含 OSC 8，靠下面隐式 URL 兜底）。
+        if let Some((sc, ec, uri)) = mp.term.hyperlink_span_at(abs, col) {
+            return Some(HoverLink {
+                pane_id: sid,
+                line: abs,
+                start_col: sc,
+                end_col: ec,
+                target: links::LinkTarget::Url(uri),
+            });
+        }
+        // 2) 隐式 http/https：扫行文本（跳过宽字符占位格，建显示列↔字符下标
+        //    映射，与本地 link_at_mouse 同构），**只接受 RawLink::Url**。
+        let grid_row = mp.term.grid().line_by_abs(abs)?;
+        let cells = grid_row.cells();
+        let mut cols: Vec<usize> = Vec::new();
+        let mut text: Vec<char> = Vec::new();
+        for (c, cell) in cells.iter().enumerate() {
+            if cell.flags.contains(lumen_term::CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            cols.push(c);
+            text.push(cell.ch);
+        }
+        let char_idx = cols
+            .iter()
+            .position(|&dc| dc == col)
+            .or_else(|| cols.iter().rposition(|&dc| dc <= col))?;
+        let (cs, ce, raw) = links::detect_link(&text, char_idx)?;
+        // 只放 URL：文件路径候选丢弃（远端文件本地打不开 / 会开错）。
+        let links::RawLink::Url(u) = raw else {
+            return None;
+        };
+        // 字符下标区段 → 显示列区段（高亮用，与 link_at_mouse 同法）。
+        let start_col = *cols.get(cs)?;
+        let end_col = cols.get(ce).copied().unwrap_or_else(|| {
+            let last = ce.saturating_sub(1).min(cols.len().saturating_sub(1));
+            let last_col = cols.get(last).copied().unwrap_or(start_col);
+            let wide = cells
+                .get(last_col)
+                .is_some_and(|c| c.flags.contains(lumen_term::CellFlags::WIDE));
+            last_col + if wide { 2 } else { 1 }
+        });
+        Some(HoverLink {
+            pane_id: sid,
+            line: abs,
+            start_col,
+            end_col,
+            target: links::LinkTarget::Url(u),
+        })
+    }
+
+    /// 镜像态鼠标移动后更新链接 hover（F10）：与 [`Self::update_link_hover`]
+    /// 对称，但探测**镜像**窗格、只认 URL。写同一 `hovered_link` /
+    /// `hover_probe_cell` 字段——手型光标、提示浮层、渲染下划线全复用本地那套，
+    /// 无需新增。
+    fn update_mirror_link_hover(&mut self) {
+        let probe = self.mirror_pane_cell_at_mouse().and_then(|(sid, row, col)| {
+            let abs = self
+                .remote_ws
+                .mirror_panes()
+                .iter()
+                .find(|p| p.session_id == sid)
+                .map(|mp| mp.term.grid().view_top_abs_line() + row as u64)?;
+            Some((sid, abs, col))
+        });
+        if probe == self.hover_probe_cell {
+            return;
+        }
+        self.hover_probe_cell = probe;
+        let new_link = self.mirror_link_at_mouse();
         let changed = match (&new_link, &self.hovered_link) {
             (Some(a), Some(b)) => {
                 a.pane_id != b.pane_id
@@ -4060,30 +4236,56 @@ impl AppState {
         self.session_icon_exe.retain(|k, _| live.contains(k));
     }
 
-    /// F7② 把 `session_icon_exe` 里出现、但纹理缓存尚无的 exe 图标懒加载
-    /// 为 egui 纹理（抽取失败缓存 None，避免每帧重试）。
-    fn ensure_session_icon_textures(&mut self) {
+    /// F7② 把 `session_icon_exe` 里出现的 exe 图标懒加载为 egui 纹理。首抽后隔
+    /// [`ICON_REFRESH_DELAY`] 重抽一次覆盖（治首抽踩到进程刚起时的系统占位图标、
+    /// 被永久冻结不自愈）；抽取失败缓存 `tex: None`、回退自绘字形。
+    fn ensure_session_icon_textures(&mut self, now: Instant) {
+        // 侧栏隐藏时不显示 tab 图标、无需建本地纹理（被控端侧栏常隐藏——它靠
+        // session_icon_rgba 位图上线给控制端，不依赖此本地纹理，避免白建永不显示
+        // 的 GPU 纹理）。与 probe_session_icons 的 gate 一致。
+        if !self.settings.layout.sidebar_visible {
+            return;
+        }
+        // 需抽取：① 未缓存（首抽）② 已缓存但未重抽且过了延迟窗口（进程此时已
+        //   稳定，重抽覆盖首抽可能踩到的占位图标）。
         let needed: Vec<std::path::PathBuf> = self
             .session_icon_exe
             .values()
             .flatten()
-            .filter(|p| !self.session_icon_tex.contains_key(*p))
+            .filter(|p| match self.session_icon_tex.get(*p) {
+                None => true,
+                Some(e) => !e.refreshed && now.duration_since(e.born) >= ICON_REFRESH_DELAY,
+            })
             .cloned()
             .collect();
         for path in needed {
-            let tex = proc_icon::load_icon_rgba(&path).map(|ic| {
-                let img = egui::ColorImage::from_rgba_unmultiplied(
-                    [ic.width as usize, ic.height as usize],
-                    &ic.rgba,
-                );
-                self.egui_ctx.load_texture(
-                    format!("sess-icon:{}", path.display()),
-                    img,
-                    egui::TextureOptions::LINEAR,
-                )
-            });
-            self.session_icon_tex.insert(path, tex);
+            let tex = self.load_session_icon_texture(&path);
+            // 已存在=这是延迟重抽（定型 refreshed）；否则首抽（留一次重抽机会）。
+            let refreshed = self.session_icon_tex.contains_key(&path);
+            self.session_icon_tex.insert(
+                path,
+                SessionIcon {
+                    tex,
+                    born: now,
+                    refreshed,
+                },
+            );
         }
+    }
+
+    /// F7② 抽取单个 exe 的关联图标并上传为 egui 纹理（失败 None）。
+    fn load_session_icon_texture(&self, path: &std::path::Path) -> Option<egui::TextureHandle> {
+        proc_icon::load_icon_rgba(path).map(|ic| {
+            let img = egui::ColorImage::from_rgba_unmultiplied(
+                [ic.width as usize, ic.height as usize],
+                &ic.rgba,
+            );
+            self.egui_ctx.load_texture(
+                format!("sess-icon:{}", path.display()),
+                img,
+                egui::TextureOptions::LINEAR,
+            )
+        })
     }
 
     /// F7② 取某 tab 当前应显示的会话图标纹理（前台程序 exe 图标）；
@@ -4093,8 +4295,104 @@ impl AppState {
             .get(&tab_id)
             .and_then(|o| o.as_ref())
             .and_then(|p| self.session_icon_tex.get(p))
-            .and_then(|o| o.as_ref())
+            .and_then(|e| e.tex.as_ref())
             .map(egui::TextureHandle::id)
+    }
+
+    /// F7②-remote 被控端：为上线刷新前台 exe（不受本地侧栏 gate——被控端侧栏常
+    /// 隐藏）+ 抽会话图标位图缓存（`session_icon_rgba`）。probe 进程快照重、按
+    /// [`ICON_PROBE_INTERVAL`] 节流；位图只对新出现的 exe 抽（稳定后无操作）。
+    fn refresh_remote_tab_icons(&mut self) {
+        let now = Instant::now();
+        // 到节流点才 probe 前台 exe（复用 last_icon_probe；被控端侧栏隐藏时本地
+        // probe_session_icons 直接 return，不与此争节流）。
+        if self
+            .last_icon_probe
+            .is_none_or(|t| now.duration_since(t) >= ICON_PROBE_INTERVAL)
+        {
+            self.last_icon_probe = Some(now);
+            let probed: Vec<(TabId, Option<std::path::PathBuf>)> = self
+                .tabs
+                .iter()
+                .map(|t| {
+                    let exe = t
+                        .focused_pane()
+                        .pty
+                        .shell_pid()
+                        .and_then(proc_icon::foreground_exe);
+                    (t.id, exe)
+                })
+                .collect();
+            for (id, exe) in probed {
+                self.session_icon_exe.insert(id, exe);
+            }
+            let live: std::collections::HashSet<TabId> =
+                self.tabs.iter().map(|t| t.id).collect();
+            self.session_icon_exe.retain(|k, _| live.contains(k));
+        }
+        // 抽新出现 exe 的图标位图（top-down RGBA8 上线）；已缓存的跳过（廉价）。
+        let needed: Vec<std::path::PathBuf> = self
+            .session_icon_exe
+            .values()
+            .flatten()
+            .filter(|p| !self.session_icon_rgba.contains_key(*p))
+            .cloned()
+            .collect();
+        for path in needed {
+            let bm = proc_icon::load_icon_rgba(&path).map(|ic| {
+                std::sync::Arc::new(lumen_protocol::remote::IconBitmap {
+                    w: ic.width as u16,
+                    h: ic.height as u16,
+                    rgba: ic.rgba,
+                })
+            });
+            self.session_icon_rgba.insert(path, bm);
+        }
+    }
+
+    /// F7②-remote 被控端：取某 tab 焦点前台程序图标位图（上线用），无则 None。
+    fn remote_tab_icon(&self, tab_id: TabId) -> Option<lumen_protocol::remote::IconBitmap> {
+        self.session_icon_exe
+            .get(&tab_id)
+            .and_then(|o| o.as_ref())
+            .and_then(|p| self.session_icon_rgba.get(p))
+            .and_then(|o| o.as_ref())
+            .map(|arc| (**arc).clone())
+    }
+
+    /// F7②-remote 控制端：把远程 tab 的图标位图 ensure 成本地 egui 纹理（内容
+    /// 寻址、同图标多 tab 共享），并清掉不再被引用的纹理（防累积泄漏）。
+    fn ensure_remote_icon_textures(&mut self) {
+        // 先收集（结束对 remote_ws 的借用），再建纹理（借 egui_ctx + 写缓存）。
+        let icons: Vec<(u64, lumen_protocol::remote::IconBitmap)> = self
+            .remote_ws
+            .remote_tabs()
+            .iter()
+            .filter_map(|t| t.icon.as_ref().map(|bm| (remote_icon_hash(bm), bm.clone())))
+            .collect();
+        let live: std::collections::HashSet<u64> = icons.iter().map(|(k, _)| *k).collect();
+        for (key, bm) in icons {
+            if self.remote_icon_tex.contains_key(&key) {
+                continue;
+            }
+            // 尺寸防御（对端字节不可信）：① 长度自洽挡 from_rgba_unmultiplied 的
+            //   length-mismatch panic；② w/h 上界挡畸形超大尺寸（如 w=65535 长度仍
+            //   自洽、却超 GPU max_texture_dimension → wgpu 上传报错/掉设备），对齐
+            //   本地 proc_icon 的 512 上界。畸形则跳过（不建纹理 → 取纹理落 None →
+            //   回退自绘字形，不 panic）。
+            let (w, h) = (bm.w as usize, bm.h as usize);
+            if w == 0 || h == 0 || w > 512 || h > 512 || bm.rgba.len() != w * h * 4 {
+                continue;
+            }
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &bm.rgba);
+            let tex = self.egui_ctx.load_texture(
+                format!("remote-icon:{key:016x}"),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            self.remote_icon_tex.insert(key, tex);
+        }
+        self.remote_icon_tex.retain(|k, _| live.contains(k));
     }
 
     /// 构造当前 tab 列表的持久化快照（F4/F5 嵌套结构：每 tab 的
@@ -5154,6 +5452,8 @@ impl App {
             pending_tex_free: Vec::new(),
             session_icon_exe: HashMap::new(),
             session_icon_tex: HashMap::new(),
+            session_icon_rgba: HashMap::new(),
+            remote_icon_tex: HashMap::new(),
             last_icon_probe: None,
             pane_rects_px: Vec::new(),
             pending_resize_dir: None,
@@ -5308,6 +5608,11 @@ const UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// F7② 会话前台进程轮询间隔：进程快照较重，限频到 ~0.8s（命令起止的
 /// 图标切换感知足够灵敏，开销可忽略）。
 const ICON_PROBE_INTERVAL: Duration = Duration::from_millis(800);
+
+/// F7② 会话图标首抽后延迟重抽一次的间隔：首抽可能撞上前台进程刚 spawn、系统
+/// 图标未就绪而抽到通用占位图标；隔此时间进程已稳定，重抽覆盖（> [`ICON_PROBE_INTERVAL`]，
+/// 确保跨过至少一轮 probe）。
+const ICON_REFRESH_DELAY: Duration = Duration::from_secs(3);
 
 impl ApplicationHandler<PtyWake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -6659,7 +6964,11 @@ impl ApplicationHandler<PtyWake> for App {
                 {
                     busy = busy || state.footer_dragging;
                 }
-                if !busy {
+                if state.is_mirror_active() {
+                    // 镜像态：探测**镜像**窗格链接（只 URL），写同一 hover 字段。
+                    // 本地 update_link_hover 只看本地窗格，镜像态调它会误清 hover。
+                    state.update_mirror_link_hover();
+                } else if !busy {
                     state.update_link_hover();
                 }
             }
@@ -6914,6 +7223,26 @@ impl ApplicationHandler<PtyWake> for App {
                         && state.report_mirror_mouse_button(MouseButton::Left, false)
                     {
                         return;
+                    }
+                    // F10：镜像态 Ctrl+Click 落在 URL 链接上 → 本地浏览器打开（**只放
+                    // URL**，见 mirror_link_at_mouse）。Ctrl 让位后释放落到这里
+                    // （report_mirror_mouse_button 对未 held 键返 false）。先于
+                    // copy-on-select / sel_end：命中即开、并清掉起手的空拖选。
+                    // `!has_mirror_active_selection()`：只在空选区（未拖动）时开，与本地
+                    // `if selection.is_empty()` 对称——Ctrl+拖出一段非空选区不误开链接。
+                    if state.is_mirror_active()
+                        && state.modifiers.control_key()
+                        && !state.remote_ws.has_mirror_active_selection()
+                    {
+                        if let Some(link) = state.mirror_link_at_mouse() {
+                            log::info!("F10：镜像 Ctrl+Click 打开链接 {:?}", link.target);
+                            links::open(&link.target);
+                            if state.remote_ws.mirror_pane_selecting() {
+                                state.remote_ws.mirror_pane_sel_end();
+                            }
+                            state.window.request_redraw();
+                            return;
+                        }
                     }
                     // 镜像 copy-on-select（**仅焦点镜像窗格开鼠标上报时**=全屏 TUI 如 Claude）：
                     // 上报态下普通拖被转发、选区只能靠 Shift 逃生拖出，松手即自动复制到本地剪贴板，
@@ -7497,8 +7826,14 @@ impl ApplicationHandler<PtyWake> for App {
 
                 // F7② 会话图标：节流轮询各 tab 前台运行程序 → 懒加载其 exe
                 // 图标纹理（侧栏隐藏时 probe 内部直接跳过，零开销）。
-                state.probe_session_icons(Instant::now());
-                state.ensure_session_icon_textures();
+                let icon_now = Instant::now();
+                state.probe_session_icons(icon_now);
+                state.ensure_session_icon_textures(icon_now);
+                // 控制端镜像视图：把被控端传来的远程会话图标位图 ensure 成本地纹理
+                // （内容寻址缓存；下面构造远程 TabItem 时按 hash 取纹理）。
+                if state.is_mirror_active() {
+                    state.ensure_remote_icon_textures();
+                }
                 // part3d（K3）：远程视图 + 控制中 → 会话栏整组替换为被控端的远程会话列表
                 // （active = 当前订阅会话；点击切换 = 订阅，由下方 activate 分流）。否则画本地
                 // tab 列表（原 F7② 两行条目：名称行 + 路径行 + 前台程序 exe 图标）。
@@ -7515,8 +7850,13 @@ impl ApplicationHandler<PtyWake> for App {
                             active: Some(t.id) == sub,
                             unseen: t.unseen,
                             pane_count: t.pane_count as usize,
-                            // 远程会话图标不上线（egui 纹理不可序列化），回退自绘终端字形。
-                            icon: None,
+                            // F7②-remote：被控端传来的前台程序图标位图 → 本地纹理
+                            // （ensure_remote_icon_textures 已按内容 hash 建好）；无则回退字形。
+                            icon: t
+                                .icon
+                                .as_ref()
+                                .and_then(|bm| state.remote_icon_tex.get(&remote_icon_hash(bm)))
+                                .map(egui::TextureHandle::id),
                             busy: t.busy,
                         })
                         .collect()
@@ -9167,6 +9507,13 @@ impl ApplicationHandler<PtyWake> for App {
                     // part4b：切换视图即清镜像选区/拖选态——否则远程→本地→远程后会复制
                     // 陈旧选区、或（左键仍按住时切换）回来后产生幻影拖选。
                     state.remote_ws.clear_mirror_selection();
+                    // F10：切视图同时清链接 hover——本地窗格 id 与镜像 session_id 来自
+                    // 两台机器、各自从 0 自增，撞号是常态；本地/镜像两条渲染循环各按自己
+                    // 的 id 过滤同一 hovered_link，切态后若鼠标不动，陈旧 hover 会被另一
+                    // 态按撞号命中、误画一条下划线（直到下次 CursorMoved 重探才自愈）。
+                    // 切态即清、连带 probe（重入原格不会因 probe 相等跳过重探）。
+                    state.hovered_link = None;
+                    state.hover_probe_cell = None;
                     // part4c：切视图复位焦点窗格 preedit（仿 activate()）——否则进镜像态前
                     // 本地打了一半的中文组合串，退出镜像态后会残留在 footer/composer。
                     #[cfg(feature = "input-editor")]
@@ -10044,6 +10391,19 @@ impl ApplicationHandler<PtyWake> for App {
                         };
                         // per-pane 选区高亮（part4b 多窗格；Selection 为 Copy）。
                         let sel_i = state.remote_ws.mirror_panes()[i].selection;
+                        // F10 链接 hover 下划线：回看态（in_hist_here）坐标系不一致不画；
+                        // 否则仅给命中窗格（pane_id==该镜像窗格 session_id）传区段。与
+                        // 本地渲染循环同法，复用同一条 renderer link_hover 路径。
+                        let link_hover_i = if in_hist_here {
+                            None
+                        } else {
+                            let sid_i = state.remote_ws.mirror_panes()[i].session_id;
+                            state
+                                .hovered_link
+                                .as_ref()
+                                .filter(|h| h.pane_id == sid_i)
+                                .map(|h| (h.line, h.start_col, h.end_col))
+                        };
                         if state.renderer.ensure_offscreen(oid, w, h) {
                             if let (Some(view), Some(&tex)) = (
                                 state.renderer.offscreen_view(oid),
@@ -10057,9 +10417,14 @@ impl ApplicationHandler<PtyWake> for App {
                                 );
                             }
                         }
-                        if let Err(e) =
-                            state.renderer.render(oid, term, sel_i.as_ref(), cur, None, None)
-                        {
+                        if let Err(e) = state.renderer.render(
+                            oid,
+                            term,
+                            sel_i.as_ref(),
+                            cur,
+                            None,
+                            link_hover_i,
+                        ) {
                             error!("多窗格镜像渲染失败: {e:#}");
                         }
                     }
