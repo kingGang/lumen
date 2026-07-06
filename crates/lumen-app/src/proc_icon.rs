@@ -384,8 +384,136 @@ mod imp {
     }
 }
 
-// ── 其余非 Windows（macOS / BSD）：暂空实现（macOS 的 NSWorkspace 图标后续补）─────
-#[cfg(not(any(windows, target_os = "linux")))]
+// ── macOS：libproc 找前台子进程 + NSWorkspace 图标 → NSBitmapImageRep → RGBA ──
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    use objc2_app_kit::{NSBitmapFormat, NSBitmapImageRep, NSImageRep, NSWorkspace};
+    use objc2_foundation::NSString;
+
+    // libproc（macOS libSystem 内，默认链接）：查子进程 / 取进程可执行路径。
+    extern "C" {
+        fn proc_listchildpids(ppid: i32, buffer: *mut i32, buffersize: i32) -> i32;
+        fn proc_pidpath(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+
+    pub fn foreground_exe(shell_pid: u32) -> Option<PathBuf> {
+        let pid = foreground_pid(shell_pid).unwrap_or(shell_pid);
+        exe_path(pid)
+    }
+
+    /// shell 的直接子进程（前台程序），取 PID 最大者（近似最近创建）。无子进程返回 None。
+    fn foreground_pid(shell_pid: u32) -> Option<u32> {
+        let mut buf = vec![0i32; 256];
+        // SAFETY: buf 可写、buffersize 与其字节容量一致。返回填入的字节数（proc_list* 家族
+        // 约定），<=0 视为无子进程/失败。
+        let ret = unsafe {
+            proc_listchildpids(shell_pid as i32, buf.as_mut_ptr(), (buf.len() * 4) as i32)
+        };
+        if ret <= 0 {
+            return None;
+        }
+        let count = ((ret as usize) / 4).min(buf.len());
+        buf[..count]
+            .iter()
+            .copied()
+            .filter(|&p| p > 0)
+            .map(|p| p as u32)
+            .max()
+    }
+
+    /// proc_pidpath 取进程可执行绝对路径。失败返回 None。
+    fn exe_path(pid: u32) -> Option<PathBuf> {
+        let mut buf = vec![0u8; 4096];
+        // SAFETY: buf 可写、buffersize 与其容量一致。返回写入的路径字节长度，<=0 为失败。
+        let ret = unsafe { proc_pidpath(pid as i32, buf.as_mut_ptr(), buf.len() as u32) };
+        if ret <= 0 {
+            return None;
+        }
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(
+            &buf[..ret as usize],
+        )))
+    }
+
+    pub fn load_icon_rgba(exe: &Path) -> Option<super::IconRgba> {
+        let path = NSString::from_str(exe.to_str()?);
+        // NSWorkspace 对任意存在文件都返回图标（无专属图标则给通用可执行图标）。
+        // SAFETY: 均为标准 AppKit 只读调用；NSWorkspace/NSImage 线程安全，本函数在 UI 线程调用。
+        let tiff = unsafe {
+            let ws = NSWorkspace::sharedWorkspace();
+            let image = ws.iconForFile(&path);
+            image.TIFFRepresentation()?
+        };
+        // TIFF → NSBitmapImageRep（imageRepWithData 对 TIFF 返回位图 rep，downcast 取具体类型）。
+        let rep = unsafe { NSImageRep::imageRepWithData(&tiff) }?
+            .downcast::<NSBitmapImageRep>()
+            .ok()?;
+        bitmap_to_rgba(&rep)
+    }
+
+    /// NSBitmapImageRep → top-down RGBA8。仅处理常见 32bpp / 4 通道 / 非平面；其余返回
+    /// None（上层回退自绘字形）。按 bitmapFormat 处理 alpha 位置（首/尾）与预乘还原。
+    fn bitmap_to_rgba(rep: &NSBitmapImageRep) -> Option<super::IconRgba> {
+        // SAFETY: 以下均为 rep 的只读属性访问。
+        let (planar, spp, bpp, w, h, stride, fmt) = unsafe {
+            (
+                rep.isPlanar(),
+                rep.samplesPerPixel(),
+                rep.bitsPerPixel(),
+                rep.pixelsWide(),
+                rep.pixelsHigh(),
+                rep.bytesPerRow(),
+                rep.bitmapFormat(),
+            )
+        };
+        if planar || spp != 4 || bpp != 32 || w <= 0 || h <= 0 || w > 512 || h > 512 {
+            return None;
+        }
+        let (w, h, stride) = (w as usize, h as usize, stride as usize);
+        if stride < w * 4 {
+            return None;
+        }
+        // SAFETY: bitmapData 返回 rep 位图缓冲首指针（rep 存活期内有效）；判空后按 stride/像素
+        // 宽在 h*stride 界内逐像素取 4 字节（bpp==32 保证每像素 4 字节）。
+        let data = unsafe { rep.bitmapData() };
+        if data.is_null() {
+            return None;
+        }
+        let alpha_first = fmt.contains(NSBitmapFormat::AlphaFirst);
+        let premultiplied = !fmt.contains(NSBitmapFormat::AlphaNonpremultiplied);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                // SAFETY: 见上，y*stride + x*4 + 3 < h*stride，界内。
+                let (r, g, b, a) = unsafe {
+                    let px = data.add(y * stride + x * 4);
+                    if alpha_first {
+                        (*px.add(1), *px.add(2), *px.add(3), *px)
+                    } else {
+                        (*px, *px.add(1), *px.add(2), *px.add(3))
+                    }
+                };
+                let (r, g, b) = if premultiplied && a != 0 {
+                    let un = |c: u8| (((c as u32) * 255 + (a as u32) / 2) / a as u32).min(255) as u8;
+                    (un(r), un(g), un(b))
+                } else {
+                    (r, g, b)
+                };
+                rgba.extend_from_slice(&[r, g, b, a]);
+            }
+        }
+        Some(super::IconRgba {
+            width: w as u32,
+            height: h as u32,
+            rgba,
+        })
+    }
+}
+
+// ── 其余非 Windows/Linux/macOS（BSD 等）：暂空实现（编译兜底）───────────────────
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod imp {
     use std::path::{Path, PathBuf};
 

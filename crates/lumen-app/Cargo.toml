@@ -86,8 +86,14 @@ freedesktop-icons.workspace = true
 # （proc_icon.rs）用 NSWorkspace/NSImage/NSBitmapImageRep。objc2 系按用到的类开 feature。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { workspace = true }
-objc2-foundation = { workspace = true, features = ["NSArray", "NSString", "NSURL"] }
-objc2-app-kit = { workspace = true, features = ["NSPasteboard"] }
+objc2-foundation = { workspace = true, features = ["NSArray", "NSString", "NSURL", "NSData"] }
+objc2-app-kit = { workspace = true, features = [
+    "NSPasteboard",
+    "NSWorkspace",
+    "NSImage",
+    "NSImageRep",
+    "NSBitmapImageRep",
+] }
 
 # 单实例检测（F8）仅 Windows 路径需要 Win32 同步原语。
 [target.'cfg(windows)'.dependencies]
