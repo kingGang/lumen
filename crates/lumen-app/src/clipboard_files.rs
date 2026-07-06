@@ -18,13 +18,14 @@ pub use imp::{copy_files, has_files, paste_files};
 #[cfg(target_os = "linux")]
 pub use linux::{copy_files, has_files, paste_files};
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+pub use macos::{copy_files, has_files, paste_files};
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub use stub_other::{copy_files, has_files, paste_files};
 
-// ── 其它非 Windows（macOS / BSD）：编译占位（文件剪贴板未实现）──────────────
-// macOS 文件剪贴板（NSPasteboard `NSFilenamesPboardType` / `public.file-url`）是
-// 独立后续项，这里保持返回空 / false 的桩，不影响编译与非文件功能。
-#[cfg(not(any(windows, target_os = "linux")))]
+// ── 其它非 Windows/Linux/macOS（BSD 等）：编译占位（文件剪贴板未实现）────────
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod stub_other {
     use std::path::PathBuf;
 
@@ -329,6 +330,76 @@ mod linux {
                 Err(_) => false,
             }
         }
+    }
+}
+
+// ── macOS 文件剪贴板：NSPasteboard 的文件 URL（public.file-url），与 Finder 互通 ──
+// 参照 arboard 3.6.1 的 objc2 0.6 惯用法。NSPasteboard 线程安全，可从 UI 线程调用。
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::path::PathBuf;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2::{msg_send, ClassType};
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    use objc2_foundation::{NSArray, NSString, NSURL};
+
+    /// 通用剪贴板。launchd 守护态等边缘情况可能取不到 → `None`（用 msg_send 承接可空返回）。
+    fn pasteboard() -> Option<Retained<NSPasteboard>> {
+        unsafe { msg_send![NSPasteboard::class(), generalPasteboard] }
+    }
+
+    /// 把本地路径写成剪贴板的文件 URL（Finder「粘贴」用的同一格式）。空 / 后端不可用返回 `false`。
+    pub fn copy_files(paths: &[PathBuf]) -> bool {
+        let Some(pb) = pasteboard() else {
+            return false;
+        };
+        let urls: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+            .iter()
+            .filter_map(|p| p.to_str())
+            .map(|s| {
+                let ns = NSString::from_str(s);
+                let url = unsafe { NSURL::fileURLWithPath(&ns) };
+                ProtocolObject::from_retained(url)
+            })
+            .collect();
+        if urls.is_empty() {
+            return false;
+        }
+        let array = NSArray::from_retained_slice(&urls);
+        unsafe { pb.clearContents() };
+        unsafe { pb.writeObjects(&array) }
+    }
+
+    /// 读剪贴板里的文件（NSURL → 本地路径），仅取文件 URL（排除 http 等）。无 / 失败返回空列表。
+    pub fn paste_files() -> Vec<PathBuf> {
+        let Some(pb) = pasteboard() else {
+            return Vec::new();
+        };
+        let class_array = NSArray::from_slice(&[NSURL::class()]);
+        // 不传 fileURLsOnly 选项（省去 NSDictionary 类型匹配），改用 isFileURL 过滤。
+        let objects = unsafe { pb.readObjectsForClasses_options(&class_array, None) };
+        objects
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|obj| {
+                        let url = obj.downcast::<NSURL>().ok()?;
+                        if unsafe { url.isFileURL() } {
+                            unsafe { url.path() }.map(|p| PathBuf::from(p.to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 剪贴板是否有文件。复用 `paste_files`（NSPasteboard 读取是本地快调用，非跨进程往返）。
+    pub fn has_files() -> bool {
+        !paste_files().is_empty()
     }
 }
 
