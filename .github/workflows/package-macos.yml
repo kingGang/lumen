@@ -1,0 +1,58 @@
+# macOS 打包：在 macos runner 上构建 universal（x86_64 + arm64）release，打成
+# 未签名 .app bundle，供无 Mac 或真机测试时下载。
+#
+# 触发：手动 workflow_dispatch（本移植分支迭代期按需出包）。
+# 产物（Actions run 的 Artifacts 区下载）：lumen-macos-app（Lumen.app 的 zip）。
+#
+# 未签名说明：Gatekeeper 会拦未签名 app。用户首次运行需「右键 → 打开 → 仍要打开」，
+# 或终端 `xattr -cr Lumen.app` 去隔离属性。CI 绿只证明「编译打包成功」，运行时
+# （Metal/渲染/剪贴板等）需真机验证。
+
+name: package-macos
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-macos
+
+      - name: 构建 universal release（x86_64 + arm64）
+        run: |
+          cargo build --release --target x86_64-apple-darwin -p lumen-app
+          cargo build --release --target aarch64-apple-darwin -p lumen-app
+          lipo -create -output lumen \
+            target/x86_64-apple-darwin/release/lumen \
+            target/aarch64-apple-darwin/release/lumen
+          file lumen
+
+      - name: 组 .app bundle
+        run: |
+          APP=Lumen.app/Contents
+          mkdir -p "$APP/MacOS" "$APP/Resources"
+          cp lumen "$APP/MacOS/lumen"
+          chmod +x "$APP/MacOS/lumen"
+          cp .github/macos/Info.plist "$APP/Info.plist"
+          # ditto 保留 bundle 结构打 zip（比 zip -r 更忠实保留 macOS 元数据）。
+          ditto -c -k --sequesterRsrc --keepParent Lumen.app Lumen-macos.zip
+          ls -la Lumen-macos.zip
+
+      - name: 上传 .app 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-macos-app
+          path: Lumen-macos.zip
+          if-no-files-found: error

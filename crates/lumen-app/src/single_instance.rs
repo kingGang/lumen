@@ -45,10 +45,10 @@ pub struct PrimaryGuard {
     /// 锁仍生效但无前台化通道。
     #[cfg(windows)]
     event: usize,
-    /// Linux：绑定在抽象命名空间的 Unix 套接字监听端。持有它即持有单实例
-    /// 锁（进程退出时内核自动释放抽象地址，无残留套接字文件）；监听线程
-    /// `try_clone` 一份 accept 第二实例的前台化连接。
-    #[cfg(target_os = "linux")]
+    /// Linux/macOS：Unix 套接字监听端（Linux 走抽象命名空间、macOS 走文件系统
+    /// 路径）。持有它即持有单实例锁；监听线程 `try_clone` 一份 accept 第二实例
+    /// 的前台化连接。
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     listener: std::os::unix::net::UnixListener,
 }
 
@@ -250,7 +250,9 @@ fn acquire_impl() -> InstanceCheck {
     }
 }
 
-#[cfg(target_os = "linux")]
+// Linux 与 macOS 共用（都持有 UnixListener，前台化 IPC 逻辑一致，仅 acquire
+// 的绑定方式不同：Linux 抽象命名空间 / macOS 文件系统路径）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_listener_impl(guard: &PrimaryGuard, proxy: EventLoopProxy<PtyWake>) {
     use std::io::Read;
 
@@ -289,17 +291,66 @@ fn spawn_listener_impl(guard: &PrimaryGuard, proxy: EventLoopProxy<PtyWake>) {
     }
 }
 
-// —— 其它 unix（macOS/BSD）：暂无单实例实现，放行多开（编译兜底）。 ——
-// 抽象套接字是 Linux 专属；macOS 需走文件系统套接字 + 陈旧清理或 flock，
-// 待后续在真机上补。
+// —— macOS：文件系统 Unix 套接字（抽象套接字是 Linux 专属）+ 陈旧清理。 ——
+//
+// bind 到 $TMPDIR 下固定路径：成功 = 第一实例；失败（EADDRINUSE = 路径已存在）时
+// connect 探活——连上 = 有实例在跑（通知前台化后退出）；连不上 = 上次异常退出残留的
+// 陈旧套接字文件，删掉重绑。干净退出后套接字文件仍留存，由下次启动的探活-删除自愈
+//（TMPDIR 亦被系统周期清理），故不做 Drop 清理。名字带用户名后缀做同机多用户隔离。
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn macos_socket_path() -> std::path::PathBuf {
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_owned());
+    let user = sanitize_user(&user);
+    let dir = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    dir.join(format!("lumen-single-instance-{user}.sock"))
+}
+
+#[cfg(target_os = "macos")]
+fn acquire_impl() -> InstanceCheck {
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let path = macos_socket_path();
+    match UnixListener::bind(&path) {
+        Ok(listener) => InstanceCheck::Primary(PrimaryGuard { listener }),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // 路径已存在：探活区分「有实例在跑」与「陈旧残留」。
+            match UnixStream::connect(&path) {
+                Ok(mut s) => {
+                    let _ = s.write_all(b"raise");
+                    InstanceCheck::AlreadyRunning
+                }
+                Err(_) => {
+                    // 连不上 = 陈旧套接字：删除后重绑成为第一实例。
+                    let _ = std::fs::remove_file(&path);
+                    match UnixListener::bind(&path) {
+                        Ok(listener) => InstanceCheck::Primary(PrimaryGuard { listener }),
+                        Err(e) => {
+                            log::warn!("重绑单实例套接字失败（{e}），放行本次启动");
+                            InstanceCheck::MultiAllowed
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("绑定单实例套接字失败（{e}），放行本次启动");
+            InstanceCheck::MultiAllowed
+        }
+    }
+}
+
+// —— 其它 unix（BSD 等）：暂无单实例实现，放行多开（编译兜底）。 ——
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn acquire_impl() -> InstanceCheck {
     log::debug!("本平台暂无单实例实现，放行多开");
     InstanceCheck::MultiAllowed
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn spawn_listener_impl(_guard: &PrimaryGuard, _proxy: EventLoopProxy<PtyWake>) {}
 
 #[cfg(test)]
