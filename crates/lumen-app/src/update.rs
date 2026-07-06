@@ -61,6 +61,9 @@ fn parse_leading_u32(s: &str) -> Option<u32> {
 }
 
 /// 当前运行版本（编译期 `CARGO_PKG_VERSION`）。
+/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate，
+/// 无需比对版本），故 windows-only，避免非 Windows 上「函数从未使用」告警。
+#[cfg(windows)]
 pub fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version {
         major: 0,
@@ -120,6 +123,10 @@ pub fn should_auto_check(last: Option<u64>, now: u64, min_interval_ms: u64) -> b
 /// GitHub Release 结构含 `tag_name` / `body` / `assets[]`（每项有 `name` +
 /// `browser_download_url`）。无 `.exe` 资产时回退取第一个资产；完全无资产
 /// 或无 tag 返回 None。
+/// 仅 Windows 更新检查（[`fetch_release`]）+ 单测用；非 Windows 非测试构建
+/// 用不到（[`check_for_update`] 直接返回 UpToDate），故 `any(windows, test)`
+/// 门控，避免 Linux/macOS release 构建「函数从未使用」告警。
+#[cfg(any(windows, test))]
 pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let tag = v.get("tag_name")?.as_str()?.to_owned();
@@ -153,6 +160,8 @@ pub fn parse_release_json(body: &str) -> Option<ParsedRelease> {
 }
 
 /// [`parse_release_json`] 的中间结果（下载地址可能缺失）。
+/// 与 [`parse_release_json`] 同门控（仅 Windows + 测试）。
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRelease {
     pub version: Version,
@@ -161,7 +170,8 @@ pub struct ParsedRelease {
     pub download_url: Option<String>,
 }
 
-/// GitHub latest Release API URL。
+/// GitHub latest Release API URL。仅 Windows 更新检查用（见 [`check_for_update`]）。
+#[cfg(windows)]
 fn latest_release_url(repo: &str) -> String {
     format!("https://api.github.com/repos/{repo}/releases/latest")
 }
@@ -180,6 +190,8 @@ fn with_proxy(builder: ureq::AgentBuilder, proxy: Option<&str>) -> ureq::AgentBu
 
 /// 请求并解析 GitHub 的 latest Release。失败（网络/HTTP 非 2xx/解析）返回
 /// `Err`。在后台线程内调用（阻塞）。`proxy` 为生效的网络代理（None=直连）。
+/// 仅 Windows 更新检查用（非 Windows [`check_for_update`] 直接返回 UpToDate）。
+#[cfg(windows)]
 fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> {
     let url = latest_release_url(repo);
     let agent = with_proxy(
@@ -210,6 +222,11 @@ fn fetch_release(repo: &str, proxy: Option<&str>) -> Result<UpdateInfo, String> 
 }
 
 /// 更新检查结果。
+///
+/// 非 Windows 上 [`check_for_update`] 只构造 `UpToDate`，`Newer`/`Failed` 仅
+/// 在 `main.rs` 被模式匹配、从不构造 → 「variant never constructed」告警；但
+/// 两变体又必须保留（否则 main.rs 的 match 编译不过），故非 Windows 抑制该告警。
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckResult {
     /// 有新版本。
@@ -223,20 +240,33 @@ pub enum CheckResult {
 /// 查更新：请求 GitHub latest Release，与当前版本比较裁决。
 /// 发布只走 GitHub（不发 Gitee，海风哥 2026-06-13 拍板）。
 /// 在后台线程内调用（阻塞）。
+///
+/// 非 Windows：自动更新分发的是 Windows Inno Setup `.exe` 安装包（见
+/// [`launch_installer`]），Linux/macOS 无从应用（走源码构建 / 平台包管理器）。
+/// 故一律返回 [`CheckResult::UpToDate`]，从源头掐断「弹更新提示 → 下载 .exe →
+/// 拉起安装器失败」的坏链路，整条更新 UI 流程在非 Windows 上永不触发。
 pub fn check_for_update(proxy: Option<&str>) -> CheckResult {
-    let current = current_version();
-    match fetch_release(GITHUB_REPO, proxy) {
-        Ok(info) if info.version > current => {
-            log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
-            CheckResult::Newer(info)
-        }
-        Ok(info) => {
-            log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
-            CheckResult::UpToDate
-        }
-        Err(e) => {
-            log::debug!("F3：{e}");
-            CheckResult::Failed
+    #[cfg(not(windows))]
+    {
+        let _ = proxy;
+        CheckResult::UpToDate
+    }
+    #[cfg(windows)]
+    {
+        let current = current_version();
+        match fetch_release(GITHUB_REPO, proxy) {
+            Ok(info) if info.version > current => {
+                log::info!("F3：发现新版本 {}（当前 {current}）", info.version);
+                CheckResult::Newer(info)
+            }
+            Ok(info) => {
+                log::debug!("F3：已是最新版 {current}（GitHub 上 {}）", info.version);
+                CheckResult::UpToDate
+            }
+            Err(e) => {
+                log::debug!("F3：{e}");
+                CheckResult::Failed
+            }
         }
     }
 }
@@ -389,10 +419,13 @@ mod tests {
     fn 安装包落地路径_清洗tag() {
         let p = installer_dest("v0.2.0");
         assert!(p.to_string_lossy().contains("Lumen-Setup-v0.2.0.exe"));
-        // 含非法字符的 tag 被清洗。
+        // 含非法字符的 tag 被清洗——只断言文件名部分（清洗后）不含路径分隔符
+        // 与非法字符。不能断言整条路径：unix 上 temp_dir 的目录分隔符本就是
+        // `/`，会误判（跨平台移植前该测试只在 Windows 跑，故未暴露）。
         let p2 = installer_dest("v0.2/evil");
-        assert!(!p2.to_string_lossy().contains('/'));
-        assert!(p2.to_string_lossy().contains("Lumen-Setup-v0.2_evil.exe"));
+        let name2 = p2.file_name().expect("应有文件名").to_string_lossy();
+        assert!(!name2.contains('/'));
+        assert_eq!(name2, "Lumen-Setup-v0.2_evil.exe");
     }
 
     #[test]
@@ -405,6 +438,8 @@ mod tests {
         assert!(should_auto_check(Some(1_000_000), 5_000_000, 3_600_000));
     }
 
+    // latest_release_url 仅 Windows 编译（非 Windows 更新检查直接返回 UpToDate）。
+    #[cfg(windows)]
     #[test]
     fn latest_release_url_格式() {
         assert_eq!(

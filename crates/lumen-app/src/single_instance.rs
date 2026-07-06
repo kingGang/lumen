@@ -38,13 +38,18 @@ pub enum InstanceCheck {
     MultiAllowed,
 }
 
-/// 第一实例持有的前台化事件句柄（仅 Windows 有实义）。
+/// 第一实例持有的前台化通道句柄（各平台不同）。
 pub struct PrimaryGuard {
-    /// 前台化事件句柄（监听线程 wait 用）。以 usize 形式保存便于跨
-    /// 线程传递（`HANDLE` 是裸指针、非 Send）；0 = 事件创建失败，
-    /// 单实例锁仍生效但无前台化通道。
+    /// Windows：前台化事件句柄（监听线程 wait 用）。以 usize 形式保存便于
+    /// 跨线程传递（`HANDLE` 是裸指针、非 Send）；0 = 事件创建失败，单实例
+    /// 锁仍生效但无前台化通道。
     #[cfg(windows)]
     event: usize,
+    /// Linux：绑定在抽象命名空间的 Unix 套接字监听端。持有它即持有单实例
+    /// 锁（进程退出时内核自动释放抽象地址，无残留套接字文件）；监听线程
+    /// `try_clone` 一份 accept 第二实例的前台化连接。
+    #[cfg(target_os = "linux")]
+    listener: std::os::unix::net::UnixListener,
 }
 
 /// 主循环取走前台化请求：有挂起请求则清零并返回 true。
@@ -192,16 +197,109 @@ fn spawn_listener_impl(guard: &PrimaryGuard, proxy: EventLoopProxy<PtyWake>) {
     }
 }
 
-// —— 非 Windows 平台：项目当前仅支持 Windows（ConPTY），其他平台
-// 无单实例实现，一律放行多开（编译兜底，行为同测试版）。 ——
+// —— Linux：抽象命名空间 Unix 套接字既作单实例锁又作前台化 IPC。 ——
+//
+// 抽象套接字（名字以 NUL 起始，不落文件系统）由内核在进程退出时自动回收，
+// 无残留 socket 文件、无需清理逻辑，天然规避「上次崩溃留下陈旧锁」问题。
+// `bind` 成功 = 本进程是第一实例（持有监听端即持有锁）；`bind` 报 `AddrInUse`
+// = 已有实例在跑，连上去写一字节请求其前台化，本进程静默退出。名字带用户名
+// 后缀做同机多用户隔离（抽象套接字对同网络命名空间所有用户可见，与 Windows
+// `Local\` 命名空间同样是簿记性约束、非安全边界）。
 
-#[cfg(not(windows))]
+/// 抽象套接字地址名（不含起始 NUL，`from_abstract_name` 内部加）。
+#[cfg(target_os = "linux")]
+fn abstract_socket_name() -> Vec<u8> {
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_owned());
+    let user = sanitize_user(&user);
+    format!("lumen-single-instance-{user}").into_bytes()
+}
+
+#[cfg(target_os = "linux")]
 fn acquire_impl() -> InstanceCheck {
-    log::debug!("非 Windows 平台：单实例检测未实现，放行多开");
+    use std::io::Write;
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+
+    let name = abstract_socket_name();
+    let addr = match SocketAddr::from_abstract_name(&name) {
+        Ok(a) => a,
+        Err(e) => {
+            // 构造地址失败（超长等，不应发生）：放行启动，单实例是簿记约束。
+            log::warn!("构造单实例抽象地址失败（{e}），放行本次启动");
+            return InstanceCheck::MultiAllowed;
+        }
+    };
+    match UnixListener::bind_addr(&addr) {
+        Ok(listener) => InstanceCheck::Primary(PrimaryGuard { listener }),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // 已有实例：连上写一字节请求前台化，然后静默退出。连接失败也无妨
+            //（对端可能正忙），单实例语义已达成。
+            match UnixStream::connect_addr(&addr) {
+                Ok(mut s) => {
+                    let _ = s.write_all(b"raise");
+                }
+                Err(e) => log::warn!("已有实例在跑但通知其前台化失败（仅影响前台化）: {e}"),
+            }
+            InstanceCheck::AlreadyRunning
+        }
+        Err(e) => {
+            // 其它 bind 失败（权限/资源）：放行启动，不挡主功能。
+            log::warn!("绑定单实例套接字失败（{e}），放行本次启动");
+            InstanceCheck::MultiAllowed
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_listener_impl(guard: &PrimaryGuard, proxy: EventLoopProxy<PtyWake>) {
+    use std::io::Read;
+
+    // clone 一份监听端交给后台线程 accept（原件随 guard 存活于主线程/AppState）。
+    let listener = match guard.listener.try_clone() {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("clone 单实例监听端失败（仅影响前台化）: {e}");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("single-instance-fg".to_owned())
+        .spawn(move || {
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(mut stream) => {
+                        // 收到任意连接即视为前台化请求（内容不解析，读空即可）。
+                        let mut buf = [0u8; 8];
+                        let _ = stream.read(&mut buf);
+                        log::info!("收到第二实例的前台化信号");
+                        FOREGROUND_REQUESTED.store(true, Ordering::Release);
+                        // 借既有 PtyWake 唤醒主循环。Err = 事件循环已关闭，线程退出。
+                        if proxy.send_event(PtyWake).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("单实例监听 accept 异常（忽略继续）: {e}");
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("前台化监听线程启动失败（仅影响前台化，不影响单实例）: {e}");
+    }
+}
+
+// —— 其它 unix（macOS/BSD）：暂无单实例实现，放行多开（编译兜底）。 ——
+// 抽象套接字是 Linux 专属；macOS 需走文件系统套接字 + 陈旧清理或 flock，
+// 待后续在真机上补。
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn acquire_impl() -> InstanceCheck {
+    log::debug!("本平台暂无单实例实现，放行多开");
     InstanceCheck::MultiAllowed
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn spawn_listener_impl(_guard: &PrimaryGuard, _proxy: EventLoopProxy<PtyWake>) {}
 
 #[cfg(test)]

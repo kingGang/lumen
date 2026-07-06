@@ -5036,52 +5036,48 @@ fn remote_notice_toast(n: &remote_ws::Notice) -> (shell::toast::ToastKind, Strin
 
 /// 无边框窗口外缘 resize 命中检测（左/右/下及下方两角）：鼠标物理坐标
 /// `mouse_pos` 落在客户区外缘约 6 逻辑像素带内时返回对应 [`ResizeDirection`]。
-/// Windows 无边框窗口客户区铺满整窗、系统不再对边缘做 NCHITTEST resize
-/// （WS_THICKFRAME 命中区被吞），故手动命中 + drag_resize_window 补回拖边
-/// resize。顶边让位自绘标题栏拖动移动与右上角窗控按钮，不做 resize。
-/// 最大化态 / 非 Windows（保留系统装饰、原生 resize 可用）返回 None。
+/// 无边框窗口客户区铺满整窗、系统不再对边缘做原生 NCHITTEST/边框 resize，
+/// 故手动命中 + drag_resize_window 补回拖边 resize。顶边让位自绘标题栏拖动
+/// 移动与右上角窗控按钮，不做 resize。最大化态返回 None。
+///
+/// 三平台通用：客户端各自绘标题栏 + 无边框（Windows WS_THICKFRAME 铺满、
+/// Linux/macOS with_decorations(false)），边缘 resize 均由此逻辑接管，经
+/// winit drag_resize_window（Windows WM_NCLBUTTONDOWN / X11 _NET_WM_MOVERESIZE /
+/// Wayland xdg_toplevel::resize）启动系统 resize。
 fn resize_edge_dir(
     window: &winit::window::Window,
     mouse_pos: (f64, f64),
     ppp: f32,
 ) -> Option<winit::window::ResizeDirection> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (window, mouse_pos, ppp);
-        None
+    use winit::window::ResizeDirection;
+    if window.is_maximized() {
+        return None;
     }
-    #[cfg(target_os = "windows")]
-    {
-        use winit::window::ResizeDirection;
-        if window.is_maximized() {
-            return None;
-        }
-        let size = window.inner_size();
-        if size.width == 0 || size.height == 0 {
-            return None;
-        }
-        let (w, h) = (size.width as f64, size.height as f64);
-        let (mx, my) = mouse_pos;
-        // 命中带：约 6 逻辑像素（随 DPI 缩放），最低 4 物理像素。
-        let b = (6.0 * ppp as f64).max(4.0);
-        let left = mx < b;
-        let right = mx > w - b;
-        let bottom = my > h - b;
-        let dir = if bottom && left {
-            ResizeDirection::SouthWest
-        } else if bottom && right {
-            ResizeDirection::SouthEast
-        } else if left {
-            ResizeDirection::West
-        } else if right {
-            ResizeDirection::East
-        } else if bottom {
-            ResizeDirection::South
-        } else {
-            return None;
-        };
-        Some(dir)
+    let size = window.inner_size();
+    if size.width == 0 || size.height == 0 {
+        return None;
     }
+    let (w, h) = (size.width as f64, size.height as f64);
+    let (mx, my) = mouse_pos;
+    // 命中带：约 6 逻辑像素（随 DPI 缩放），最低 4 物理像素。
+    let b = (6.0 * ppp as f64).max(4.0);
+    let left = mx < b;
+    let right = mx > w - b;
+    let bottom = my > h - b;
+    let dir = if bottom && left {
+        ResizeDirection::SouthWest
+    } else if bottom && right {
+        ResizeDirection::SouthEast
+    } else if left {
+        ResizeDirection::West
+    } else if right {
+        ResizeDirection::East
+    } else if bottom {
+        ResizeDirection::South
+    } else {
+        return None;
+    };
+    Some(dir)
 }
 
 impl App {
@@ -5119,6 +5115,11 @@ impl App {
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
             .with_maximized(true)
+            // 无边框：自绘顶栏作为唯一标题栏（与 Windows 一致），消除
+            // 「系统标题栏 + 自绘顶栏」双栏 + 双套窗控按钮。移动走顶栏
+            // drag_window、缩放走 resize_edge_dir + drag_resize_window（均 winit
+            // 跨平台）。若某些 compositor 不认，WM 的 Alt+拖动仍可移动窗口。
+            .with_decorations(false)
             // 隐藏创建，init 末尾铺底色帧后再显示（消白闪，见 init 收尾）。
             .with_visible(false)
             .with_window_icon(window_icon);

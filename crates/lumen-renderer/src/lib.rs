@@ -1408,10 +1408,30 @@ fn resolve_family(font_system: &FontSystem, wanted: &str) -> String {
     pick_mono_family(font_system)
 }
 
-/// 在系统字体库中挑选等宽字体：Cascadia Mono → Consolas → 任意 Monospace。
+/// 在系统字体库中挑选等宽字体：按平台常见等宽字体优先命名匹配
+/// （Windows→macOS→Linux），命中即用；都没有则退回字体库里任意标记为
+/// `monospaced` 的字体家族；再没有才退字面量 `"monospace"`。
+///
+/// 跨平台要点：非 Windows 上 `"monospace"` 作为 `Family::Name` 传给 glyphon
+/// 未必解析成真正的等宽字体（fontdb 不一定配了该 generic），会回退到比例
+/// 字体——终端字符逐格错位、'M' 与 'a' advance 不等。故此处必须解析到一个
+/// **真实存在的等宽字体名**，而非依赖 generic 别名。
 fn pick_mono_family(font_system: &FontSystem) -> String {
     let db = font_system.db();
-    for wanted in ["Cascadia Mono", "Consolas"] {
+    for wanted in [
+        // Windows
+        "Cascadia Mono",
+        "Consolas",
+        // macOS
+        "SF Mono",
+        "Menlo",
+        "Monaco",
+        // Linux（含 CI runner 常见）
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        "Ubuntu Mono",
+    ] {
         let found = db.faces().any(|f| {
             f.families
                 .iter()
@@ -1420,6 +1440,15 @@ fn pick_mono_family(font_system: &FontSystem) -> String {
         if found {
             return wanted.to_owned();
         }
+    }
+    // 兜底：字体库里任意标记为等宽的字体（fontdb 的 monospaced 标志），取其
+    // 首个家族名——保证跨平台一定拿到真正的等宽字体而非比例回退。
+    if let Some(name) = db
+        .faces()
+        .find(|f| f.monospaced)
+        .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+    {
+        return name;
     }
     "monospace".to_owned()
 }
