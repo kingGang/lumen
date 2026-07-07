@@ -164,6 +164,9 @@ pub fn show(
 
                 // ── 窗控三按钮（最右，从右到左：关闭 → 最大化/还原 → 最小化）
                 // ──────────────────────────────────────────────────────────────
+                // macOS 用原生装饰（交通灯），此处不画自绘窗控，避免双套按钮；
+                // Windows/Linux 无边框，由自绘顶栏承担窗控。
+                if !cfg!(target_os = "macos") {
 
                 // 关闭按钮（悬停红底 #c42b1c 白字，Win11 惯例）
                 let (close_rect, close_resp) =
@@ -287,6 +290,8 @@ pub fn show(
                 if min_resp.on_hover_text(s.wc_minimize).clicked() {
                     out.minimize_window = true;
                 }
+
+                } // end if !macOS（窗控三按钮）
 
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);

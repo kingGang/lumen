@@ -5110,15 +5110,23 @@ impl App {
                 .with_window_icon(window_icon)
                 .with_taskbar_icon(taskbar_icon)
         };
-        #[cfg(not(target_os = "windows"))]
+        // macOS：保留原生装饰（红黄绿交通灯）。自绘 × 在 mac 上点击命中不可靠（真机
+        // 实测关不掉），且原生窗口管理更符合 mac 习惯；topbar 在 mac 上不再画自绘窗控
+        // 按钮（避免与交通灯双套）。不强制最大化、不无边框——排除「无边框+maximized」
+        // 在 Metal 上的 surface 尺寸/渲染怪象（残影排查）。
+        #[cfg(target_os = "macos")]
+        let attrs = Window::default_attributes()
+            .with_title("Lumen")
+            .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
+            .with_visible(false)
+            .with_window_icon(window_icon);
+        // Linux/其它 unix：无边框 + 自绘顶栏作唯一标题栏（消除双标题栏，已真机验证）。
+        // 移动走顶栏 drag_window、缩放走 resize_edge_dir + drag_resize_window（winit 跨平台）。
+        #[cfg(all(unix, not(target_os = "macos")))]
         let attrs = Window::default_attributes()
             .with_title("Lumen")
             .with_inner_size(winit::dpi::LogicalSize::new(1000.0, 640.0))
             .with_maximized(true)
-            // 无边框：自绘顶栏作为唯一标题栏（与 Windows 一致），消除
-            // 「系统标题栏 + 自绘顶栏」双栏 + 双套窗控按钮。移动走顶栏
-            // drag_window、缩放走 resize_edge_dir + drag_resize_window（均 winit
-            // 跨平台）。若某些 compositor 不认，WM 的 Alt+拖动仍可移动窗口。
             .with_decorations(false)
             // 隐藏创建，init 末尾铺底色帧后再显示（消白闪，见 init 收尾）。
             .with_visible(false)

@@ -41,12 +41,32 @@ jobs:
             target/aarch64-apple-darwin/release/lumen
           file lumen
 
+      - name: 生成 .icns 应用图标
+        run: |
+          # 由仓库现成 PNG（icons/lumen-icon-*.png）拼 iconset，再 iconutil 转 icns。
+          set -e
+          ICON=Lumen.iconset
+          mkdir -p "$ICON"
+          cp icons/lumen-icon-16.png   "$ICON/icon_16x16.png"
+          cp icons/lumen-icon-32.png   "$ICON/icon_16x16@2x.png"
+          cp icons/lumen-icon-32.png   "$ICON/icon_32x32.png"
+          cp icons/lumen-icon-64.png   "$ICON/icon_32x32@2x.png"
+          cp icons/lumen-icon-128.png  "$ICON/icon_128x128.png"
+          cp icons/lumen-icon-256.png  "$ICON/icon_128x128@2x.png"
+          cp icons/lumen-icon-256.png  "$ICON/icon_256x256.png"
+          cp icons/lumen-icon-512.png  "$ICON/icon_256x256@2x.png"
+          cp icons/lumen-icon-512.png  "$ICON/icon_512x512.png"
+          cp icons/lumen-icon-1024.png "$ICON/icon_512x512@2x.png"
+          iconutil -c icns "$ICON" -o Lumen.icns
+          ls -la Lumen.icns
+
       - name: 组 .app bundle
         run: |
           APP=Lumen.app/Contents
           mkdir -p "$APP/MacOS" "$APP/Resources"
           cp lumen "$APP/MacOS/lumen"
           chmod +x "$APP/MacOS/lumen"
+          cp Lumen.icns "$APP/Resources/Lumen.icns"
           cp .github/macos/Info.plist "$APP/Info.plist"
           # ditto 保留 bundle 结构打 zip（比 zip -r 更忠实保留 macOS 元数据）。
           ditto -c -k --sequesterRsrc --keepParent Lumen.app Lumen-macos.zip

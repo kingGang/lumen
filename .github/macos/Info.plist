@@ -8,6 +8,8 @@
 	<string>Lumen</string>
 	<key>CFBundleExecutable</key>
 	<string>lumen</string>
+	<key>CFBundleIconFile</key>
+	<string>Lumen</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.jimhy.lumen</string>
 	<key>CFBundleVersion</key>
