@@ -1,10 +1,11 @@
-# Lumen 持续集成：守住「编译过 + 测试绿 + clippy 0 warning」与跨平台编译
-# 不回归。发版打包另见 release.yml。
+# Lumen 持续集成：守住「编译过 + 测试绿 + clippy 0 warning」与跨平台
+# 编译不回归。发版打包另见 release.yml。
 #
-# - Windows 是权威平台（发布目标）：cargo test 全绿 + clippy -D warnings。
-# - Linux 仅作「跨平台编译哨兵」：non-blocking（continue-on-error）的
-#   cargo check，专防 windows-sys/winresource 等 target-gate 漏写、把
-#   非 Windows 代码路径编挂的回归。失败不拦合并，只在 CI 面板亮黄。
+# 三平台一等公民（跨平台移植后，见 feat/cross-platform-linux-macos）：
+# - Windows：权威平台（历史发布目标），clippy -D warnings + 全量测试。
+# - Linux / macOS：正式 build + test（阻塞）。Windows 专属能力在非 Windows
+#   走跨平台实现或优雅降级（见各模块 cfg(not(windows)) 分支）。
+#   Linux runner 需装 wgpu/winit/arboard/rfd 依赖的 X11/Wayland/GTK 运行库。
 
 name: ci
 
@@ -22,7 +23,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 权威：Windows 上测试 + clippy。
+  # 权威：Windows 上 clippy 0 warning + 测试。
   test-windows:
     runs-on: windows-latest
     steps:
@@ -36,13 +37,37 @@ jobs:
       - name: 测试
         run: cargo test --workspace
 
-  # 哨兵：Linux 仅编译检查，非阻塞。只为及早发现跨平台 cfg 回归。
-  compile-linux:
+  # Linux：正式 build + test。
+  test-linux:
     runs-on: ubuntu-latest
-    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # wgpu（Vulkan/GL loader）、winit（X11/Wayland/xkb）、arboard（X11 剪贴板）、
+      # rfd（GTK3 同步文件对话框）在 Linux 上链接这些系统库；缺任一则 lumen
+      # 二进制链接失败。
+      - name: 安装系统依赖（X11 / Wayland / GTK / xkb / 等宽字体）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            pkg-config \
+            fonts-dejavu-core
+          # 渲染器需一个真实等宽字体（pick_mono_family 命中 DejaVu Sans Mono）；
+          # headless runner 默认可能无等宽字体，否则字体测量测试会挂。
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试（含全 crate 构建）
+        run: cargo test --workspace
+
+  # macOS：正式 build + test（AppKit/Metal 随 Xcode SDK 内置，无需额外系统包）。
+  test-macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check（跨平台编译哨兵）
-        run: cargo check --workspace --all-targets
+      - name: 测试（含全 crate 构建）
+        run: cargo test --workspace

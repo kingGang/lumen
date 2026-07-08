@@ -2480,7 +2480,11 @@ fn remote_device_list_ui(
 /// 速度由 egui 时间驱动（每帧 `request_repaint` 续动），跟随强调色。
 /// `half` 为正方形半边长。
 fn draw_busy_spinner(ui: &egui::Ui, center: egui::Pos2, half: f32, color: egui::Color32) {
-    ui.ctx().request_repaint(); // 驱动连续动画
+    // 30fps 驱动动画即可（转圈视觉足够顺滑）。原 request_repaint() 每帧立即重绘，
+    // 经 egui_repaint_at 的 8ms 合帧上限跑到 ~125fps——TUI 长时间工作时单核拉满
+    // （CPU/内存偏高的主因之一，跨平台皆然）。降到 33ms 一帧后 CPU 减约 4 倍。
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
     let t = ui.input(|i| i.time) as f32;
     let side = 2.0 * half; // 单边长
     let perim = 4.0 * side; // 周长

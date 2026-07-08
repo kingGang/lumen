@@ -97,6 +97,10 @@ pub struct CompletionSidecar {
     proxy: EventLoopProxy<PtyWake>,
     /// 读线程「进程已退出」标志（读线程设 true 主线程据此触发重启）。
     reader_dead: Arc<AtomicBool>,
+    /// pwsh 永久缺失标志：spawn 报 `NotFound`（系统未装 PowerShell，常见于
+    /// Linux/macOS）后置 true，此后 `ensure_alive` 直接跳过 spawn，避免每次
+    /// 补全请求都白 spawn + 刷日志。装了 pwsh 的 unix 不受影响（正常启用）。
+    disabled: bool,
 }
 
 impl CompletionSidecar {
@@ -111,6 +115,7 @@ impl CompletionSidecar {
             next_req_id: 1,
             proxy,
             reader_dead: Arc::new(AtomicBool::new(false)),
+            disabled: false,
         }
     }
 
@@ -184,6 +189,9 @@ impl CompletionSidecar {
 
     /// 确保 sidecar 进程存活：若未启动或读线程标记死亡，则重新 spawn。
     fn ensure_alive(&mut self) {
+        if self.disabled {
+            return; // pwsh 缺失已判定，永久跳过 spawn（避免每次请求白试）。
+        }
         let dead = self.reader_dead.load(Ordering::Acquire);
         if !dead && self.child.is_some() {
             return; // 进程正常运行，无需操作。
@@ -281,10 +289,17 @@ impl CompletionSidecar {
                 info!("completion sidecar 进程已启动");
             }
             Err(e) => {
-                // pwsh 不存在或无权限：静默降级，命令补全功能不可用。
-                warn!("completion sidecar spawn 失败（pwsh 不可用？）: {e}");
                 self.child = None;
                 self.stdin = None;
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // 系统未装 pwsh（常见于 Linux/macOS）：永久禁用命令补全，
+                    // 不再每次请求重试。文件路径补全不受影响。只 info 一次。
+                    info!("未找到 pwsh，命令补全禁用（文件路径补全仍可用）");
+                    self.disabled = true;
+                } else {
+                    // 其它错误（权限/资源）可能是暂时性的：warn 但保留重试。
+                    warn!("completion sidecar spawn 失败: {e}");
+                }
             }
         }
     }

@@ -1,0 +1,105 @@
+# Linux 打包：在 ubuntu runner 上构建 release 并产出可下载的安装产物
+# （.deb + 通用 tarball），供无 Linux 机器时拿去真机测试。
+#
+# 触发：push 到跨平台分支，或手动 workflow_dispatch。
+# 产物（Actions run 的 Artifacts 区下载）：
+#   - lumen-linux-deb：Debian/Ubuntu 安装包（sudo apt install ./*.deb 自动装依赖）
+#   - lumen-linux-tarball：任意发行版通用（解压得二进制 lumen，运行需系统装 GTK/X11/
+#     Wayland/xkb/Vulkan|GL 运行库）
+#
+# 注意：CI 绿只证明「编译打包成功」，二进制能否正常运行（GPU/渲染）需真机验证。
+
+name: package-linux
+
+on:
+  push:
+    branches: [feat/cross-platform-linux-macos]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    # 关键：在较老的 ubuntu-22.04 上打包，而非 ubuntu-latest(24.04)。
+    # 24.04 的 glibc 2.39 会让二进制无法在老系统运行（如 Deepin glibc 2.38），
+    # 且 24.04 把运行库改名加了 t64 后缀（libgtk-3-0t64 等），非 t64 发行版
+    # （Debian 12 / Deepin 等）依赖解析失败。22.04 = glibc 2.35 + 无 t64 包名，
+    # 兼容面最广。
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖（X11 / Wayland / GTK / xkb / 等宽字体）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            pkg-config fonts-dejavu-core
+
+      - uses: dtolnay/rust-toolchain@stable
+      # rust-cache 用**独立 key**（package-linux-2204）与 ci.yml 的 Linux 缓存隔离：
+      # 其默认键只按笼统 runner.os(Linux) 不分 22.04/24.04，若共享会把 24.04
+      # (glibc 2.39) 的 release 产物 + cargo-deb 二进制恢复到 22.04 复用，导致产出
+      # 反而要 GLIBC_2.39。独立 key 后缓存仅在 22.04 打包间复用（同 glibc），首次
+      # 冷编译、后续加速，兼容老发行版不受影响。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-linux-2204
+
+      - name: 构建 release 二进制
+        run: cargo build --release -p lumen-app
+
+      # 保底产物：通用 tarball（几乎不会失败）。
+      - name: 打通用 tarball
+        run: |
+          mkdir -p dist
+          cp target/release/lumen dist/lumen
+          cp README.md dist/ 2>/dev/null || true
+          cat > dist/运行说明.txt <<'EOF'
+          Lumen —— Linux 通用构建（跨平台移植分支）
+
+          运行需系统安装以下运行库（按发行版选一条）：
+            Debian/Ubuntu:
+              sudo apt install libgtk-3-0 libxcb1 libxcb-render0 libxcb-shape0 \
+                libxcb-xfixes0 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 \
+                libvulkan1 libgl1 libegl1 fonts-dejavu-core
+            Fedora:
+              sudo dnf install gtk3 libxcb libxkbcommon libxkbcommon-x11 wayland-libs-client \
+                vulkan-loader mesa-libGL mesa-libEGL dejavu-sans-mono-fonts
+            Arch:
+              sudo pacman -S gtk3 libxcb libxkbcommon libxkbcommon-x11 wayland \
+                vulkan-icd-loader mesa ttf-dejavu
+
+          然后：  chmod +x lumen && ./lumen
+          配置/会话/历史落在 ~/.local/share/Lumen/（release）。
+          EOF
+          tar -czf lumen-linux-x86_64.tar.gz -C dist .
+          ls -la lumen-linux-x86_64.tar.gz
+
+      # Debian/Ubuntu 安装包（best-effort：cargo-deb 若失败不影响 tarball 产物）。
+      - name: 安装 cargo-deb
+        run: cargo install cargo-deb --locked
+        continue-on-error: true
+
+      - name: 打 .deb（默认输出 target/debian/*.deb）
+        id: deb
+        run: cargo deb -p lumen-app --no-build
+        continue-on-error: true
+
+      - name: 上传 tarball 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-linux-tarball
+          path: lumen-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+      - name: 上传 .deb 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-linux-deb
+          path: target/debian/*.deb
+          if-no-files-found: warn

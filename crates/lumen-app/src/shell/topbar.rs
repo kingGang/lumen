@@ -164,6 +164,9 @@ pub fn show(
 
                 // ── 窗控三按钮（最右，从右到左：关闭 → 最大化/还原 → 最小化）
                 // ──────────────────────────────────────────────────────────────
+                // macOS 用原生装饰（交通灯），此处不画自绘窗控，避免双套按钮；
+                // Windows/Linux 无边框，由自绘顶栏承担窗控。
+                if !cfg!(target_os = "macos") {
 
                 // 关闭按钮（悬停红底 #c42b1c 白字，Win11 惯例）
                 let (close_rect, close_resp) =
@@ -287,6 +290,8 @@ pub fn show(
                 if min_resp.on_hover_text(s.wc_minimize).clicked() {
                     out.minimize_window = true;
                 }
+
+                } // end if !macOS（窗控三按钮）
 
                 // ── 头像（紧贴窗控左侧，加右内边距 10px）──────────────────
                 ui.add_space(10.0);
@@ -742,6 +747,8 @@ mod topbar_layout_tests {
 
     /// RTL 布局哨兵（fb2610a 修复回归防线）：无头 egui 跑一帧顶栏布局，
     /// 断言窗控按钮分配在面板右端——cursor().min 类手工矩形 bug 重现时此测试失败。
+    /// macOS 用原生装饰、不画自绘窗控（见 show 内 cfg），故本测试不适用。
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn 顶栏_最大化按钮分配在右端() {
         let ctx = egui::Context::default();
@@ -784,6 +791,8 @@ mod topbar_layout_tests {
 
     /// 绘制哨兵：一帧的绘制图元里右端区域（x>1050）应存在窗控按钮的
     /// 线段图元（✕/—/□ 画线）——按钮绘制被条件分支意外跳过时此测试失败。
+    /// macOS 不画自绘窗控，故本测试不适用。
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn 顶栏_右端绘制图元存在() {
         let ctx = egui::Context::default();

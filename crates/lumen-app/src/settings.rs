@@ -301,7 +301,7 @@ impl Settings {
         match Self::path() {
             Some(p) => Self::load_from(&p),
             None => {
-                log::warn!("LOCALAPPDATA 未设置，使用默认设置（本次运行不持久化）");
+                log::warn!("数据目录不可用（HOME/LOCALAPPDATA 均未解析到？），使用默认设置（本次运行不持久化）");
                 Self::default()
             }
         }

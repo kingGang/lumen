@@ -255,48 +255,51 @@ pub fn open(target: &LinkTarget) {
     }
 }
 
-/// 打开 URL（系统默认浏览器）。
+/// 系统默认「打开」启动器：Windows `explorer.exe`，macOS `open`，
+/// 其余 unix `xdg-open`。参数由调用方追加。
 ///
-/// Windows 走 `explorer.exe <url>`：内部转 ShellExecute，URL 含
-/// `&`/`?`/`=` 等查询串字符也安全（不经 cmd 二次解析），与文件树
-/// `open_with_default` 同款规避策略。
-fn open_url(url: &str) {
+/// Windows 走 `explorer.exe`（内部转 ShellExecute），URL 含 `&`/`?`/`=`
+/// 等查询串字符也安全（不经 cmd 二次解析），与文件树 `open_with_default`
+/// 同款规避策略。macOS `open` / Linux `xdg-open` 同样直接把整参数交给
+/// 系统处理器，不经 shell 解析。
+fn default_open_command() -> std::process::Command {
     #[cfg(windows)]
-    let result = std::process::Command::new("explorer.exe").arg(url).spawn();
-    #[cfg(not(windows))]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-    match result {
+    {
+        std::process::Command::new("explorer.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+    }
+}
+
+/// 打开 URL（系统默认浏览器）。
+fn open_url(url: &str) {
+    match default_open_command().arg(url).spawn() {
         Ok(child) => reap_in_background(child),
         Err(e) => log::error!("打开 URL 失败 {url}: {e}"),
     }
 }
 
 /// 打开文件：带行号且检测到 VS Code 时用 `code -g 定位到行列`，否则用
-/// 系统默认程序打开（不定位）。
+/// 系统默认程序打开（不定位）。三平台通用。
 fn open_file(path: &Path, line: Option<u32>, col: Option<u32>) {
-    #[cfg(windows)]
-    {
-        if let Some(line) = line {
-            if vscode_available() {
-                let goto = match col {
-                    Some(c) => format!("{}:{line}:{c}", path.display()),
-                    None => format!("{}:{line}", path.display()),
-                };
-                use std::os::windows::process::CommandExt;
-                // code 是 .cmd 批处理 shim，须经 cmd 调起（Command::new 直
-                // 接找无扩展名/批处理会失败）；CREATE_NO_WINDOW 避免 cmd
-                // 窗口闪现。源码路径几乎不含 cmd 元字符，可接受。
-                let child = std::process::Command::new("cmd")
-                    .args(["/c", "code", "-g", &goto])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .spawn();
-                match child {
-                    Ok(c) => {
-                        reap_in_background(c);
-                        return;
-                    }
-                    Err(e) => log::warn!("VS Code 打开失败，回退默认程序: {e}"),
+    if let Some(line) = line {
+        if vscode_available() {
+            let goto = match col {
+                Some(c) => format!("{}:{line}:{c}", path.display()),
+                None => format!("{}:{line}", path.display()),
+            };
+            match spawn_vscode_goto(&goto) {
+                Ok(c) => {
+                    reap_in_background(c);
+                    return;
                 }
+                Err(e) => log::warn!("VS Code 打开失败，回退默认程序: {e}"),
             }
         }
     }
@@ -305,14 +308,30 @@ fn open_file(path: &Path, line: Option<u32>, col: Option<u32>) {
 
 /// 用系统默认程序打开文件（不定位行列）。
 fn open_path_default(path: &Path) {
-    #[cfg(windows)]
-    let result = std::process::Command::new("explorer.exe").arg(path).spawn();
-    #[cfg(not(windows))]
-    let result = std::process::Command::new("xdg-open").arg(path).spawn();
-    match result {
+    match default_open_command().arg(path).spawn() {
         Ok(child) => reap_in_background(child),
         Err(e) => log::error!("打开文件失败 {}: {e}", path.display()),
     }
+}
+
+/// 调 VS Code 跳转到 `<路径>:行:列`（`goto` 已格式化）。
+///
+/// Windows：`code` 是 .cmd 批处理 shim，须经 cmd 调起（`Command::new`
+/// 直接找无扩展名/批处理会失败）；`CREATE_NO_WINDOW` 避免 cmd 窗口闪现。
+/// 源码路径几乎不含 cmd 元字符，可接受。unix：`code` 是可直接执行的
+/// 脚本，直接 spawn，无需经 shell。
+#[cfg(windows)]
+fn spawn_vscode_goto(goto: &str) -> std::io::Result<std::process::Child> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .args(["/c", "code", "-g", goto])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+}
+
+#[cfg(not(windows))]
+fn spawn_vscode_goto(goto: &str) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("code").args(["-g", goto]).spawn()
 }
 
 /// Windows 上 `CREATE_NO_WINDOW` 进程创建标志（隐藏子进程控制台）。
@@ -320,21 +339,32 @@ fn open_path_default(path: &Path) {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// VS Code CLI（`code`）是否可用（首次调用探测一次后缓存）。
-#[cfg(windows)]
 fn vscode_available() -> bool {
     use std::sync::OnceLock;
     static AVAIL: OnceLock<bool> = OnceLock::new();
-    *AVAIL.get_or_init(|| {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new("cmd")
-            .args(["/c", "where", "code"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    *AVAIL.get_or_init(probe_vscode)
+}
+
+/// Windows：`cmd /c where code` 探测（`code` 是批处理 shim）。
+#[cfg(windows)]
+fn probe_vscode() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .args(["/c", "where", "code"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// unix：在 PATH 各目录中查 `code` 可执行文件（不 spawn，避免拉起进程）。
+#[cfg(not(windows))]
+fn probe_vscode() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("code").is_file()))
+        .unwrap_or(false)
 }
 
 /// 后台线程回收已 spawn 的子进程句柄（防僵尸句柄堆积）。

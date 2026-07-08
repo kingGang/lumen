@@ -376,18 +376,87 @@ fn read_machine_guid() -> Option<String> {
     }
 }
 
-/// 非 Windows（开发 / 测试）：无 `MachineGuid`，返回 `None`（服务端退化按 `device_id`）。
-#[cfg(not(windows))]
+/// 读稳定机器标识（Linux 实现）：`/etc/machine-id`，回退
+/// `/var/lib/dbus/machine-id`（无 systemd 的老发行版）。该值由
+/// systemd/dbus 在系统首次启动时生成，跨重启 / 更新恒定，语义上等价
+/// Windows 的 `MachineGuid`。读不到（受限容器 / 权限）返回 `None`。
+#[cfg(target_os = "linux")]
+fn read_machine_guid() -> Option<String> {
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 读稳定机器标识（macOS 实现）：`ioreg` 读 `IOPlatformExpertDevice` 的
+/// `IOPlatformUUID`。该 UUID 绑定主板、跨系统更新恒定，语义等价
+/// `MachineGuid`。`ioreg` 是 macOS 自带命令，零第三方依赖；读不到返回 `None`。
+#[cfg(target_os = "macos")]
+fn read_machine_guid() -> Option<String> {
+    let out = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // 目标行形如：    "IOPlatformUUID" = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+    // 取 `IOPlatformUUID` 之后第一对引号中间的内容（split('"').nth(1)）。
+    for line in text.lines() {
+        let Some((_, after)) = line.split_once("IOPlatformUUID") else {
+            continue;
+        };
+        if let Some(uuid) = after.split('"').nth(1) {
+            let uuid = uuid.trim();
+            if !uuid.is_empty() {
+                return Some(uuid.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 其余平台（BSD 等）：无统一稳定标识源，返回 `None`（服务端退化按 `device_id`）。
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn read_machine_guid() -> Option<String> {
     None
 }
 
-/// 本机设备显示名（Windows 取 `COMPUTERNAME`，兜底 `Lumen-PC`）。
+/// 本机设备显示名。Windows 取 `COMPUTERNAME`；unix 优先 `HOSTNAME`
+/// 环境变量、回退 `hostname` 命令；一律兜底 `Lumen-PC`。
 pub fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Lumen-PC".to_string())
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Lumen-PC".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOSTNAME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(unix_hostname)
+            .unwrap_or_else(|| "Lumen-PC".to_string())
+    }
+}
+
+/// unix：调 `hostname` 命令取主机名（`HOSTNAME` 环境变量常未导出到进程）。
+#[cfg(not(windows))]
+fn unix_hostname() -> Option<String> {
+    let out = std::process::Command::new("hostname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]

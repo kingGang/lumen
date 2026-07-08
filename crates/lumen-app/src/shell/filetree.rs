@@ -2816,7 +2816,10 @@ fn has_control_chars(path: &Path) -> bool {
 pub fn open_with_default(path: &Path) {
     #[cfg(windows)]
     let result = std::process::Command::new("explorer.exe").arg(path).spawn();
-    #[cfg(not(windows))]
+    // macOS：系统 `open` 用默认程序打开，语义等价 explorer/xdg-open。
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
     let result = std::process::Command::new("xdg-open").arg(path).spawn();
     match result {
         Ok(child) => reap_in_background(child),
@@ -2829,7 +2832,8 @@ pub fn open_with_default(path: &Path) {
 /// Windows 用 `explorer /select,"路径"`：该参数必须作为一个整体原样
 /// 传给 explorer——std 的标准引用规则会把整段加引号导致 explorer 不
 /// 识别，故用 `raw_arg` 自行引用。Windows 文件名不可能含 `"`，无引号
-/// 逃逸风险。
+/// 逃逸风险。macOS 用 `open -R` 在 Finder 中揭示并选中目标。其余 unix
+/// 无标准「选中」协议，退化为用默认文件管理器打开父目录。
 fn reveal_in_explorer(path: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     let child = {
@@ -2838,7 +2842,12 @@ fn reveal_in_explorer(path: &Path) -> std::io::Result<()> {
             .raw_arg(format!("/select,\"{}\"", path.display()))
             .spawn()?
     };
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let child = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()?;
+    #[cfg(not(any(windows, target_os = "macos")))]
     let child = std::process::Command::new("xdg-open")
         .arg(path.parent().unwrap_or(path))
         .spawn()?;

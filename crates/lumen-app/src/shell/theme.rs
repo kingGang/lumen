@@ -376,35 +376,106 @@ pub fn apply_style(ctx: &egui::Context, pal: &Palette) {
     ctx.set_global_style(style);
 }
 
-/// 运行时加载系统中文字体并插入 fallback 列表。
+/// 运行时加载系统中文字体并插入 egui fallback 列表。
 ///
-/// 优先微软雅黑（msyh.ttc，按 index 0 取字面），缺失则降级黑体；
-/// 都没有时仅记录警告（外壳界面中文会缺字，终端区不受影响——
-/// 终端文字走 lumen-renderer 的 glyphon 管线，与 egui 字体无关）。
-/// 字体约 19MB，运行时读取而非编进二进制。
+/// egui 自带字体只含 Latin，中文需额外挂系统 CJK 字体，否则外壳界面中文
+/// （菜单/状态栏/设置页）显示为豆腐块 □（终端区不受影响——终端文字走
+/// lumen-renderer 的 glyphon 管线，与 egui 字体无关）。字体较大（十几 MB），
+/// 运行时读取而非编进二进制。
+///
+/// 跨平台查找：unix 先用 `fc-match` 问 fontconfig 要系统中文字体（最贴合发行
+/// 版实际配置），再退各平台常见路径（Windows 雅黑/黑体、macOS PingFang、
+/// Linux Noto CJK/文泉驿等）。全都没有才记警告。
 pub fn install_cjk_fonts(ctx: &egui::Context) {
-    const CANDIDATES: [(&str, u32); 2] = [
+    let Some((bytes, index)) = load_cjk_font() else {
+        log::warn!("未找到系统中文字体，外壳界面中文将显示为豆腐块");
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    let mut data = egui::FontData::from_owned(bytes);
+    data.index = index;
+    fonts.font_data.insert("cjk".to_owned(), Arc::new(data));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(list) = fonts.families.get_mut(&family) {
+            list.push("cjk".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+/// 找到并读入一个中文字体，返回 (字节, TTC face index)。
+fn load_cjk_font() -> Option<(Vec<u8>, u32)> {
+    // unix：先问 fontconfig（fc-match）要系统中文字体，最贴合发行版实际配置。
+    #[cfg(not(windows))]
+    if let Some((path, index)) = fc_match_cjk() {
+        if let Ok(bytes) = std::fs::read(&path) {
+            log::info!("外壳中文字体(fc-match): {path}#{index}");
+            return Some((bytes, index));
+        }
+    }
+    // 各平台常见路径兜底。
+    for (path, index) in cjk_font_candidates() {
+        if let Ok(bytes) = std::fs::read(path) {
+            log::info!("外壳中文字体: {path}");
+            return Some((bytes, *index));
+        }
+    }
+    None
+}
+
+/// 各平台常见中文字体候选路径 + TTC face index。
+#[cfg(windows)]
+fn cjk_font_candidates() -> &'static [(&'static str, u32)] {
+    &[
         ("C:/Windows/Fonts/msyh.ttc", 0),
         ("C:/Windows/Fonts/simhei.ttf", 0),
-    ];
-    let mut fonts = egui::FontDefinitions::default();
-    for (path, index) in CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = index;
-        fonts.font_data.insert("cjk".to_owned(), Arc::new(data));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            if let Some(list) = fonts.families.get_mut(&family) {
-                list.push("cjk".to_owned());
-            }
-        }
-        ctx.set_fonts(fonts);
-        log::info!("外壳中文字体: {path}");
-        return;
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn cjk_font_candidates() -> &'static [(&'static str, u32)] {
+    &[
+        ("/System/Library/Fonts/PingFang.ttc", 0),
+        ("/System/Library/Fonts/STHeiti Light.ttc", 0),
+        ("/Library/Fonts/Arial Unicode.ttf", 0),
+    ]
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn cjk_font_candidates() -> &'static [(&'static str, u32)] {
+    &[
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+        ("/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", 0),
+        ("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf", 0),
+    ]
+}
+
+/// unix：`fc-match` 问 fontconfig 中文（zh）最匹配字体的文件路径 + face index。
+/// 返回形如 `("/path/font.ttc", 0)`；fontconfig 缺失或无输出时 None。
+#[cfg(not(windows))]
+fn fc_match_cjk() -> Option<(String, u32)> {
+    let out = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}:%{index}", "sans-serif:lang=zh"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    log::warn!("未找到系统中文字体（msyh.ttc / simhei.ttf），外壳界面中文将无法显示");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // 格式 "文件路径:index"；文件名极少含冒号，按最后一个冒号切分。
+    match s.rsplit_once(':') {
+        Some((path, idx)) if !path.is_empty() => {
+            Some((path.to_owned(), idx.trim().parse().unwrap_or(0)))
+        }
+        _ => Some((s.to_owned(), 0)),
+    }
 }
 
 #[cfg(test)]

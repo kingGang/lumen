@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.6"
+version = "1.0.9"
 edition = "2021"
 # 最低支持 Rust 版本（MSRV）：由锁定依赖树决定，当前最高为 ecolor 0.34.3
 # （egui 0.34 成员）要求 1.92；README 徽章与此保持一致。仅客户端 crates 继承；
@@ -33,6 +33,23 @@ lumen-protocol = { path = "crates/lumen-protocol" }
 
 anyhow = "1"
 arboard = "3"
+# Linux 文件剪贴板（clipboard_files.rs 的 Linux 实现）：与文件管理器互通的
+# text/uri-list。arboard 只管纯文本，故 X11/Wayland 各引专用 crate（仅 Linux
+# target 编译）：X11 用 x11-clipboard（进程内常驻 selection owner 持续 serve），
+# Wayland 用 wl-clipboard-rs。percent-encoding 做 file:// URI 路径转义（纯逻辑，
+# 已是传递依赖，全平台编译供单测）。
+percent-encoding = "2"
+x11-clipboard = "0.9"
+wl-clipboard-rs = "0.9"
+# 会话前台进程图标（proc_icon.rs）Linux：按可执行名查 freedesktop 图标主题
+# （仅 Linux target）。macOS 走 objc2 NSWorkspace（见下 objc2 系）。
+freedesktop-icons = "0.4"
+# macOS 原生（仅 macos target）：文件剪贴板（NSPasteboard 的文件 URL）+ 进程图标
+# （NSWorkspace/NSImage）。版本对齐 arboard/winit 已解析的 objc2 0.6 系，不引新版本。
+# 具体 feature 在 lumen-app 按用到的类开启。
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
 bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2"

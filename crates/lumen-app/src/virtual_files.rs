@@ -19,10 +19,191 @@
 #[cfg(windows)]
 pub use imp::ClipboardService;
 
-#[cfg(not(windows))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use unix::ClipboardService;
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub use stub::ClipboardService;
 
-#[cfg(not(windows))]
+// ── Linux/macOS：务实替代（复制即下临时目录，再走系统文件剪贴板）──────────────
+// Linux/macOS 无 Windows 那种「延迟文件内容」剪贴板协议，无法在文件管理器「粘贴」
+// 时才按需流式下载。改为**远程复制时后台先把文件下到本地临时目录**，再把临时路径
+// 放进系统文件剪贴板（clipboard_files），文件管理器即可正常粘贴。代价：大文件在
+// 「复制」时即完整下载（非粘贴时流式）。下载复用既有 ClipFetchCmd/StreamMsg 管线。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix {
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::Arc;
+
+    use winit::event_loop::EventLoopProxy;
+
+    use crate::remote_ws::{ClipFetchCmd, StreamMsg};
+    use crate::PtyWake;
+    use lumen_protocol::remote::RecursiveDirEntry;
+
+    /// 临时子目录去重计数（进程内单调递增，无需随机）。
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    pub struct ClipboardService {
+        proxy: EventLoopProxy<PtyWake>,
+        wake_pending: Arc<AtomicBool>,
+        fetch_tx: Sender<ClipFetchCmd>,
+        temp_root: PathBuf,
+    }
+
+    impl ClipboardService {
+        pub fn start(
+            proxy: EventLoopProxy<PtyWake>,
+            wake_pending: Arc<AtomicBool>,
+            fetch_tx: Sender<ClipFetchCmd>,
+        ) -> Self {
+            let temp_root = std::env::temp_dir().join("lumen-remote-clip");
+            Self {
+                proxy,
+                wake_pending,
+                fetch_tx,
+                temp_root,
+            }
+        }
+
+        /// 远程复制单文件：后台下到临时目录 → 放进系统文件剪贴板。立即返回（不阻塞 UI）。
+        pub fn set_remote_file(&self, path: String, name: String, size: u64) {
+            let _ = size; // 进度暂不用（下载完成后才置剪贴板）
+            let ctx = self.ctx();
+            std::thread::spawn(move || {
+                let dir = ctx.temp_root.join(unique_dir());
+                if fs::create_dir_all(&dir).is_err() {
+                    return;
+                }
+                let dest = dir.join(sanitize_name(&name));
+                if download_file(&ctx, &path, &dest).is_ok() {
+                    crate::clipboard_files::copy_files(&[dest]);
+                }
+            });
+        }
+
+        /// 远程复制目录子树：后台按 rel_path 逐个下到临时目录（保留结构）→ 顶层项放进剪贴板。
+        pub fn set_remote_dir(&self, entries: Vec<RecursiveDirEntry>) {
+            let ctx = self.ctx();
+            std::thread::spawn(move || {
+                let dir = ctx.temp_root.join(unique_dir());
+                if fs::create_dir_all(&dir).is_err() {
+                    return;
+                }
+                let mut tops: std::collections::BTreeSet<PathBuf> = Default::default();
+                for e in &entries {
+                    let rel = sanitize_rel(&e.rel_path);
+                    if rel.as_os_str().is_empty() {
+                        continue; // 全被清洗掉（`..`/绝对/空）——跳过，防目录穿越
+                    }
+                    if let Some(top) = rel.components().next() {
+                        tops.insert(dir.join(top.as_os_str()));
+                    }
+                    let dest = dir.join(&rel);
+                    if e.is_dir {
+                        let _ = fs::create_dir_all(&dest);
+                    } else {
+                        if let Some(parent) = dest.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        // 单文件失败只跳过该文件（其余仍尽力下），不整体放弃。
+                        let _ = download_file(&ctx, &e.path, &dest);
+                    }
+                }
+                let tops: Vec<PathBuf> = tops.into_iter().collect();
+                if !tops.is_empty() {
+                    crate::clipboard_files::copy_files(&tops);
+                }
+            });
+        }
+
+        /// 清空：非 Windows 无需主动清系统剪贴板（本地复制会覆盖）。空实现。
+        pub fn clear(&self) {}
+
+        fn ctx(&self) -> Ctx {
+            Ctx {
+                proxy: self.proxy.clone(),
+                wake_pending: self.wake_pending.clone(),
+                fetch_tx: self.fetch_tx.clone(),
+                temp_root: self.temp_root.clone(),
+            }
+        }
+    }
+
+    /// 后台下载线程用的上下文（克隆自 service）。
+    struct Ctx {
+        proxy: EventLoopProxy<PtyWake>,
+        wake_pending: Arc<AtomicBool>,
+        fetch_tx: Sender<ClipFetchCmd>,
+        temp_root: PathBuf,
+    }
+
+    /// 下载一个远程文件到 `dest`（阻塞当前后台线程）：发 ClipFetchCmd + 唤醒主循环 drain，
+    /// 收 StreamMsg 分块写盘。Done=成功；Failed/通道断=失败（清掉半截文件）。
+    fn download_file(ctx: &Ctx, remote_path: &str, dest: &PathBuf) -> std::io::Result<()> {
+        let (tx, rx) = channel();
+        if ctx
+            .fetch_tx
+            .send(ClipFetchCmd {
+                path: remote_path.to_owned(),
+                data_tx: tx,
+            })
+            .is_err()
+        {
+            return Err(std::io::Error::other("主循环已退出，无法下载"));
+        }
+        // 唤醒主循环 drain clip_fetch_rx（与 Windows RemoteFileStream 同款 PtyWake 去重）。
+        if !ctx.wake_pending.swap(true, Ordering::SeqCst) {
+            let _ = ctx.proxy.send_event(PtyWake);
+        }
+        let mut file = fs::File::create(dest)?;
+        loop {
+            match rx.recv() {
+                Ok(StreamMsg::Chunk(data)) => file.write_all(&data)?,
+                Ok(StreamMsg::Done) => return Ok(()),
+                Ok(StreamMsg::Failed) | Err(_) => {
+                    drop(file);
+                    let _ = fs::remove_file(dest);
+                    return Err(std::io::Error::other("远程下载中止"));
+                }
+            }
+        }
+    }
+
+    /// 进程内唯一临时子目录名（pid + 单调计数，避免并发复制撞目录；无需随机）。
+    fn unique_dir() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// 单文件名清洗：去掉路径分隔符（防 name 带 `/` 越出临时目录）。
+    fn sanitize_name(name: &str) -> String {
+        name.replace(['/', '\\'], "_")
+    }
+
+    /// rel_path（'/' 分隔）→ 安全相对 PathBuf：拒绝空段 / `.` / `..`，防目录穿越
+    /// （rel_path 来自被控端，视为不可信）。
+    fn sanitize_rel(rel: &str) -> PathBuf {
+        let mut out = PathBuf::new();
+        for seg in rel.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                continue;
+            }
+            out.push(seg.replace('\\', "_"));
+        }
+        out
+    }
+}
+
+// ── 其它非 Windows/Linux/macOS（BSD 等）：空桩（编译兜底）───────────────────────
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod stub {
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::Sender;

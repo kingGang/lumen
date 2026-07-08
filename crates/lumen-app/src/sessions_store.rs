@@ -140,7 +140,7 @@ impl SessionsFile {
         match Self::path() {
             Some(p) => Self::load_from(&p),
             None => {
-                log::warn!("LOCALAPPDATA 未设置，会话列表不持久化");
+                log::warn!("数据目录不可用（HOME/LOCALAPPDATA 均未解析到？），会话列表不持久化");
                 None
             }
         }

@@ -180,13 +180,26 @@ impl Renderer {
         } else {
             wgpu::PresentMode::AutoVsync
         };
+        // 不透明窗口：优先 Opaque。某些后端（尤其 macOS/Metal）alpha_modes[0] 可能是
+        // PreMultiplied/PostMultiplied/Inherit，一旦窗口内容含非 1.0 alpha（文本抗锯齿边缘/
+        // 光标/纹理边），合成器按透明混合 → 桌面从半透明区透出（灰块）、光标移动留拖尾
+        // （Windows/DX12 的 alpha_modes[0]=Opaque 恰好规避了）。显式选 Opaque 让合成忽略
+        // alpha 通道；无 Opaque 时回退首个（不改变原行为）。
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
             height: height.max(1),
             present_mode,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1408,10 +1421,30 @@ fn resolve_family(font_system: &FontSystem, wanted: &str) -> String {
     pick_mono_family(font_system)
 }
 
-/// 在系统字体库中挑选等宽字体：Cascadia Mono → Consolas → 任意 Monospace。
+/// 在系统字体库中挑选等宽字体：按平台常见等宽字体优先命名匹配
+/// （Windows→macOS→Linux），命中即用；都没有则退回字体库里任意标记为
+/// `monospaced` 的字体家族；再没有才退字面量 `"monospace"`。
+///
+/// 跨平台要点：非 Windows 上 `"monospace"` 作为 `Family::Name` 传给 glyphon
+/// 未必解析成真正的等宽字体（fontdb 不一定配了该 generic），会回退到比例
+/// 字体——终端字符逐格错位、'M' 与 'a' advance 不等。故此处必须解析到一个
+/// **真实存在的等宽字体名**，而非依赖 generic 别名。
 fn pick_mono_family(font_system: &FontSystem) -> String {
     let db = font_system.db();
-    for wanted in ["Cascadia Mono", "Consolas"] {
+    for wanted in [
+        // Windows
+        "Cascadia Mono",
+        "Consolas",
+        // macOS
+        "SF Mono",
+        "Menlo",
+        "Monaco",
+        // Linux（含 CI runner 常见）
+        "DejaVu Sans Mono",
+        "Liberation Mono",
+        "Noto Sans Mono",
+        "Ubuntu Mono",
+    ] {
         let found = db.faces().any(|f| {
             f.families
                 .iter()
@@ -1420,6 +1453,15 @@ fn pick_mono_family(font_system: &FontSystem) -> String {
         if found {
             return wanted.to_owned();
         }
+    }
+    // 兜底：字体库里任意标记为等宽的字体（fontdb 的 monospaced 标志），取其
+    // 首个家族名——保证跨平台一定拿到真正的等宽字体而非比例回退。
+    if let Some(name) = db
+        .faces()
+        .find(|f| f.monospaced)
+        .and_then(|f| f.families.first().map(|(n, _)| n.clone()))
+    {
+        return name;
     }
     "monospace".to_owned()
 }

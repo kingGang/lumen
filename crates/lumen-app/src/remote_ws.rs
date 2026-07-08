@@ -4347,17 +4347,6 @@ impl RemoteWs {
         self.has_mirror_pane_selection() || self.has_mirror_selection()
     }
 
-    /// 控制端：**焦点镜像窗格**当前是否开了鼠标上报（copy-on-select 门控）。开 = 被控端跑
-    /// 全屏 TUI（Claude 等）、普通左键拖被转发、用户须 Shift 逃生才能拖出本地镜像选区，
-    /// 松手即自动复制；未开（普通 shell / inline）则不自动复制，避免只想选来看看却误清剪贴板。
-    /// 多窗格取焦点窗格 term、单窗格取 mirror（均解析被控端 VT 流故与被控端 DECSET 同步），
-    /// 与本地 copy-on-select 用 `pane.term.mouse_protocol().is_on()` 语义对齐。
-    #[must_use]
-    pub fn mirror_active_reporting(&self) -> bool {
-        self.focused_mirror_term()
-            .is_some_and(|t| t.mouse_protocol().is_on())
-    }
-
     /// 控制端：清空焦点镜像选区（多窗格焦点窗格 + 单窗格都清；复制成功 / 切视图后调用）。
     pub fn clear_mirror_active_selection(&mut self) {
         self.mirror_selection = None;

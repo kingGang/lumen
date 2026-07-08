@@ -47,10 +47,21 @@ pub struct KeyInput {
 
 impl KeyInput {
     /// 从 winit KeyEvent 提取（生产路径）。
+    ///
+    /// macOS：按 Ctrl+字母时 winit 的 `logical_key` 会变成控制字符（如 Ctrl+E→U+0005
+    /// ENQ）而非字母键，导致所有 Ctrl+字母快捷键（经典直通 Ctrl+Shift+E、分屏 Ctrl+Shift+D
+    /// 等）匹配失败。改用 `key_without_modifiers()` 拿「不加任何修饰键时的基础键」（"e"），
+    /// 修饰键判定仍走 ModifiersState。仅 macOS 走此路径，Windows/Linux 维持 logical_key
+    /// （其上无此控制字符问题，避免任何回归）。
     pub fn from_event(event: &KeyEvent) -> Self {
-        Self {
-            logical_key: event.logical_key.clone(),
-        }
+        #[cfg(target_os = "macos")]
+        let logical_key = {
+            use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+            event.key_without_modifiers()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let logical_key = event.logical_key.clone();
+        Self { logical_key }
     }
 
     /// 字符键（测试构造用）。
