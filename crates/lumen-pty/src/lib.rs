@@ -80,6 +80,22 @@ impl PtySession {
         // 终端能力声明：上层实现了 256 色与真彩 SGR。
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        // unix locale 兜底：macOS GUI app（open 经 launchd 启动）不继承终端 LANG，
+        // 子 shell 无 locale → ls 等把非 ASCII 文件名输出成 '?'（中文乱码）。若继承
+        // 环境里无任何 locale 变量，补一个 UTF-8 locale（有则尊重用户设置、不覆盖）。
+        #[cfg(unix)]
+        {
+            let has_locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+            if !has_locale {
+                // macOS 用 en_US.UTF-8（必装）；其它 unix 用 C.UTF-8（现代 glibc 具备）。
+                #[cfg(target_os = "macos")]
+                cmd.env("LANG", "en_US.UTF-8");
+                #[cfg(not(target_os = "macos"))]
+                cmd.env("LANG", "C.UTF-8");
+            }
+        }
         // 调用方追加的环境（网络代理等）：覆盖同名内置/继承值。
         for (k, v) in extra_env {
             cmd.env(k, v);
